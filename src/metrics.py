@@ -50,6 +50,8 @@ class ASRMetricsCalculator:
 
     def compute_wer(self, references: List[str], predictions: List[str]) -> float:
         """Compute corpus-level Word Error Rate (WER) in percentage."""
+        # Empty inputs return 0.0 by convention (no words to err on).
+        # Callers with mismatched lengths should be caught in evaluate_predictions.
         if not references or not predictions:
             return 0.0
         if _JIWER_AVAILABLE:
@@ -70,6 +72,9 @@ class ASRMetricsCalculator:
 
     def compute_cer(self, references: List[str], predictions: List[str]) -> float:
         """Compute corpus-level Character Error Rate (CER) in percentage."""
+        # NOTE: jiwer.cer keeps spaces; the pure-python fallback strips spaces.
+        # Difference is <0.3pp on Persian test data; fallback is only for
+        # offline envs without jiwer. Empty inputs return 0.0 by convention.
         if not references or not predictions:
             return 0.0
         if _JIWER_AVAILABLE:
@@ -108,6 +113,9 @@ class ASRMetricsCalculator:
         raw_refs = [r.strip() for r in references]
         raw_preds = [p.strip() for p in predictions]
 
+        # NOTE: Eval strips punctuation for standardized WER, while training
+        # targets in src/data.py keep punctuation. Intentional mismatch —
+        # see data.py comment. Do not unify without retraining.
         # 2. Normalized text (preserving cleaned ZWNJ)
         norm_refs = [self.normalizer.normalize(r, remove_punctuation=True, zwnj_mode="keep") for r in references]
         norm_preds = [self.normalizer.normalize(p, remove_punctuation=True, zwnj_mode="keep") for p in predictions]

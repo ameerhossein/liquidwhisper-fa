@@ -30,3 +30,5 @@ training:
   optimizer: "adamw_torch_fused"
   gradient_checkpointing: true
   num_workers: 4
+  eval_batch_size: 16
+  max_benchmark_samples: 300  # 0 = full test set (2149); 300 guards L40S OOM

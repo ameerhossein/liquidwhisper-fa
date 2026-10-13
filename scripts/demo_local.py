@@ -18,6 +18,33 @@ import urllib.parse
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "server" / "static"
 
+
+def _load_demo_baselines():
+    """Load shared baselines so demo matches server/training numbers."""
+    defaults = (28.50, 8.90, 26.10, 24.00, 36.80, 17.20, 4.80, 15.90, 15.10, 22.40)
+    try:
+        with open(BASE_DIR / "configs" / "baselines.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        w, b = data.get("whisper_v3", {}), data.get("buzzasr_base", {})
+        return (
+            float(w.get("normalized_wer", defaults[0])),
+            float(w.get("normalized_cer", defaults[1])),
+            float(w.get("diagnostic_wer", defaults[2])),
+            float(w.get("formal_wer", defaults[3])),
+            float(w.get("informal_wer", defaults[4])),
+            float(b.get("normalized_wer", defaults[5])),
+            float(b.get("normalized_cer", defaults[6])),
+            float(b.get("diagnostic_wer", defaults[7])),
+            float(b.get("formal_wer", defaults[8])),
+            float(b.get("informal_wer", defaults[9])),
+        )
+    except Exception:
+        return defaults
+
+
+_WHISPER_WER, _WHISPER_CER, _WHISPER_DIAG, _WHISPER_FORMAL, _WHISPER_INFORMAL, \
+    _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, _BUZZ_INFORMAL = _load_demo_baselines()
+
 # Simulation State
 sim_state = {
     "is_running": False,
@@ -47,11 +74,11 @@ sim_benchmarks = [
         "epoch_number": 0,
         "type": "baseline",
         "is_baseline": True,
-        "normalized_wer": 28.50,
-        "normalized_cer": 8.90,
-        "diagnostic_wer": 26.10,
-        "formal_wer": 24.00,
-        "informal_wer": 36.80,
+        "normalized_wer": _WHISPER_WER,
+        "normalized_cer": _WHISPER_CER,
+        "diagnostic_wer": _WHISPER_DIAG,
+        "formal_wer": _WHISPER_FORMAL,
+        "informal_wer": _WHISPER_INFORMAL,
         "delta_vs_whisper": 0.0,
         "total_samples": 2149,
         "canary_transcriptions": [
@@ -80,12 +107,12 @@ sim_benchmarks = [
         "epoch_number": 0,
         "type": "baseline",
         "is_baseline": True,
-        "normalized_wer": 17.20,
-        "normalized_cer": 4.80,
-        "diagnostic_wer": 15.90,
-        "formal_wer": 15.10,
-        "informal_wer": 22.40,
-        "delta_vs_whisper": -11.30,
+        "normalized_wer": _BUZZ_WER,
+        "normalized_cer": _BUZZ_CER,
+        "diagnostic_wer": _BUZZ_DIAG,
+        "formal_wer": _BUZZ_FORMAL,
+        "informal_wer": _BUZZ_INFORMAL,
+        "delta_vs_whisper": round(_BUZZ_WER - _WHISPER_WER, 2),
         "total_samples": 2149,
         "canary_transcriptions": []
     }
@@ -182,8 +209,8 @@ def simulation_worker():
                 }
             ]
 
-            delta_whisper = round(metrics[0] - 28.50, 2)
-            delta_buzz = round(metrics[0] - 17.20, 2)
+            delta_whisper = round(metrics[0] - _WHISPER_WER, 2)
+            delta_buzz = round(metrics[0] - _BUZZ_WER, 2)
             sim_benchmarks.append({
                 "epoch": f"Epoch {epoch_idx}",
                 "epoch_number": epoch_idx,
@@ -200,10 +227,16 @@ def simulation_worker():
                 "canary_transcriptions": canary_cards,
                 "timestamp": time.time()
             })
-            sim_logs.append(f">>> [Epoch {epoch_idx}] Benchmark Finished! Normalized WER: {metrics[0]}% (Improvement: {delta}% vs Whisper v3)")
+            sim_logs.append(f">>> [Epoch {epoch_idx}] Benchmark Finished! Normalized WER: {metrics[0]}% (Improvement: {delta_whisper}% vs Whisper v3, {delta_buzz}% vs BuzzASR)")
             sim_state["status"] = "training"
 
         sim_state["epoch"] = round(current_step / 1820, 2)
+
+        # Auto-stop at max_steps so a second Launch starts a fresh run.
+        if current_step >= sim_state["max_steps"]:
+            sim_state["is_running"] = False
+            sim_state["status"] = "completed"
+            sim_logs.append("[Demo Engine] >>> Simulation complete. Launch again for a fresh run.")
 
 
 class LocalDemoHandler(SimpleHTTPRequestHandler):
@@ -239,7 +272,7 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/status":
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             payload = dict(sim_state)
             payload["process_running"] = sim_state["is_running"]
@@ -248,21 +281,21 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/benchmarks":
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(sim_benchmarks).encode("utf-8"))
             return
 
         if path == "/api/loss-history":
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(sim_loss_history[-100:]).encode("utf-8"))
             return
 
         if path.startswith("/api/logs"):
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"logs": sim_logs[-80:]}).encode("utf-8"))
             return
@@ -275,11 +308,23 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
         path = url.path
 
         if path == "/api/train/start":
+            # Fresh-run semantics: if previous simulation completed, reset.
+            # Otherwise stop→start resumes (documented cumulative behavior).
+            if sim_state.get("step", 0) >= sim_state.get("max_steps", 7280):
+                sim_state.update({
+                    "step": 0, "epoch": 0.0, "current_epoch_int": 0,
+                    "loss": 0.4850, "learning_rate": 1e-4,
+                    "elapsed_seconds": 0, "eta_seconds": 1800,
+                })
+                sim_loss_history.clear()
+                # Keep the two baselines, drop epoch checkpoints.
+                del sim_benchmarks[2:]
+                sim_logs.append("[Demo Engine] >>> Previous run completed; state reset for fresh run.")
             sim_state["is_running"] = True
             sim_state["status"] = "training"
             sim_logs.append("[Demo Engine] >>> Training initiated by user.")
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "started", "pid": 9999}).encode("utf-8"))
             return
@@ -287,9 +332,9 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
         if path == "/api/train/stop":
             sim_state["is_running"] = False
             sim_state["status"] = "idle"
-            sim_logs.append("[Demo Engine] >>> Training halted by user.")
+            sim_logs.append("[Demo Engine] >>> Training halted by user. (State kept; Launch resumes.)")
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "stopped"}).encode("utf-8"))
             return

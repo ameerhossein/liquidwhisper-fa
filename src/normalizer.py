@@ -41,12 +41,13 @@ class PersianTextNormalizer:
         self.punct_pattern = re.compile(r"""[.,?!:;"'()\[\]{}<>\/\\@#$%^&*_\-+=~`|«»؟،؛…—–]""")
 
         # Persian and Arabic digits mapping to standard Persian or ASCII
+        # NOTE: "ۀ" (U+06C0 Heh with hamza / ezafe form) is intentionally NOT
+        # mapped to "ه" — that would delete the ezafe. Hazm handles it.
         self.arabic_to_persian_chars = {
             "ك": "ک",
             "ي": "ی",
             "ى": "ی",
             "ة": "ه",
-            "ۀ": "ه",
             "ؤ": "و",
             "إ": "ا",
             "أ": "ا",
@@ -54,16 +55,17 @@ class PersianTextNormalizer:
             "\u0640": "",  # Tatweel / Kashida
         }
 
-        # Common colloquial contraction indicators for classification heuristics
+        # Colloquial markers only (formal words like چرا/چطور/اینجا/اونجا
+        # also occur in formal text, so they are NOT included here).
         self.colloquial_patterns = [
             r"\bمی‌خوام\b", r"\bمیخوام\b", r"\bمی‌خواستم\b",
             r"\bمیرم\b", r"\bمیری\b", r"\bمیره\b", r"\bمیریم\b", r"\bمیرن\b",
             r"\bمیشه\b", r"\bنمیشه\b", r"\bمیشد\b",
             r"\bواسه\b", r"\bواسم\b", r"\bواست\b",
-            r"\bچیکار\b", r"\bچطور\b", r"\bچرا\b",
-            r"\bاونا\b", r"\bاینا\b", r"\bاونجا\b", r"\bاینجا\b",
+            r"\bچیکار\b",
+            r"\bاونا\b", r"\bاینا\b",
             r"\bبگم\b", r"\bبگی\b", r"\bبگه\b",
-            r"\bخونه\b", r"\bدیگه\b", r"\bهمینطور\b"
+            r"\bخونه\b", r"\bدیگه\b",
         ]
         self.colloquial_regex = re.compile("|".join(self.colloquial_patterns))
 

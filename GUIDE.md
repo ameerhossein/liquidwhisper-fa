@@ -119,6 +119,8 @@ source .venv/bin/activate
 | **Optimizer** | `adamw_torch_fused` |
 | **Duration** | **~3 to 5 hours** for 4 epochs |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
+| **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |
+| **Epoch Benchmark** | 300-sample subset by default (`--max_benchmark_samples 0` = full 2,149) |
 
 ### Live Monitoring & Management (RunPod Web Cockpit):
 Launch the web interface (port 7860, RunPod HTTP proxy compatible):
@@ -127,8 +129,9 @@ Launch the web interface (port 7860, RunPod HTTP proxy compatible):
 ```
 Open your RunPod HTTP proxy URL in your browser to view:
 - **Real-time Telemetry:** GPU VRAM allocation gauge, Loss curve, LR, and ETA.
-- **Epoch Benchmark Comparison Matrix:** Automatically evaluates the complete 2,149-sample test split at the end of every epoch and records normalized WER, CER, formal vs. informal breakdown, and emerald delta badges vs. Whisper Large v3.
+- **Epoch Benchmark Comparison Matrix:** Evaluates a 300-sample subset per epoch by default (use `--max_benchmark_samples 0` for the complete 2,149-sample test split) and records normalized WER, CER, formal vs. informal breakdown, and emerald delta badges vs. Whisper Large v3.
 - **Canary Audio Inspector:** Live orthography comparison for ZWNJ and colloquial contractions.
+- Set `ASR_COCKPIT_TOKEN` env to require a token on train start/stop (public proxy hardening).
 
 ---
 

@@ -1,20 +1,22 @@
-# Core Deep Learning & CUDA Acceleration
+# Core Deep Learning & CUDA Acceleration (torch cu124 via setup_server.sh)
 torch>=2.2.0
 torchaudio>=2.2.0
-torchvision>=0.17.0
 accelerate>=0.30.0
 peft>=0.11.1
-bitsandbytes>=0.43.0
+# NOTE: torchvision and bitsandbytes removed — unused (BF16 LoRA, no QLoRA/vision).
+# If you need 4-bit quantization later: pip install bitsandbytes>=0.43.0
 
 # Hugging Face Stack
 transformers>=4.42.0
 datasets>=2.19.0
 evaluate>=0.4.2
 huggingface_hub>=0.23.0
+tensorboard>=2.14.0  # required by train_lora.py report_to=["tensorboard"]
 
 # Persian NLP & Text Normalization
 hazm>=0.9.4
-shekar>=0.1.0; platform_system != "Windows"
+# NOTE: `shekar` PyPI package removed — not imported anywhere; dataset comes
+# from Hugging Face `shekar-ai/Neyshekar` via `datasets`.
 
 # Speech & Audio Processing
 librosa>=0.10.1

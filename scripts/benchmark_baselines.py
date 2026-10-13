@@ -33,6 +33,7 @@ from src.data import PersianASRDataPipeline
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark Persian ASR Baseline Models")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config (e.g. configs/eval_config.yaml). CLI flags override file.")
     parser.add_argument(
         "--models",
         nargs="+",
@@ -75,7 +76,51 @@ def parse_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Computation device"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.config:
+        _apply_yaml_config(args, args.config)
+    return args
+
+
+def _apply_yaml_config(args: argparse.Namespace, path: str):
+    """Overlay eval YAML (configs/eval_config.yaml) onto args; CLI wins."""
+    import sys as _sys
+    try:
+        import yaml
+    except ImportError:
+        print("Warning: PyYAML not installed; ignoring --config.")
+        return
+    cli_flags = {a.split("=")[0] for a in _sys.argv[1:] if a.startswith("--")}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"Warning: failed to load config {path}: {e}")
+        return
+    bench = cfg.get("benchmark", {}) if isinstance(cfg.get("benchmark"), dict) else {}
+    mapping = {
+        "dataset_name": "dataset_name", "split": "split",
+        "batch_size": "batch_size", "output_dir": "output_dir",
+        "models": "models",
+    }
+    for yk, ak in mapping.items():
+        if yk in bench and ("--" + ak) not in cli_flags:
+            setattr(args, ak, bench[yk])
+
+
+def _resolve_infer_dtype(device: str):
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+
+def _should_autocast(device: str) -> bool:
+    return device.startswith("cuda") and torch.cuda.is_available()
 
 
 def transcribe_batch(
@@ -89,23 +134,38 @@ def transcribe_batch(
     sampling_rate = 16000
     waveforms = [a["array"] for a in audios]
 
-    inputs = processor(
+    feats = processor(
         waveforms,
         sampling_rate=sampling_rate,
         return_tensors="pt"
     ).input_features.to(device)
 
-    # Autocast to bfloat16 or float16 if on CUDA
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 if device == "cuda" else torch.float32
-
-    with torch.inference_mode(), torch.autocast(device_type=device.split(":")[0], dtype=dtype):
-        # Monolingual BuzzASR already bakes Persian prompt into its generation config
-        if "buzzasr" in model_id.lower():
-            predicted_ids = model.generate(inputs, max_new_tokens=225)
-        else:
-            # For standard multilingual Whisper, force Persian transcription
-            forced_decoder_ids = processor.get_decoder_prompt_ids(language="persian", task="transcribe")
-            predicted_ids = model.generate(inputs, forced_decoder_ids=forced_decoder_ids, max_new_tokens=225)
+    # Autocast to bfloat16/float16 only on CUDA; plain inference on CPU.
+    if _should_autocast(device):
+        dtype = _resolve_infer_dtype(device)
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+            if "buzzasr" in model_id.lower():
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+            else:
+                forced_decoder_ids = processor.get_decoder_prompt_ids(language="persian", task="transcribe")
+                predicted_ids = model.generate(
+                    input_features=feats,
+                    forced_decoder_ids=forced_decoder_ids,
+                    max_new_tokens=225,
+                )
+    else:
+        with torch.inference_mode():
+            # Monolingual BuzzASR already bakes Persian prompt into its generation config
+            if "buzzasr" in model_id.lower():
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+            else:
+                # For standard multilingual Whisper, force Persian transcription
+                forced_decoder_ids = processor.get_decoder_prompt_ids(language="persian", task="transcribe")
+                predicted_ids = model.generate(
+                    input_features=feats,
+                    forced_decoder_ids=forced_decoder_ids,
+                    max_new_tokens=225,
+                )
 
     transcriptions = processor.batch_decode(predicted_ids, skip_special_tokens=True)
     return transcriptions
@@ -153,7 +213,7 @@ def run_benchmark():
         processor = WhisperProcessor.from_pretrained(model_id)
         
         # Load model weights
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 if args.device == "cuda" else torch.float32
+        dtype = _resolve_infer_dtype(args.device)
         model = WhisperForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=dtype,

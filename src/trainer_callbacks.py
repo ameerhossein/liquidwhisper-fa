@@ -17,6 +17,64 @@ import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
 
+def _default_baselines() -> Dict[str, Any]:
+    return {
+        "whisper_v3": {
+            "name": "Whisper Large v3 (Zero-Shot)",
+            "normalized_wer": 28.50,
+            "normalized_cer": 8.90,
+            "diagnostic_wer": 26.10,
+            "formal_wer": 24.00,
+            "informal_wer": 36.80,
+        },
+        "buzzasr_base": {
+            "name": "BuzzASR Base (Zero-Shot)",
+            "normalized_wer": 17.20,
+            "normalized_cer": 4.80,
+            "diagnostic_wer": 15.90,
+            "formal_wer": 15.10,
+            "informal_wer": 22.40,
+        }
+    }
+
+
+def load_baselines(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load shared baselines from configs/baselines.json with safe fallback."""
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    # <repo>/configs/baselines.json relative to this file
+    candidates.append(Path(__file__).resolve().parent.parent / "configs" / "baselines.json")
+    candidates.append(Path("configs/baselines.json"))
+    for cand in candidates:
+        try:
+            if cand.exists():
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "whisper_v3" in data:
+                    return data
+        except Exception:
+            continue
+    return _default_baselines()
+
+
+def _resolve_infer_dtype(device: str):
+    """Pick inference dtype: bf16/fp16 on CUDA, fp32 on CPU."""
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+
+def _should_autocast(device: str) -> bool:
+    """Only autocast on CUDA. CPU autocast with fp32 raises."""
+    return device.startswith("cuda") and torch.cuda.is_available()
+
+
 class WebTelemetryCallback(TrainerCallback):
     """
     Captures live training telemetry and persists it for the web dashboard.
@@ -33,6 +91,9 @@ class WebTelemetryCallback(TrainerCallback):
         normalizer: Optional[Any] = None,
         canary_samples: Optional[List[Dict[str, Any]]] = None,
         baseline_benchmark: Optional[Dict[str, Any]] = None,
+        baselines_path: Optional[str] = None,
+        eval_batch_size: int = 16,
+        max_benchmark_samples: Optional[int] = 300,
     ):
         self.output_dir = output_dir
         self.results_dir = results_dir
@@ -41,26 +102,12 @@ class WebTelemetryCallback(TrainerCallback):
         self.metrics_calculator = metrics_calculator
         self.normalizer = normalizer
         self.canary_samples = canary_samples or []
-        
-        # Baselines to compare against
-        self.baseline_benchmark = baseline_benchmark or {
-            "whisper_v3": {
-                "name": "Whisper Large v3 (Zero-Shot)",
-                "normalized_wer": 28.50,
-                "normalized_cer": 8.90,
-                "diagnostic_wer": 26.10,
-                "formal_wer": 24.00,
-                "informal_wer": 36.80,
-            },
-            "buzzasr_base": {
-                "name": "BuzzASR Base (Zero-Shot)",
-                "normalized_wer": 17.20,
-                "normalized_cer": 4.80,
-                "diagnostic_wer": 15.90,
-                "formal_wer": 15.10,
-                "informal_wer": 22.40,
-            }
-        }
+        self.eval_batch_size = max(1, int(eval_batch_size or 16))
+        # None or <=0 means full test set; default 300 guards L40S OOM.
+        self.max_benchmark_samples = max_benchmark_samples
+
+        # Baselines to compare against (single source: configs/baselines.json)
+        self.baseline_benchmark = baseline_benchmark or load_baselines(baselines_path)
 
         os.makedirs(self.results_dir, exist_ok=True)
         self.telemetry_file = os.path.join(self.results_dir, "live_telemetry.json")
@@ -254,74 +301,123 @@ class WebTelemetryCallback(TrainerCallback):
             return {}
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 if device == "cuda" else torch.float32
+        dtype = _resolve_infer_dtype(device)
+        use_amp = _should_autocast(device)
 
-        model.eval()
-        total_test = len(self.test_dataset)
-        batch_size = 16
-        predictions = []
-        references = [sample.get("text", "") or "" for sample in self.test_dataset]
+        # Subsample to guard VRAM: None/<=0 means full set.
+        try:
+            total_available = len(self.test_dataset)
+        except Exception:
+            total_available = 0
+        limit = self.max_benchmark_samples
+        if limit is not None and limit > 0 and total_available > limit:
+            print(f"[TelemetryCallback] Subsampling benchmark: {limit}/{total_available} samples.")
+            try:
+                eval_ds = self.test_dataset.select(range(limit))
+            except Exception:
+                eval_ds = self.test_dataset
+        else:
+            eval_ds = self.test_dataset
 
-        is_informal = []
-        for s in self.test_dataset:
-            if "informal" in s:
-                is_informal.append(bool(s["informal"]))
-            elif "is_informal" in s:
-                is_informal.append(bool(s["is_informal"]))
-            else:
-                is_informal.append(self.normalizer.is_colloquial(s.get("text", "")))
+        total_test = len(eval_ds) if hasattr(eval_ds, "__len__") else 0
+        batch_size = self.eval_batch_size
 
-        with torch.inference_mode():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        was_training = False
+        try:
+            was_training = bool(getattr(model, "training", False))
+        except Exception:
+            pass
+
+        try:
+            model.eval()
+            predictions = []
+            references = [s.get("text", "") or "" for s in eval_ds]
+
+            is_informal = []
+            for s in eval_ds:
+                if "informal" in s:
+                    is_informal.append(bool(s["informal"]))
+                elif "is_informal" in s:
+                    is_informal.append(bool(s["is_informal"]))
+                elif self.normalizer is not None:
+                    is_informal.append(self.normalizer.is_colloquial(s.get("text", "")))
+                else:
+                    is_informal.append(False)
+
             for i in range(0, total_test, batch_size):
-                batch = self.test_dataset[i : i + batch_size]
+                batch = eval_ds[i : i + batch_size]
                 audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
                 waveforms = [a["array"] for a in audios]
 
-                inputs = self.processor(
+                feats = self.processor(
                     waveforms,
                     sampling_rate=16000,
                     return_tensors="pt"
                 ).input_features.to(device)
 
-                with torch.autocast(device_type=device.split(":")[0], dtype=dtype):
-                    pred_ids = model.generate(inputs, max_new_tokens=225)
+                if use_amp:
+                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                        pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+                else:
+                    with torch.inference_mode():
+                        pred_ids = model.generate(input_features=feats, max_new_tokens=225)
 
                 batch_preds = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
                 predictions.extend(batch_preds)
 
-        # Compute full metrics
-        metrics = self.metrics_calculator.evaluate_predictions(
-            references=references,
-            predictions=predictions,
-            is_informal_flags=is_informal
-        )
+            # Compute full metrics
+            metrics = self.metrics_calculator.evaluate_predictions(
+                references=references,
+                predictions=predictions,
+                is_informal_flags=is_informal
+            )
 
-        # Evaluate Canary Sentences (if provided)
-        canary_evals = []
-        for canary in self.canary_samples:
-            ref = canary.get("text", "")
-            audio_arr = canary.get("audio_array")
-            if audio_arr is not None:
-                inp = self.processor(
-                    audio_arr, sampling_rate=16000, return_tensors="pt"
-                ).input_features.to(device)
-                with torch.autocast(device_type=device.split(":")[0], dtype=dtype):
-                    c_pred_ids = model.generate(inp, max_new_tokens=225)
-                c_pred = self.processor.batch_decode(c_pred_ids, skip_special_tokens=True)[0]
-                canary_evals.append({
-                    "label": canary.get("label", "Canary"),
-                    "category": canary.get("category", "General"),
-                    "ref": ref,
-                    "pred": c_pred,
-                    "is_informal": canary.get("is_informal", False)
-                })
+            # Evaluate Canary Sentences (if provided)
+            canary_evals = []
+            for canary in self.canary_samples:
+                ref = canary.get("text", "")
+                audio_arr = canary.get("audio_array")
+                if audio_arr is not None:
+                    c_feats = self.processor(
+                        audio_arr, sampling_rate=16000, return_tensors="pt"
+                    ).input_features.to(device)
+                    if use_amp:
+                        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225)
+                    else:
+                        with torch.inference_mode():
+                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225)
+                    c_pred = self.processor.batch_decode(c_pred_ids, skip_special_tokens=True)[0]
+                    canary_evals.append({
+                        "label": canary.get("label", "Canary"),
+                        "category": canary.get("category", "General"),
+                        "ref": ref,
+                        "pred": c_pred,
+                        "is_informal": canary.get("is_informal", False)
+                    })
 
-        metrics["canary_transcriptions"] = canary_evals
-        model.train()
-        return metrics
+            metrics["canary_transcriptions"] = canary_evals
+            return metrics
+        finally:
+            try:
+                if was_training:
+                    model.train()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
     def _record_epoch_benchmark(self, epoch_num: int, results: Dict[str, Any]):
         """Persists epoch metrics and calculates deltas vs. baselines."""
+        if not results or not results.get("overall"):
+            print(f"[TelemetryCallback] No benchmark results for epoch {epoch_num}; skipping record.")
+            return
         overall = results.get("overall", {})
         formal = results.get("formal", {})
         informal = results.get("informal", {})

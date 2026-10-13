@@ -46,40 +46,117 @@ app.add_middleware(
 
 # Global process manager
 training_process: Optional[subprocess.Popen] = None
+training_log_fd = None
 connected_websockets: List[WebSocket] = []
+PID_FILE = RESULTS_DIR / "training.pid"
+
+_HARDCODED_BASELINES = [
+    {
+        "epoch": "Whisper Large v3 (Zero-Shot)",
+        "epoch_number": 0,
+        "type": "baseline",
+        "is_baseline": True,
+        "normalized_wer": 28.50,
+        "normalized_cer": 8.90,
+        "diagnostic_wer": 26.10,
+        "formal_wer": 24.00,
+        "informal_wer": 36.80,
+        "delta_vs_whisper": 0.0,
+        "total_samples": 2149,
+        "canary_transcriptions": []
+    },
+    {
+        "epoch": "BuzzASR Base (Zero-Shot)",
+        "epoch_number": 0,
+        "type": "baseline",
+        "is_baseline": True,
+        "normalized_wer": 17.20,
+        "normalized_cer": 4.80,
+        "diagnostic_wer": 15.90,
+        "formal_wer": 15.10,
+        "informal_wer": 22.40,
+        "delta_vs_whisper": -11.30,
+        "total_samples": 2149,
+        "canary_transcriptions": []
+    }
+]
+
+
+def _load_shared_baselines() -> List[Dict[str, Any]]:
+    """Single source of truth: configs/baselines.json, fallback to hardcoded."""
+    for cand in (BASE_DIR / "configs" / "baselines.json", Path("configs/baselines.json")):
+        try:
+            if cand.exists():
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                w = data.get("whisper_v3", {})
+                b = data.get("buzzasr_base", {})
+                if w and b:
+                    return [
+                        {
+                            "epoch": w.get("epoch", w.get("name", "Whisper Large v3 (Zero-Shot)")),
+                            "epoch_number": 0,
+                            "type": "baseline",
+                            "is_baseline": True,
+                            "normalized_wer": float(w.get("normalized_wer", 28.5)),
+                            "normalized_cer": float(w.get("normalized_cer", 8.9)),
+                            "diagnostic_wer": float(w.get("diagnostic_wer", 26.1)),
+                            "formal_wer": float(w.get("formal_wer", 24.0)),
+                            "informal_wer": float(w.get("informal_wer", 36.8)),
+                            "delta_vs_whisper": 0.0,
+                            "total_samples": int(w.get("total_samples", 2149)),
+                            "canary_transcriptions": []
+                        },
+                        {
+                            "epoch": b.get("epoch", b.get("name", "BuzzASR Base (Zero-Shot)")),
+                            "epoch_number": 0,
+                            "type": "baseline",
+                            "is_baseline": True,
+                            "normalized_wer": float(b.get("normalized_wer", 17.2)),
+                            "normalized_cer": float(b.get("normalized_cer", 4.8)),
+                            "diagnostic_wer": float(b.get("diagnostic_wer", 15.9)),
+                            "formal_wer": float(b.get("formal_wer", 15.1)),
+                            "informal_wer": float(b.get("informal_wer", 22.4)),
+                            "delta_vs_whisper": round(float(b.get("normalized_wer", 17.2)) - float(w.get("normalized_wer", 28.5)), 2),
+                            "total_samples": int(b.get("total_samples", 2149)),
+                            "canary_transcriptions": []
+                        },
+                    ]
+        except Exception:
+            continue
+    return [dict(r) for r in _HARDCODED_BASELINES]
+
+
+def _is_process_running(pid: Optional[int] = None) -> bool:
+    """Check PID liveness (for restart recovery via PID file)."""
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _check_auth(config: Optional[Dict[str, Any]]) -> None:
+    """Optional token gate: set ASR_COCKPIT_TOKEN env to require it.
+
+    Public RunPod proxy URLs are unauthenticated by default; setting the
+    env var requires callers to send {"token": "..."} or X-Auth-Token.
+    """
+    required = os.environ.get("ASR_COCKPIT_TOKEN", "")
+    if not required:
+        return
+    provided = ""
+    if isinstance(config, dict):
+        provided = str(config.get("token", "") or "")
+    # FastAPI header check happens in endpoint via Request; body fallback here.
+    if provided != required:
+        raise HTTPException(status_code=401, detail="Invalid or missing cockpit token.")
 
 
 def get_default_benchmarks() -> List[Dict[str, Any]]:
-    return [
-        {
-            "epoch": "Whisper Large v3 (Zero-Shot)",
-            "epoch_number": 0,
-            "type": "baseline",
-            "is_baseline": True,
-            "normalized_wer": 28.50,
-            "normalized_cer": 8.90,
-            "diagnostic_wer": 26.10,
-            "formal_wer": 24.00,
-            "informal_wer": 36.80,
-            "delta_vs_whisper": 0.0,
-            "total_samples": 2149,
-            "canary_transcriptions": []
-        },
-        {
-            "epoch": "BuzzASR Base (Zero-Shot)",
-            "epoch_number": 0,
-            "type": "baseline",
-            "is_baseline": True,
-            "normalized_wer": 17.20,
-            "normalized_cer": 4.80,
-            "diagnostic_wer": 15.90,
-            "formal_wer": 15.10,
-            "informal_wer": 22.40,
-            "delta_vs_whisper": -11.30,
-            "total_samples": 2149,
-            "canary_transcriptions": []
-        }
-    ]
+    return _load_shared_baselines()
 
 
 def read_json_safely(path: Path, default: Any) -> Any:
@@ -120,6 +197,34 @@ def get_gpu_info() -> Dict[str, Any]:
     }
 
 
+def _close_log_fd():
+    global training_log_fd
+    try:
+        if training_log_fd is not None:
+            try:
+                training_log_fd.flush()
+            except Exception:
+                pass
+            try:
+                training_log_fd.close()
+            except Exception:
+                pass
+    finally:
+        training_log_fd = None
+
+
+def _sanitize_output_dir(raw: str) -> str:
+    """Confine output_dir under BASE_DIR to block ../ traversal."""
+    raw = (raw or "outputs/buzzasr-neyshekar-lora").strip() or "outputs/buzzasr-neyshekar-lora"
+    # Reject absolute paths outside repo and traversal.
+    p = (BASE_DIR / raw).resolve() if not os.path.isabs(raw) else Path(raw).resolve()
+    try:
+        p.relative_to(BASE_DIR.resolve())
+    except Exception:
+        raise HTTPException(status_code=400, detail="output_dir must stay inside project directory.")
+    return str(p.relative_to(BASE_DIR.resolve()))
+
+
 @app.get("/")
 async def serve_index():
     index_file = STATIC_DIR / "index.html"
@@ -138,6 +243,23 @@ async def get_status():
             is_running = True
         else:
             training_process = None
+            _close_log_fd()
+            try:
+                if PID_FILE.exists():
+                    PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+    if not is_running:
+        # Recover liveness across server restarts via PID file.
+        try:
+            if PID_FILE.exists():
+                pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
+                if _is_process_running(pid):
+                    is_running = True
+                else:
+                    PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     telemetry = read_json_safely(TELEMETRY_FILE, {
         "status": "running" if is_running else "idle",
@@ -190,17 +312,50 @@ async def get_logs(tail: int = 150):
 
 @app.post("/api/train/start")
 async def start_training(config: Dict[str, Any] = None):
-    global training_process
+    global training_process, training_log_fd
+    _check_auth(config)
     if training_process is not None and training_process.poll() is None:
         raise HTTPException(status_code=400, detail="Training is already currently running.")
+    # Recover from PID file after restart.
+    try:
+        if PID_FILE.exists():
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
+            if _is_process_running(pid):
+                raise HTTPException(status_code=400, detail=f"Training already running (pid {pid}).")
+            PID_FILE.unlink(missing_ok=True)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     config = config or {}
-    epochs = str(config.get("epochs", 4))
-    batch_size = str(config.get("batch_size", 16))
-    grad_accum = str(config.get("grad_accum", 2))
-    lr = str(config.get("learning_rate", 1e-4))
-    output_dir = str(config.get("output_dir", "outputs/buzzasr-neyshekar-lora"))
-    dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar"))
+    try:
+        epochs_i = int(config.get("epochs", 4))
+        batch_i = int(config.get("batch_size", 16))
+        accum_i = int(config.get("grad_accum", 2))
+        lr_f = float(config.get("learning_rate", 1e-4))
+        eval_bs_i = int(config.get("eval_batch_size", 16))
+        max_bench = config.get("max_benchmark_samples", 300)
+        max_bench_i = int(max_bench) if max_bench not in (None, "") else 300
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size must be integers; learning_rate numeric.")
+    if not (1 <= epochs_i <= 20):
+        raise HTTPException(status_code=400, detail="epochs must be 1..20.")
+    if not (1 <= batch_i <= 64):
+        raise HTTPException(status_code=400, detail="batch_size must be 1..64.")
+    if not (1 <= accum_i <= 16):
+        raise HTTPException(status_code=400, detail="grad_accum must be 1..16.")
+    if not (1e-7 <= lr_f <= 1e-2):
+        raise HTTPException(status_code=400, detail="learning_rate must be 1e-7..1e-2.")
+    if not (1 <= eval_bs_i <= 64):
+        raise HTTPException(status_code=400, detail="eval_batch_size must be 1..64.")
+    if not (0 <= max_bench_i <= 10000):
+        raise HTTPException(status_code=400, detail="max_benchmark_samples must be 0..10000 (0=full).")
+
+    output_dir = _sanitize_output_dir(str(config.get("output_dir", "outputs/buzzasr-neyshekar-lora")))
+    dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
+    if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
+        raise HTTPException(status_code=400, detail="Invalid dataset_name.")
 
     # Remove any old stop signal
     if STOP_SIGNAL_FILE.exists():
@@ -212,42 +367,50 @@ async def start_training(config: Dict[str, Any] = None):
         "--base_model", "BuzzASR/persian",
         "--dataset_name", dataset_name,
         "--output_dir", output_dir,
-        "--epochs", epochs,
-        "--batch_size", batch_size,
-        "--grad_accum", grad_accum,
-        "--learning_rate", lr,
+        "--epochs", str(epochs_i),
+        "--batch_size", str(batch_i),
+        "--grad_accum", str(accum_i),
+        "--learning_rate", str(lr_f),
+        "--eval_batch_size", str(eval_bs_i),
+        "--max_benchmark_samples", str(max_bench_i),
         "--enable_telemetry",
         "--run_epoch_benchmark"
     ]
 
-    log_fd = open(LOG_FILE, "w", encoding="utf-8")
-    log_fd.write(f"=== Persian ASR Training Job Launched at {time.ctime()} ===\n")
-    log_fd.write(f"Command: {' '.join(cmd)}\n\n")
-    log_fd.flush()
+    _close_log_fd()
+    training_log_fd = open(LOG_FILE, "w", encoding="utf-8")
+    training_log_fd.write(f"=== Persian ASR Training Job Launched at {time.ctime()} ===\n")
+    training_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
+    training_log_fd.flush()
 
     training_process = subprocess.Popen(
         cmd,
-        stdout=log_fd,
+        stdout=training_log_fd,
         stderr=subprocess.STDOUT,
         cwd=str(BASE_DIR),
         preexec_fn=os.setsid if sys.platform != "win32" else None
     )
+    try:
+        PID_FILE.write_text(str(training_process.pid), encoding="utf-8")
+    except Exception:
+        pass
 
     return {
         "status": "started",
         "pid": training_process.pid,
         "config": {
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "learning_rate": lr,
+            "epochs": str(epochs_i),
+            "batch_size": str(batch_i),
+            "learning_rate": str(lr_f),
             "output_dir": output_dir
         }
     }
 
 
 @app.post("/api/train/stop")
-async def stop_training():
+async def stop_training(payload: Dict[str, Any] = None):
     global training_process
+    _check_auth(payload)
     # 1. Trigger graceful stop via file signal
     with open(STOP_SIGNAL_FILE, "w") as f:
         f.write("stop")
@@ -264,6 +427,12 @@ async def stop_training():
             except Exception:
                 pass
         training_process = None
+    _close_log_fd()
+    try:
+        if PID_FILE.exists():
+            PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     return {"status": "stopped"}
 
@@ -274,14 +443,21 @@ async def websocket_telemetry(websocket: WebSocket):
     connected_websockets.append(websocket)
     try:
         while True:
-            # Poll status, telemetry and send to client
+            # Poll status, telemetry and send to client (1s cadence to save bandwidth)
             telemetry = read_json_safely(TELEMETRY_FILE, {})
             benchmarks = read_json_safely(BENCHMARKS_FILE, get_default_benchmarks())
             loss_hist = read_json_safely(LOSS_HISTORY_FILE, [])
 
-            # Check process status
+            # Check process status (in-memory + PID file for restart recovery)
             global training_process
             is_running = training_process is not None and training_process.poll() is None
+            if not is_running:
+                try:
+                    if PID_FILE.exists():
+                        pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
+                        is_running = _is_process_running(pid)
+                except Exception:
+                    pass
             telemetry["process_running"] = is_running
             if not is_running and telemetry.get("status") in ["training", "evaluating_benchmark"]:
                 telemetry["status"] = "idle"
@@ -293,11 +469,14 @@ async def websocket_telemetry(websocket: WebSocket):
                 "timestamp": time.time()
             }
             await websocket.send_json(payload)
-            await asyncio.sleep(0.5)  # 500ms broadcast cycle
+            await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         pass
     except Exception:
-        pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
     finally:
         if websocket in connected_websockets:
             connected_websockets.remove(websocket)

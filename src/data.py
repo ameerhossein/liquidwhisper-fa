@@ -10,7 +10,15 @@ Supports:
 
 import os
 from typing import Optional, Dict, Any
-from datasets import load_dataset, Audio, DatasetDict, Dataset
+try:
+    from datasets import load_dataset, Audio, DatasetDict, Dataset
+    _DATASETS_AVAILABLE = True
+except ImportError:
+    load_dataset = None  # type: ignore
+    Audio = None  # type: ignore
+    DatasetDict = dict  # type: ignore
+    Dataset = object  # type: ignore
+    _DATASETS_AVAILABLE = False
 from src.normalizer import PersianTextNormalizer
 
 
@@ -31,12 +39,43 @@ class PersianASRDataPipeline:
         self.min_duration_seconds = min_duration_seconds
         self.num_proc = num_proc
 
+    def _audio_duration_seconds(self, audio: Dict[str, Any]) -> float:
+        """Compute duration from waveform length. Returns 0.0 if unknown."""
+        try:
+            arr = audio.get("array", [])
+            sr = audio.get("sampling_rate", 16000) or 16000
+            return len(arr) / float(sr) if sr else 0.0
+        except Exception:
+            return 0.0
+
+    def _truncate_audio(self, audio: Dict[str, Any]) -> Dict[str, Any]:
+        """Truncate waveform to max_duration_seconds (Whisper caps at 30s)."""
+        max_len = int(self.max_duration_seconds * 16000)
+        arr = audio.get("array", [])
+        if len(arr) > max_len:
+            audio = dict(audio)
+            # datasets Audio arrays may be list or numpy; slice preserves type for list,
+            # for numpy use slicing which also works.
+            try:
+                audio["array"] = arr[:max_len]
+            except Exception:
+                import numpy as np
+                audio["array"] = np.asarray(arr)[:max_len]
+        return audio
+
+    def is_valid_duration(self, audio: Dict[str, Any]) -> bool:
+        """Check min-duration (and non-empty). Max is truncated, not dropped."""
+        dur = self._audio_duration_seconds(audio)
+        return dur >= self.min_duration_seconds and dur > 0
+
     def load_raw_dataset(
         self,
         split: Optional[str] = None,
         max_samples: Optional[int] = None
     ) -> Any:
         """Loads dataset from Hugging Face Hub, resamples audio to 16kHz."""
+        if not _DATASETS_AVAILABLE:
+            raise ImportError("datasets package not installed; cannot load HF dataset.")
         print(f"Loading dataset '{self.dataset_name}' (split={split})...")
         try:
             ds = load_dataset(self.dataset_name, split=split)
@@ -66,12 +105,18 @@ class PersianASRDataPipeline:
         audio = batch["audio"]
         raw_text = batch.get("text", "") or ""
 
-        # Normalize text for target label
+        # NOTE: Training keeps punctuation (remove_punctuation=False) to preserve
+        # natural transcripts for generation. Evaluation in src/metrics.py strips
+        # punctuation (remove_punctuation=True) for standardized WER. This is
+        # intentional; do not "fix" by unifying without retraining.
         clean_text = self.normalizer.normalize(
             raw_text,
             remove_punctuation=False,
             zwnj_mode="keep"
         )
+
+        # Truncate to max_duration (Whisper input caps at 30s / 3000 mel frames).
+        audio = self._truncate_audio(audio)
 
         # 1. Audio feature extraction (128 mel bins for Whisper Large v3 / BuzzASR)
         input_features = self.processor.feature_extractor(
@@ -101,13 +146,46 @@ class PersianASRDataPipeline:
         remove_columns: Optional[list] = None
     ) -> Dataset:
         """Applies mapping over dataset to produce model-ready inputs."""
+        # Drop too-short clips (min_duration). Overlong clips are truncated
+        # in prepare_sample, not dropped.
+        orig_len = len(dataset)
+        try:
+            dataset = dataset.filter(
+                lambda x: self.is_valid_duration(x["audio"]),
+                desc="Filtering by duration",
+            )
+            dropped = orig_len - len(dataset)
+            if dropped:
+                print(f"Filtered {dropped}/{orig_len} samples below {self.min_duration_seconds}s.")
+        except Exception as e:
+            print(f"Duration filtering skipped ({e}). Continuing without filter.")
+
         cols_to_remove = remove_columns or [c for c in dataset.column_names if c not in ["input_features", "labels", "is_informal"]]
 
         print("Transforming dataset (feature extraction & tokenization)...")
-        prepared_ds = dataset.map(
-            self.prepare_sample,
-            remove_columns=cols_to_remove,
-            num_proc=min(self.num_proc, os.cpu_count() or 1),
-            desc="Preparing ASR Features"
-        )
+        # num_proc=0 (or 1) must run single-process; datasets.map with
+        # num_proc>1 pickles prepare_sample (bound method) which can fail.
+        effective_proc = 1
+        try:
+            if self.num_proc and self.num_proc > 1:
+                effective_proc = min(self.num_proc, os.cpu_count() or 1)
+        except Exception:
+            effective_proc = 1
+
+        map_kwargs: Dict[str, Any] = {
+            "remove_columns": cols_to_remove,
+            "desc": "Preparing ASR Features",
+        }
+        if effective_proc > 1:
+            map_kwargs["num_proc"] = effective_proc
+
+        try:
+            prepared_ds = dataset.map(self.prepare_sample, **map_kwargs)
+        except Exception as e:
+            if effective_proc > 1:
+                print(f"Multiprocess map failed ({e}). Retrying single-process...")
+                map_kwargs.pop("num_proc", None)
+                prepared_ds = dataset.map(self.prepare_sample, **map_kwargs)
+            else:
+                raise
         return prepared_ds

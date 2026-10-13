@@ -77,7 +77,18 @@ def main():
     print(f"Loading processor from: {load_source}...")
     processor = WhisperProcessor.from_pretrained(load_source)
 
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 if args.device == "cuda" else torch.float32
+    def _resolve_dtype(device: str):
+        if device.startswith("cuda") and torch.cuda.is_available():
+            try:
+                if torch.cuda.is_bf16_supported():
+                    return torch.bfloat16
+            except Exception:
+                pass
+            return torch.float16
+        return torch.float32
+
+    use_amp = args.device.startswith("cuda") and torch.cuda.is_available()
+    dtype = _resolve_dtype(args.device)
     if args.model_path:
         print(f"Loading merged model from: {args.model_path}...")
         model = WhisperForConditionalGeneration.from_pretrained(args.model_path, torch_dtype=dtype).to(args.device)
@@ -97,10 +108,14 @@ def main():
         print(f"\nTranscribing: {file_path.name}")
         waveform = load_audio(str(file_path), target_sr=16000)
 
-        inputs = processor(waveform, sampling_rate=16000, return_tensors="pt").input_features.to(args.device)
+        feats = processor(waveform, sampling_rate=16000, return_tensors="pt").input_features.to(args.device)
 
-        with torch.inference_mode(), torch.autocast(device_type=args.device.split(":")[0], dtype=dtype):
-            predicted_ids = model.generate(inputs, max_new_tokens=225)
+        if use_amp:
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+        else:
+            with torch.inference_mode():
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
 
         transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
 

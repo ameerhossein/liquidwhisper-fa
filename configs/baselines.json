@@ -1,0 +1,22 @@
+{
+  "whisper_v3": {
+    "name": "Whisper Large v3 (Zero-Shot)",
+    "epoch": "Whisper Large v3 (Zero-Shot)",
+    "normalized_wer": 28.5,
+    "normalized_cer": 8.9,
+    "diagnostic_wer": 26.1,
+    "formal_wer": 24.0,
+    "informal_wer": 36.8,
+    "total_samples": 2149
+  },
+  "buzzasr_base": {
+    "name": "BuzzASR Base (Zero-Shot)",
+    "epoch": "BuzzASR Base (Zero-Shot)",
+    "normalized_wer": 17.2,
+    "normalized_cer": 4.8,
+    "diagnostic_wer": 15.9,
+    "formal_wer": 15.1,
+    "informal_wer": 22.4,
+    "total_samples": 2149
+  }
+}
