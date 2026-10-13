@@ -1,0 +1,16 @@
+# Evaluation and Benchmarking configuration
+
+benchmark:
+  dataset_name: "shekar-ai/Neyshekar"
+  split: "test"
+  batch_size: 16
+  models:
+    - "openai/whisper-large-v3"
+    - "BuzzASR/persian"
+  output_dir: "results/baselines"
+
+metrics:
+  calculate_raw: true
+  calculate_normalized: true
+  calculate_diagnostic_zwnj_space: true
+  breakdown_by_register: true    # Formal vs. Informal

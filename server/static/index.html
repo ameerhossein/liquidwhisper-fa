@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Persian ASR Telemetry Cockpit | RunPod</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+
+  <!-- Top App Navigation & Status Header -->
+  <header class="app-header">
+    <div class="brand-section">
+      <div class="brand-icon">
+        <!-- Audio waveform wave icon -->
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v20M17 5v14M7 8v8M22 10v4M2 10v4"/>
+        </svg>
+      </div>
+      <div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span class="brand-title">Persian ASR Cockpit</span>
+          <span class="brand-tag">BuzzASR × Neyshekar</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Telemetry Status Strip -->
+    <div class="header-telemetry">
+      <div id="statusPill" class="status-pill idle">
+        <span class="status-dot"></span>
+        <span id="statusText">Engine Ready</span>
+      </div>
+
+      <!-- RunPod L40S VRAM Allocation Gauge -->
+      <div class="vram-gauge">
+        <span id="gpuModel" style="color: var(--text-muted); font-weight: 500;">NVIDIA L40S</span>
+        <div class="vram-bar-outer">
+          <div id="vramFill" class="vram-bar-fill"></div>
+        </div>
+        <span id="vramText" class="tabular-nums">0.0 / 48.0 GB</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Viewport -->
+  <main class="app-main">
+
+    <!-- Top Two-Column Grid: Controls/Metrics/Loss + Canary Audio Tokens -->
+    <div class="top-grid">
+
+      <!-- Left Card: Controls, Live Telemetry Stats & SVG Loss Horizon -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+            Training Control & Telemetry Horizon
+          </span>
+          <span style="font-size: 11px; color: var(--text-muted);">BF16 LoRA (r=64, α=128)</span>
+        </div>
+
+        <div class="card-body">
+          <!-- Control Strip -->
+          <div class="control-strip">
+            <div class="input-group">
+              <label class="input-label">Epochs</label>
+              <input type="number" id="inputEpochs" class="input-control" value="4" min="1" max="10" style="width: 75px;">
+            </div>
+
+            <div class="input-group">
+              <label class="input-label">Batch Size</label>
+              <input type="number" id="inputBatchSize" class="input-control" value="16" min="1" max="64" style="width: 85px;">
+            </div>
+
+            <div class="input-group">
+              <label class="input-label">Learning Rate</label>
+              <input type="text" id="inputLearningRate" class="input-control" value="0.0001" style="width: 95px;">
+            </div>
+
+            <div style="display: flex; gap: 8px; margin-left: auto; align-items: flex-end;">
+              <button id="btnStart" class="btn btn-primary">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+                Launch Run
+              </button>
+              <button id="btnStop" class="btn btn-danger" disabled>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12"/>
+                </svg>
+                Halt Job
+              </button>
+            </div>
+          </div>
+
+          <!-- Stat Numbers Grid -->
+          <div class="stat-grid">
+            <div class="stat-box">
+              <span class="stat-label">Global Step</span>
+              <span id="statStep" class="stat-value tabular-nums">0 / --</span>
+              <span class="stat-sub">Optimization Step</span>
+            </div>
+
+            <div class="stat-box">
+              <span class="stat-label">Current Loss</span>
+              <span id="statLoss" class="stat-value tabular-nums" style="color: var(--accent-cyan);">--</span>
+              <span class="stat-sub">Cross-Entropy</span>
+            </div>
+
+            <div class="stat-box">
+              <span class="stat-label">Throughput</span>
+              <span id="statSpeed" class="stat-value tabular-nums">--</span>
+              <span class="stat-sub">Step Latency</span>
+            </div>
+
+            <div class="stat-box">
+              <span class="stat-label">Time Remaining</span>
+              <span id="statEta" class="stat-value tabular-nums" style="color: var(--accent-amber);">--:--</span>
+              <span class="stat-sub">Elapsed: <span id="statElapsed" class="tabular-nums">0m</span></span>
+            </div>
+          </div>
+
+          <!-- Live SVG Loss Trajectory -->
+          <div class="chart-wrapper">
+            <svg id="svgChart" class="svg-chart">
+              <text x="50%" y="50%" fill="#64748b" font-size="12" text-anchor="middle">Awaiting live training steps to plot loss curve...</text>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Card: Persian Canary Audio Tokens (Signature Element) -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            Canary Audio Orthography Diff
+          </span>
+          <span style="font-size: 11px; color: var(--accent-amber);">ZWNJ & Spoken Contract</span>
+        </div>
+
+        <div class="card-body">
+          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+            Qualitative spot-check across representative Persian acoustic challenges:
+          </div>
+
+          <div id="canaryContainer" class="canary-list">
+            <!-- Canary 1: ZWNJ & Compound Affixes -->
+            <div class="canary-item">
+              <div class="canary-meta">
+                <span class="canary-tag">ZWNJ / نیم‌فاصله</span>
+                <span style="color: #64748b; font-size: 11px;">رسمی</span>
+              </div>
+              <div class="canary-ref">دانش‌آموزان کتاب‌های خود را در کیف می‌گذارند.</div>
+              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
+            </div>
+
+            <!-- Canary 2: Colloquial Contractions -->
+            <div class="canary-item">
+              <div class="canary-meta">
+                <span class="canary-tag">محاوره‌ای / Spoken</span>
+                <span style="color: #64748b; font-size: 11px;">گفتاری</span>
+              </div>
+              <div class="canary-ref">من الان می‌خوام برم خونه چون خیلی خسته‌ام و کار دارم.</div>
+              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
+            </div>
+
+            <!-- Canary 3: Standard Broadcast Speech -->
+            <div class="canary-item">
+              <div class="canary-meta">
+                <span class="canary-tag">معیار / Formal</span>
+                <span style="color: #64748b; font-size: 11px;">معیار</span>
+              </div>
+              <div class="canary-ref">بر اساس آخرین گزارش‌های اقتصادی نرخ تورم اعلام شد.</div>
+              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Focal Section: The Epoch Benchmark Comparison Matrix -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <line x1="3" y1="9" x2="21" y2="9"/>
+            <line x1="9" y1="21" x2="9" y2="9"/>
+          </svg>
+          Epoch Benchmark Comparison Matrix (Held-out Test Split, 2,149 recordings)
+        </span>
+        <span style="font-size: 11px; color: var(--accent-cyan);">Evaluated End-of-Epoch</span>
+      </div>
+
+      <div class="card-body" style="padding: 0;">
+        <div class="table-responsive">
+          <table class="benchmark-table">
+            <thead>
+              <tr>
+                <th>Model / Checkpoint</th>
+                <th>Normalized WER</th>
+                <th>Normalized CER</th>
+                <th>Diagnostic (ZWNJ $\rightarrow$ Space)</th>
+                <th>Formal WER</th>
+                <th>Informal WER</th>
+                <th>vs. Whisper v3</th>
+                <th>vs. BuzzASR Base</th>
+              </tr>
+            </thead>
+            <tbody id="benchmarkTbody">
+              <tr class="baseline-row">
+                <td><span class="badge-epoch">Whisper Large v3 (Zero-Shot)</span></td>
+                <td style="font-weight: 600; color: #f8fafc;">28.50%</td>
+                <td>8.90%</td>
+                <td>26.10%</td>
+                <td>24.00%</td>
+                <td>36.80%</td>
+                <td><span class="delta-badge neutral">Baseline</span></td>
+                <td><span class="delta-badge loss">↑ +11.3%</span></td>
+              </tr>
+              <tr class="baseline-row">
+                <td><span class="badge-epoch">BuzzASR Base (Zero-Shot)</span></td>
+                <td style="font-weight: 600; color: #f8fafc;">17.20%</td>
+                <td>4.80%</td>
+                <td>15.90%</td>
+                <td>15.10%</td>
+                <td>22.40%</td>
+                <td><span class="delta-badge win">↓ 11.3%</span></td>
+                <td><span class="delta-badge neutral">Baseline</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Console Drawer -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="4 17 10 11 4 5"/>
+            <line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+          RunPod Training Logs
+        </span>
+        <span style="font-size: 11px; color: var(--text-muted);">Auto-scrolling standard stream</span>
+      </div>
+      <div class="card-body" style="padding: 12px;">
+        <div id="consoleBox" class="console-box">
+          Connecting to log buffer...
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="app-footer">
+    <span>Persian Automatic Speech Recognition Dashboard &bull; Neyshekar v6 Dataset</span>
+    <span>Ready for RunPod Proxy (Port 7860)</span>
+  </footer>
+
+  <script src="/static/app.js?v=2"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Training configuration optimized for NVIDIA L40S (48 GB VRAM)
+
+model:
+  base_model: "BuzzASR/persian"
+  dataset_name: "shekar-ai/Neyshekar"
+  output_dir: "outputs/buzzasr-neyshekar-lora"
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "out_proj"
+    - "fc1"
+    - "fc2"
+
+training:
+  batch_size: 16
+  grad_accum: 2           # Effective batch size = 32
+  learning_rate: 1.0e-4
+  epochs: 4
+  warmup_steps: 500
+  eval_steps: 500
+  save_steps: 500
+  save_total_limit: 2
+  precision: "bf16"
+  optimizer: "adamw_torch_fused"
+  gradient_checkpointing: true
+  num_workers: 4
