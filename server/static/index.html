@@ -3,271 +3,188 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Persian ASR Telemetry Cockpit | RunPod</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <title>Persian ASR · Training</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
+  <div class="page">
 
-  <!-- Top App Navigation & Status Header -->
-  <header class="app-header">
-    <div class="brand-section">
-      <div class="brand-icon">
-        <!-- Audio waveform wave icon -->
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 2v20M17 5v14M7 8v8M22 10v4M2 10v4"/>
-        </svg>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-name">Persian ASR</span>
+        <span class="brand-sub">BuzzASR fine-tune on Neyshekar v6</span>
       </div>
-      <div>
-        <div style="display: flex; align-items: center; gap: 8px;">
-          <span class="brand-title">Persian ASR Cockpit</span>
-          <span class="brand-tag">BuzzASR × Neyshekar</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Live Telemetry Status Strip -->
-    <div class="header-telemetry">
-      <div id="statusPill" class="status-pill idle">
-        <span class="status-dot"></span>
-        <span id="statusText">Engine Ready</span>
-      </div>
-
-      <!-- RunPod L40S VRAM Allocation Gauge -->
-      <div class="vram-gauge">
-        <span id="gpuModel" style="color: var(--text-muted); font-weight: 500;">NVIDIA L40S</span>
-        <div class="vram-bar-outer">
-          <div id="vramFill" class="vram-bar-fill"></div>
-        </div>
-        <span id="vramText" class="tabular-nums">0.0 / 48.0 GB</span>
-      </div>
-    </div>
-  </header>
-
-  <!-- Main Viewport -->
-  <main class="app-main">
-
-    <!-- Top Two-Column Grid: Controls/Metrics/Loss + Canary Audio Tokens -->
-    <div class="top-grid">
-
-      <!-- Left Card: Controls, Live Telemetry Stats & SVG Loss Horizon -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-            </svg>
-            Training Control & Telemetry Horizon
-          </span>
-          <span style="font-size: 11px; color: var(--text-muted);">BF16 LoRA (r=64, α=128)</span>
-        </div>
-
-        <div class="card-body">
-          <!-- Control Strip -->
-          <div class="control-strip">
-            <div class="input-group">
-              <label class="input-label">Epochs</label>
-              <input type="number" id="inputEpochs" class="input-control" value="4" min="1" max="10" style="width: 75px;">
-            </div>
-
-            <div class="input-group">
-              <label class="input-label">Batch Size</label>
-              <input type="number" id="inputBatchSize" class="input-control" value="16" min="1" max="64" style="width: 85px;">
-            </div>
-
-            <div class="input-group">
-              <label class="input-label">Learning Rate</label>
-              <input type="text" id="inputLearningRate" class="input-control" value="0.0001" style="width: 95px;">
-            </div>
-
-            <div style="display: flex; gap: 8px; margin-left: auto; align-items: flex-end;">
-              <button id="btnStart" class="btn btn-primary">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                  <polygon points="5 3 19 12 5 21 5 3"/>
-                </svg>
-                Launch Run
-              </button>
-              <button id="btnStop" class="btn btn-danger" disabled>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="6" y="6" width="12" height="12"/>
-                </svg>
-                Halt Job
-              </button>
-            </div>
-          </div>
-
-          <!-- Stat Numbers Grid -->
-          <div class="stat-grid">
-            <div class="stat-box">
-              <span class="stat-label">Global Step</span>
-              <span id="statStep" class="stat-value tabular-nums">0 / --</span>
-              <span class="stat-sub">Optimization Step</span>
-            </div>
-
-            <div class="stat-box">
-              <span class="stat-label">Current Loss</span>
-              <span id="statLoss" class="stat-value tabular-nums" style="color: var(--accent-cyan);">--</span>
-              <span class="stat-sub">Cross-Entropy</span>
-            </div>
-
-            <div class="stat-box">
-              <span class="stat-label">Throughput</span>
-              <span id="statSpeed" class="stat-value tabular-nums">--</span>
-              <span class="stat-sub">Step Latency</span>
-            </div>
-
-            <div class="stat-box">
-              <span class="stat-label">Time Remaining</span>
-              <span id="statEta" class="stat-value tabular-nums" style="color: var(--accent-amber);">--:--</span>
-              <span class="stat-sub">Elapsed: <span id="statElapsed" class="tabular-nums">0m</span></span>
-            </div>
-          </div>
-
-          <!-- Live SVG Loss Trajectory -->
-          <div class="chart-wrapper">
-            <svg id="svgChart" class="svg-chart">
-              <text x="50%" y="50%" fill="#64748b" font-size="12" text-anchor="middle">Awaiting live training steps to plot loss curve...</text>
-            </svg>
-          </div>
-        </div>
-      </div>
-
-      <!-- Right Card: Persian Canary Audio Tokens (Signature Element) -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"/>
-              <line x1="12" y1="8" x2="12" y2="12"/>
-              <line x1="12" y1="16" x2="12.01" y2="16"/>
-            </svg>
-            Canary Audio Orthography Diff
-          </span>
-          <span style="font-size: 11px; color: var(--accent-amber);">ZWNJ & Spoken Contract</span>
-        </div>
-
-        <div class="card-body">
-          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-            Qualitative spot-check across representative Persian acoustic challenges:
-          </div>
-
-          <div id="canaryContainer" class="canary-list">
-            <!-- Canary 1: ZWNJ & Compound Affixes -->
-            <div class="canary-item">
-              <div class="canary-meta">
-                <span class="canary-tag">ZWNJ / نیم‌فاصله</span>
-                <span style="color: #64748b; font-size: 11px;">رسمی</span>
-              </div>
-              <div class="canary-ref">دانش‌آموزان کتاب‌های خود را در کیف می‌گذارند.</div>
-              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
-            </div>
-
-            <!-- Canary 2: Colloquial Contractions -->
-            <div class="canary-item">
-              <div class="canary-meta">
-                <span class="canary-tag">محاوره‌ای / Spoken</span>
-                <span style="color: #64748b; font-size: 11px;">گفتاری</span>
-              </div>
-              <div class="canary-ref">من الان می‌خوام برم خونه چون خیلی خسته‌ام و کار دارم.</div>
-              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
-            </div>
-
-            <!-- Canary 3: Standard Broadcast Speech -->
-            <div class="canary-item">
-              <div class="canary-meta">
-                <span class="canary-tag">معیار / Formal</span>
-                <span style="color: #64748b; font-size: 11px;">معیار</span>
-              </div>
-              <div class="canary-ref">بر اساس آخرین گزارش‌های اقتصادی نرخ تورم اعلام شد.</div>
-              <div class="canary-pred">...منتظر اتمام نخستین دوره</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- Focal Section: The Epoch Benchmark Comparison Matrix -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-            <line x1="3" y1="9" x2="21" y2="9"/>
-            <line x1="9" y1="21" x2="9" y2="9"/>
-          </svg>
-          Epoch Benchmark Comparison Matrix (Held-out Test Split, 2,149 recordings)
+      <div class="topbar-meta">
+        <span class="status"><span id="statusDot" class="dot dot-idle"></span><span id="statusLabel">Idle</span></span>
+        <span class="gpu">
+          <span id="gpuModel">NVIDIA L40S</span>
+          <span class="meter"><span id="vramFill" class="meter-fill"></span></span>
+          <span id="vramText" class="num">0.0 / 48.0 GB</span>
         </span>
-        <span style="font-size: 11px; color: var(--accent-cyan);">Evaluated End-of-Epoch</span>
       </div>
+    </header>
 
-      <div class="card-body" style="padding: 0;">
-        <div class="table-responsive">
-          <table class="benchmark-table">
+    <main>
+
+      <section class="run">
+        <div>
+          <p class="run-kicker">buzzasr-neyshekar-lora · LoRA r=64, α=128</p>
+          <h1 id="runTitle" class="run-title">Not started</h1>
+          <div class="progress">
+            <div class="progress-track">
+              <div id="progressFill" class="progress-fill"></div>
+              <div id="progressTicks" class="progress-ticks"></div>
+            </div>
+          </div>
+          <p id="runMeta" class="run-meta">Set the run parameters below and start.</p>
+        </div>
+
+        <dl class="run-stats">
+          <div class="stat">
+            <dt>Loss</dt>
+            <dd id="statLoss">--</dd>
+          </div>
+          <div class="stat">
+            <dt>Learning rate</dt>
+            <dd id="statLR">--</dd>
+          </div>
+          <div class="stat">
+            <dt>Step time</dt>
+            <dd id="statSpeed">--</dd>
+          </div>
+          <div class="stat">
+            <dt>Elapsed</dt>
+            <dd id="statElapsed">--</dd>
+          </div>
+        </dl>
+      </section>
+
+      <form class="config" onsubmit="return false">
+        <label class="field">
+          <span class="field-label">Epochs</span>
+          <input type="number" id="inputEpochs" class="field-input" value="4" min="1" max="10">
+        </label>
+        <label class="field">
+          <span class="field-label">Batch size</span>
+          <input type="number" id="inputBatchSize" class="field-input" value="16" min="1" max="64">
+        </label>
+        <label class="field">
+          <span class="field-label">Learning rate</span>
+          <input type="text" id="inputLearningRate" class="field-input" value="0.0001">
+        </label>
+        <div class="config-actions">
+          <button id="btnStop" type="button" class="btn btn-halt" disabled>Halt run</button>
+          <button id="btnStart" type="button" class="btn btn-primary">Start run</button>
+        </div>
+      </form>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <h2>Normalized WER</h2>
+            <p>Held-out test split, 2,149 recordings. Lower is better.</p>
+          </div>
+          <p class="legend"><span class="legend-line"></span>BuzzASR base</p>
+        </div>
+        <div class="table-wrap">
+          <table class="ladder">
             <thead>
               <tr>
-                <th>Model / Checkpoint</th>
-                <th>Normalized WER</th>
-                <th>Normalized CER</th>
-                <th>Diagnostic (ZWNJ $\rightarrow$ Space)</th>
-                <th>Formal WER</th>
-                <th>Informal WER</th>
-                <th>vs. Whisper v3</th>
-                <th>vs. BuzzASR Base</th>
+                <th scope="col">Checkpoint</th>
+                <th scope="col">Normalized WER</th>
+                <th scope="col" class="num">vs Whisper v3</th>
+                <th scope="col" class="num">vs BuzzASR base</th>
+                <th scope="col" class="num opt">CER</th>
+                <th scope="col" class="num opt">Formal</th>
+                <th scope="col" class="num opt">Informal</th>
+                <th scope="col" class="num opt" title="WER after replacing ZWNJ with a space">ZWNJ → space</th>
               </tr>
             </thead>
             <tbody id="benchmarkTbody">
-              <tr class="baseline-row">
-                <td><span class="badge-epoch">Whisper Large v3 (Zero-Shot)</span></td>
-                <td style="font-weight: 600; color: #f8fafc;">28.50%</td>
-                <td>8.90%</td>
-                <td>26.10%</td>
-                <td>24.00%</td>
-                <td>36.80%</td>
-                <td><span class="delta-badge neutral">Baseline</span></td>
-                <td><span class="delta-badge loss">↑ +11.3%</span></td>
-              </tr>
-              <tr class="baseline-row">
-                <td><span class="badge-epoch">BuzzASR Base (Zero-Shot)</span></td>
-                <td style="font-weight: 600; color: #f8fafc;">17.20%</td>
-                <td>4.80%</td>
-                <td>15.90%</td>
-                <td>15.10%</td>
-                <td>22.40%</td>
-                <td><span class="delta-badge win">↓ 11.3%</span></td>
-                <td><span class="delta-badge neutral">Baseline</span></td>
-              </tr>
+              <tr><td colspan="8" class="empty-cell">Waiting for benchmark data…</td></tr>
             </tbody>
           </table>
         </div>
-      </div>
-    </div>
+      </section>
 
-    <!-- Live Console Drawer -->
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="4 17 10 11 4 5"/>
-            <line x1="12" y1="19" x2="20" y2="19"/>
-          </svg>
-          RunPod Training Logs
-        </span>
-        <span style="font-size: 11px; color: var(--text-muted);">Auto-scrolling standard stream</span>
+      <div class="pair">
+        <section class="section">
+          <div class="section-head">
+            <div>
+              <h2>Training loss</h2>
+              <p>Cross-entropy at each logged step</p>
+            </div>
+          </div>
+          <div class="chart">
+            <svg id="svgChart" role="img" aria-label="Training loss over steps"></svg>
+            <p id="chartEmpty" class="chart-empty">Waiting for the first logged loss.</p>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head">
+            <div>
+              <h2>Canary sentences</h2>
+              <p>Reference on top, model output below. Changed words are marked.</p>
+            </div>
+          </div>
+          <div id="canaryContainer" class="canary-list">
+            <article class="canary-row">
+              <div class="canary-meta">
+                <span class="canary-kind">Formal</span>
+                <span class="canary-category">ZWNJ / نیم‌فاصله</span>
+              </div>
+              <div class="canary-lines">
+                <p class="canary-ref" dir="rtl">دانش‌آموزان کتاب‌های خود را در کیف می‌گذارند.</p>
+                <p class="canary-pred" dir="rtl"><span class="pending">Pending</span></p>
+              </div>
+            </article>
+            <article class="canary-row">
+              <div class="canary-meta">
+                <span class="canary-kind">Informal</span>
+                <span class="canary-category">محاوره‌ای / Spoken</span>
+              </div>
+              <div class="canary-lines">
+                <p class="canary-ref" dir="rtl">من الان می‌خوام برم خونه چون خیلی خسته‌ام و کار دارم.</p>
+                <p class="canary-pred" dir="rtl"><span class="pending">Pending</span></p>
+              </div>
+            </article>
+            <article class="canary-row">
+              <div class="canary-meta">
+                <span class="canary-kind">Formal</span>
+                <span class="canary-category">معیار / Standard</span>
+              </div>
+              <div class="canary-lines">
+                <p class="canary-ref" dir="rtl">بر اساس آخرین گزارش‌های اقتصادی نرخ تورم اعلام شد.</p>
+                <p class="canary-pred" dir="rtl"><span class="pending">Pending</span></p>
+              </div>
+            </article>
+          </div>
+        </section>
       </div>
-      <div class="card-body" style="padding: 12px;">
-        <div id="consoleBox" class="console-box">
-          Connecting to log buffer...
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <h2>Training log</h2>
+            <p>Last 80 lines from the job</p>
+          </div>
         </div>
-      </div>
-    </div>
+        <div id="consoleBox" class="log">Connecting to log…</div>
+      </section>
 
-  </main>
+    </main>
 
-  <footer class="app-footer">
-    <span>Persian Automatic Speech Recognition Dashboard &bull; Neyshekar v6 Dataset</span>
-    <span>Ready for RunPod Proxy (Port 7860)</span>
-  </footer>
+    <footer class="footer">
+      <span>Neyshekar v6 · RunPod HTTP proxy, port 7860</span>
+      <span id="syncedAt">Not synced yet</span>
+    </footer>
 
-  <script src="/static/app.js?v=2"></script>
+  </div>
+
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

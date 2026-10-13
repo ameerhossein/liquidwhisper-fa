@@ -1,63 +1,85 @@
 /**
- * Persian ASR RunPod Cockpit Frontend Logic
- * Live WebSocket telemetry, responsive SVG loss chart, and reactive benchmark matrix.
+ * Persian ASR training console.
+ * Live telemetry over WebSocket with HTTP polling fallback, loss curve,
+ * epoch benchmark ladder, canary word diffs, and the training log.
  */
 
-// State
-let isRunning = false;
+const DEFAULT_EPOCHS = 4;
+const WHISPER_WER_FALLBACK = 28.5;
+const BUZZASR_WER_FALLBACK = 17.2;
+const numberFormat = new Intl.NumberFormat("en-US");
+
+const el = {
+  statusDot: document.getElementById("statusDot"),
+  statusLabel: document.getElementById("statusLabel"),
+  gpuModel: document.getElementById("gpuModel"),
+  vramText: document.getElementById("vramText"),
+  vramFill: document.getElementById("vramFill"),
+  runTitle: document.getElementById("runTitle"),
+  runMeta: document.getElementById("runMeta"),
+  progressFill: document.getElementById("progressFill"),
+  progressTicks: document.getElementById("progressTicks"),
+  statLoss: document.getElementById("statLoss"),
+  statLR: document.getElementById("statLR"),
+  statSpeed: document.getElementById("statSpeed"),
+  statElapsed: document.getElementById("statElapsed"),
+  btnStart: document.getElementById("btnStart"),
+  btnStop: document.getElementById("btnStop"),
+  inputEpochs: document.getElementById("inputEpochs"),
+  inputBatchSize: document.getElementById("inputBatchSize"),
+  inputLearningRate: document.getElementById("inputLearningRate"),
+  benchmarkTbody: document.getElementById("benchmarkTbody"),
+  canaryContainer: document.getElementById("canaryContainer"),
+  consoleBox: document.getElementById("consoleBox"),
+  svgChart: document.getElementById("svgChart"),
+  chartEmpty: document.getElementById("chartEmpty"),
+  syncedAt: document.getElementById("syncedAt"),
+};
+
 let ws = null;
+let wsActive = false;
 let lossHistory = [];
-let benchmarks = [];
-let autoScrollLogs = true;
-
-// DOM Elements
-const statusPill = document.getElementById("statusPill");
-const statusText = document.getElementById("statusText");
-const vramText = document.getElementById("vramText");
-const vramFill = document.getElementById("vramFill");
-const gpuModel = document.getElementById("gpuModel");
-
-// Controls
-const btnStart = document.getElementById("btnStart");
-const btnStop = document.getElementById("btnStop");
-const inputEpochs = document.getElementById("inputEpochs");
-const inputBatchSize = document.getElementById("inputBatchSize");
-const inputLearningRate = document.getElementById("inputLearningRate");
-
-// Stats
-const statStep = document.getElementById("statStep");
-const statLoss = document.getElementById("statLoss");
-const statLR = document.getElementById("statLR");
-const statSpeed = document.getElementById("statSpeed");
-const statElapsed = document.getElementById("statElapsed");
-const statEta = document.getElementById("statEta");
-
-// Sections
-const benchmarkTbody = document.getElementById("benchmarkTbody");
-const canaryContainer = document.getElementById("canaryContainer");
-const consoleBox = document.getElementById("consoleBox");
-const svgChart = document.getElementById("svgChart");
+let renderedTicks = 0;
 
 // Formatters
-function formatSeconds(secs) {
-  if (!secs || secs <= 0) return "--:--";
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  const h = Math.floor(m / 60);
-  if (h > 0) {
-    return `${h}h ${m % 60}m`;
-  }
-  return `${m}m ${s < 10 ? '0' : ''}${s}s`;
+
+function formatDuration(secs) {
+  if (secs == null || isNaN(secs)) return "--";
+  const total = Math.floor(secs);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
 }
 
 function formatLR(lr) {
-  if (!lr) return "0.0";
-  return lr.toExponential(2);
+  return lr ? Number(lr).toExponential(2) : "--";
 }
 
-let wsActive = false;
+function formatPct(value) {
+  return value == null ? "--" : `${Number(value).toFixed(2)}%`;
+}
 
-// WebSocket connection
+function formatDelta(value) {
+  if (value == null || isNaN(value)) return `<span class="muted">—</span>`;
+  if (Math.abs(value) < 0.005) return `<span class="delta flat">0.00 pts</span>`;
+  const sign = value < 0 ? "−" : "+";
+  const cls = value < 0 ? "good" : "bad";
+  return `<span class="delta ${cls}">${sign}${Math.abs(value).toFixed(2)} pts</span>`;
+}
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Connection
+
 function connectWebSocket() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${protocol}//${window.location.host}/ws/live`;
@@ -67,7 +89,6 @@ function connectWebSocket() {
 
     ws.onopen = () => {
       wsActive = true;
-      console.log("[Cockpit] WebSocket connected to telemetry stream.");
     };
 
     ws.onmessage = (event) => {
@@ -77,7 +98,7 @@ function connectWebSocket() {
         if (data.benchmarks) updateBenchmarks(data.benchmarks);
         if (data.loss_history) updateLossHistory(data.loss_history);
       } catch (e) {
-        console.error("[Cockpit] Error parsing WS payload:", e);
+        console.error("Error parsing live payload:", e);
       }
     };
 
@@ -94,301 +115,373 @@ function connectWebSocket() {
   }
 }
 
-// Resilient HTTP Polling Fallback (ensures local demo works without WebSocket)
+// Resilient HTTP polling fallback (keeps the local demo working without WebSocket)
 async function pollTelemetryFallback() {
   if (wsActive) return;
   try {
     const [statusRes, benchRes, lossRes] = await Promise.all([
-      fetch("/api/status").then(r => r.ok ? r.json() : null),
-      fetch("/api/benchmarks").then(r => r.ok ? r.json() : null),
-      fetch("/api/loss-history").then(r => r.ok ? r.json() : null)
+      fetch("/api/status").then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/benchmarks").then((r) => (r.ok ? r.json() : null)),
+      fetch("/api/loss-history").then((r) => (r.ok ? r.json() : null)),
     ]);
     if (statusRes) updateTelemetry(statusRes);
     if (benchRes) updateBenchmarks(benchRes);
     if (lossRes) updateLossHistory(lossRes);
   } catch (e) {
-    // quiet network fail
+    // Network hiccup: the next poll will retry.
   }
 }
 
-// Update Telemetry Header & Stats
+// Run status
+
+function totalEpochs(tel) {
+  const step = tel.step || 0;
+  const epoch = tel.epoch || 0;
+  const maxSteps = tel.max_steps || 0;
+  if (maxSteps && step > 0 && epoch >= 0.5) {
+    return Math.max(1, Math.round((maxSteps * epoch) / step));
+  }
+  return Math.max(1, parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS);
+}
+
+function renderTicks(total) {
+  if (total === renderedTicks) return;
+  renderedTicks = total;
+  el.progressTicks.innerHTML = Array.from({ length: total - 1 }, (_, i) =>
+    `<span class="tick" style="left:${((i + 1) / total) * 100}%"></span>`
+  ).join("");
+}
+
 function updateTelemetry(tel) {
   const status = tel.status || "idle";
-  isRunning = tel.process_running || status === "training" || status === "evaluating_benchmark";
+  const evaluating = status === "evaluating_benchmark";
+  const running = !!tel.process_running || status === "training" || evaluating;
 
-  statusPill.className = `status-pill ${status === 'evaluating_benchmark' ? 'evaluating' : (isRunning ? 'training' : 'idle')}`;
-  
-  if (status === "evaluating_benchmark") {
-    statusText.textContent = `Evaluating Benchmark (Epoch ${tel.epoch || 1})`;
-  } else if (isRunning) {
-    statusText.textContent = `Training Active (Epoch ${tel.epoch || 1})`;
-  } else if (status === "completed") {
-    statusText.textContent = "Run Completed";
-  } else {
-    statusText.textContent = "Engine Ready";
-  }
+  const state = evaluating ? "evaluating" : running ? "training" : status === "completed" ? "completed" : "idle";
+  const labels = {
+    evaluating: "Evaluating on held-out test",
+    training: "Training",
+    completed: "Run completed",
+    idle: "Idle",
+  };
+  el.statusDot.className = `dot dot-${state}`;
+  el.statusLabel.textContent = labels[state];
 
-  btnStart.disabled = isRunning;
-  btnStop.disabled = !isRunning;
+  el.btnStart.disabled = running;
+  el.btnStop.disabled = !running;
 
-  // GPU
   const gpu = tel.gpu || {};
   if (gpu.available) {
-    gpuModel.textContent = gpu.device_name || "NVIDIA GPU";
-    vramText.textContent = `${gpu.allocated_gb || 0} / ${gpu.total_gb || 0} GB`;
-    vramFill.style.width = `${gpu.utilization_pct || 0}%`;
+    el.gpuModel.textContent = gpu.device_name || "NVIDIA GPU";
+    el.vramText.textContent = `${gpu.allocated_gb || 0} / ${gpu.total_gb || 0} GB`;
+    el.vramFill.style.width = `${gpu.utilization_pct || 0}%`;
   } else {
-    gpuModel.textContent = "GPU Disconnected";
-    vramText.textContent = "N/A";
-    vramFill.style.width = "0%";
+    el.gpuModel.textContent = "GPU unavailable";
+    el.vramText.textContent = "—";
+    el.vramFill.style.width = "0%";
   }
 
-  // Stats
-  statStep.textContent = `${tel.step || 0} / ${tel.max_steps || '--'}`;
-  statLoss.textContent = tel.loss !== null && tel.loss !== undefined ? Number(tel.loss).toFixed(4) : "--";
-  statLR.textContent = formatLR(tel.learning_rate);
-  statSpeed.textContent = tel.speed_s_per_step ? `${tel.speed_s_per_step}s / it` : "--";
-  statElapsed.textContent = formatSeconds(tel.elapsed_seconds);
-  statEta.textContent = formatSeconds(tel.eta_seconds);
+  const step = tel.step || 0;
+  const maxSteps = tel.max_steps || 0;
+  const epoch = tel.epoch || 0;
+  const total = totalEpochs(tel);
+  const started = running || step > 0 || status === "completed";
+  const pct = maxSteps ? Math.min(100, (step / maxSteps) * 100) : 0;
+
+  renderTicks(total);
+  el.progressFill.style.width = `${pct}%`;
+  el.runTitle.innerHTML = started
+    ? `Epoch ${Math.min(epoch, total).toFixed(2)} <span class="run-title-of">of ${total}</span>`
+    : "Not started";
+
+  const parts = [];
+  if (maxSteps) {
+    parts.push(`Step ${numberFormat.format(step)} of ${numberFormat.format(maxSteps)}`, `${pct.toFixed(1)}%`);
+  }
+  if (running && tel.eta_seconds) {
+    parts.push(`${formatDuration(tel.eta_seconds)} remaining`);
+  }
+  el.runMeta.textContent = parts.length ? parts.join(" · ") : "Set the run parameters below and start.";
+
+  el.statLoss.textContent = started && tel.loss != null ? Number(tel.loss).toFixed(4) : "--";
+  el.statLR.textContent = started ? formatLR(tel.learning_rate) : "--";
+  el.statSpeed.textContent = started && tel.speed_s_per_step ? `${Number(tel.speed_s_per_step).toFixed(2)} s` : "--";
+  el.statElapsed.textContent = formatDuration(tel.elapsed_seconds);
+
+  const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  el.syncedAt.textContent = `Synced ${time}`;
 }
 
-// Draw Responsive SVG Loss Chart
+// Loss curve
+
 function updateLossHistory(history) {
-  if (!history || history.length === 0) return;
-  lossHistory = history;
+  if (!Array.isArray(history)) return;
+  lossHistory = history.filter((h) => h.loss != null && !isNaN(h.loss));
+  drawLoss();
+}
 
-  const width = svgChart.clientWidth || 500;
-  const height = svgChart.clientHeight || 180;
-  const padX = 35;
-  const padY = 20;
+function drawLoss() {
+  const svg = el.svgChart;
+  const width = svg.clientWidth;
+  const height = svg.clientHeight;
+  el.chartEmpty.hidden = lossHistory.length > 0;
 
-  const validPoints = history.filter(h => h.loss !== null && !isNaN(h.loss));
-  if (validPoints.length === 0) return;
+  if (!lossHistory.length || !width || !height) {
+    svg.innerHTML = "";
+    return;
+  }
 
-  const minLoss = Math.min(...validPoints.map(h => h.loss)) * 0.95;
-  const maxLoss = Math.max(...validPoints.map(h => h.loss)) * 1.05;
-  const minStep = validPoints[0].step;
-  const maxStep = Math.max(...validPoints.map(h => h.step)) || (minStep + 1);
+  const pad = { top: 12, right: 64, bottom: 28, left: 48 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
 
-  const getX = (step) => padX + ((step - minStep) / (maxStep - minStep || 1)) * (width - padX - 15);
-  const getY = (loss) => height - padY - ((loss - minLoss) / (maxLoss - minLoss || 1)) * (height - padY * 2);
+  const losses = lossHistory.map((h) => Number(h.loss));
+  const steps = lossHistory.map((h) => Number(h.step));
+  const lo = Math.min(...losses) * 0.97;
+  const hi = Math.max(...losses) * 1.03;
+  const sMin = Math.min(...steps);
+  const sMax = Math.max(...steps);
 
-  let pathD = "";
-  let areaD = `M ${getX(validPoints[0].step)} ${height - padY}`;
+  const yOf = (v) => pad.top + (1 - (v - lo) / (hi - lo || 1)) * plotH;
+  const xOf = (s) => pad.left + ((s - sMin) / (sMax - sMin || 1)) * plotW;
 
-  validPoints.forEach((pt, i) => {
-    const x = getX(pt.step);
-    const y = getY(pt.loss);
-    if (i === 0) {
-      pathD += `M ${x} ${y}`;
-    } else {
-      pathD += ` L ${x} ${y}`;
+  const gridLines = [0, 0.5, 1].map((f) => {
+    const value = lo + f * (hi - lo);
+    const y = yOf(value).toFixed(1);
+    return `<line class="grid-line" x1="${pad.left}" x2="${width - pad.right}" y1="${y}" y2="${y}"/>
+      <text class="axis-label" x="${pad.left - 8}" y="${y}" dy="4" text-anchor="end">${value.toFixed(3)}</text>`;
+  }).join("");
+
+  let epochMarks = "";
+  let currentEpoch = Math.floor(lossHistory[0].epoch || 0);
+  lossHistory.forEach((h) => {
+    const e = Math.floor(h.epoch || 0);
+    if (e > currentEpoch) {
+      currentEpoch = e;
+      const x = xOf(h.step).toFixed(1);
+      epochMarks += `<line class="epoch-line" x1="${x}" x2="${x}" y1="${pad.top}" y2="${pad.top + plotH}"/>
+        <text class="axis-label" x="${Number(x) + 6}" y="${pad.top + 10}">Epoch ${e}</text>`;
     }
-    areaD += ` L ${x} ${y}`;
   });
 
-  const lastPt = validPoints[validPoints.length - 1];
-  areaD += ` L ${getX(lastPt.step)} ${height - padY} Z`;
+  const path = lossHistory
+    .map((h, i) => `${i ? "L" : "M"}${xOf(h.step).toFixed(1)} ${yOf(h.loss).toFixed(1)}`)
+    .join(" ");
+  const last = lossHistory[lossHistory.length - 1];
+  const lx = xOf(last.step).toFixed(1);
+  const ly = yOf(last.loss).toFixed(1);
 
-  svgChart.innerHTML = `
-    <defs>
-      <linearGradient id="lossGradient" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.3"/>
-        <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.0"/>
-      </linearGradient>
-    </defs>
-    <!-- Background grid lines -->
-    <line x1="${padX}" y1="${getY(maxLoss)}" x2="${width - 15}" y2="${getY(maxLoss)}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
-    <line x1="${padX}" y1="${getY((minLoss + maxLoss)/2)}" x2="${width - 15}" y2="${getY((minLoss + maxLoss)/2)}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4"/>
-    <line x1="${padX}" y1="${height - padY}" x2="${width - 15}" y2="${height - padY}" stroke="rgba(255,255,255,0.1)"/>
-    
-    <!-- Y-axis labels -->
-    <text x="${padX - 5}" y="${getY(maxLoss) + 4}" fill="#64748b" font-size="10" text-anchor="end">${maxLoss.toFixed(2)}</text>
-    <text x="${padX - 5}" y="${getY(minLoss) + 4}" fill="#64748b" font-size="10" text-anchor="end">${minLoss.toFixed(2)}</text>
-
-    <!-- Path Area & Stroke -->
-    <path d="${areaD}" fill="url(#lossGradient)"/>
-    <path d="${pathD}" fill="none" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/>
-    
-    <!-- Latest Point Highlight -->
-    <circle cx="${getX(lastPt.step)}" cy="${getY(lastPt.loss)}" r="4" fill="#22d3ee" stroke="#090b0e" stroke-width="2"/>
-  `;
+  svg.innerHTML = `
+    ${gridLines}
+    ${epochMarks}
+    <text class="axis-label" x="${pad.left}" y="${height - 6}">step ${numberFormat.format(sMin)}</text>
+    <text class="axis-label" x="${width - pad.right}" y="${height - 6}" text-anchor="end">step ${numberFormat.format(sMax)}</text>
+    <path class="loss-line" d="${path}"/>
+    <circle class="loss-dot" cx="${lx}" cy="${ly}" r="3.5"/>
+    <text class="loss-value" x="${Number(lx) + 10}" y="${ly}" dy="4">${Number(last.loss).toFixed(4)}</text>`;
 }
 
-function safeNum(val, fallback = 0.0) {
-  if (val === null || val === undefined) return fallback;
-  const n = parseFloat(val);
-  return isNaN(n) ? fallback : n;
+// Benchmark ladder
+
+function findBaseline(list, pattern, fallback) {
+  const row = list.find((r) => r.is_baseline && pattern.test(r.epoch || ""));
+  return row && row.normalized_wer != null ? Number(row.normalized_wer) : fallback;
 }
 
-// Update Epoch Benchmark Table
 function updateBenchmarks(list) {
-  if (!list || !Array.isArray(list) || list.length === 0) return;
-  benchmarks = list;
+  if (!Array.isArray(list) || list.length === 0) return;
 
-  // Find lowest normalized WER among checkpoints
-  const checkpoints = list.filter(r => !r.is_baseline && r.normalized_wer != null);
-  let bestWer = 999.0;
-  if (checkpoints.length > 0) {
-    bestWer = Math.min(...checkpoints.map(c => safeNum(c.normalized_wer, 999.0)));
-  }
+  const checkpoints = list.filter((r) => !r.is_baseline && r.normalized_wer != null);
+  const best = checkpoints.length ? Math.min(...checkpoints.map((r) => Number(r.normalized_wer))) : null;
+  const whisper = findBaseline(list, /Whisper/i, WHISPER_WER_FALLBACK);
+  const buzz = findBaseline(list, /BuzzASR/i, BUZZASR_WER_FALLBACK);
+  const scaleMax = Math.max(whisper, ...list.map((r) => Number(r.normalized_wer) || 0)) * 1.08;
+  const share = (v) => `${Math.min(100, Math.max(0, (v / scaleMax) * 100)).toFixed(2)}%`;
 
-  // Find BuzzASR base WER
-  const buzzRow = list.find(r => r.epoch && r.epoch.includes("BuzzASR Base"));
-  const buzzBaseWer = buzzRow ? safeNum(buzzRow.normalized_wer, 17.20) : 17.20;
+  el.benchmarkTbody.innerHTML = list
+    .map((row) => {
+      const wer = Number(row.normalized_wer) || 0;
+      const isBaseline = !!row.is_baseline;
+      const isBest = !isBaseline && best !== null && Math.abs(wer - best) < 0.001;
+      const isWhisper = /Whisper/i.test(row.epoch || "");
+      const isBuzz = /BuzzASR/i.test(row.epoch || "");
 
-  let html = "";
-  list.forEach((row) => {
-    const isBase = !!row.is_baseline;
-    const rowWer = safeNum(row.normalized_wer);
-    const isBest = !isBase && Math.abs(rowWer - bestWer) < 0.001;
-    const rowClass = isBase ? "baseline-row" : (isBest ? "best-row" : "");
+      const rowClass = isBaseline ? "is-baseline" : isBest ? "is-best" : "";
+      const barClass = isBaseline ? "is-base" : isBest ? "is-best" : "";
+      const tag = isBaseline
+        ? `<span class="tag">Baseline</span>`
+        : isBest
+          ? `<span class="tag tag-best">Best</span>`
+          : "";
 
-    // Delta vs. Whisper Large v3
-    let deltaWhisperBadge = `<span class="delta-badge neutral">Baseline</span>`;
-    if (!isBase) {
-      const delta = safeNum(row.delta_vs_whisper);
-      if (delta < 0) {
-        deltaWhisperBadge = `<span class="delta-badge win">↓ ${Math.abs(delta).toFixed(1)}%</span>`;
-      } else if (delta > 0) {
-        deltaWhisperBadge = `<span class="delta-badge loss">↑ +${delta.toFixed(1)}%</span>`;
-      } else {
-        deltaWhisperBadge = `<span class="delta-badge neutral">0.0%</span>`;
-      }
-    }
+      return `
+        <tr class="${rowClass}">
+          <th scope="row"><span class="row-name">${escapeHtml(row.epoch || "Checkpoint")}</span>${tag}</th>
+          <td class="wer">
+            <div class="wer-inner">
+              <div class="bar ${barClass}">
+                <span class="bar-fill" style="width:${share(wer)}"></span>
+                <span class="bar-ref" style="left:${share(buzz)}"></span>
+              </div>
+              <span class="wer-value">${wer.toFixed(2)}%</span>
+            </div>
+          </td>
+          <td class="num">${isWhisper ? formatDelta(null) : formatDelta(wer - whisper)}</td>
+          <td class="num">${isBuzz ? formatDelta(null) : formatDelta(wer - buzz)}</td>
+          <td class="num opt">${formatPct(row.normalized_cer)}</td>
+          <td class="num opt">${formatPct(row.formal_wer)}</td>
+          <td class="num opt">${formatPct(row.informal_wer)}</td>
+          <td class="num opt">${formatPct(row.diagnostic_wer)}</td>
+        </tr>`;
+    })
+    .join("");
 
-    // Delta vs. BuzzASR Base
-    let deltaBuzzBadge = `<span class="delta-badge neutral">Baseline</span>`;
-    if (row.epoch.includes("Whisper")) {
-      deltaBuzzBadge = `<span class="delta-badge loss">↑ +11.3%</span>`;
-    } else if (!row.epoch.includes("BuzzASR Base")) {
-      const deltaBuzz = row.delta_vs_buzzasr != null ? safeNum(row.delta_vs_buzzasr) : safeNum(rowWer - buzzBaseWer);
-      if (deltaBuzz < 0) {
-        deltaBuzzBadge = `<span class="delta-badge win">↓ ${Math.abs(deltaBuzz).toFixed(1)}%</span>`;
-      } else if (deltaBuzz > 0) {
-        deltaBuzzBadge = `<span class="delta-badge loss">↑ +${deltaBuzz.toFixed(1)}%</span>`;
-      } else {
-        deltaBuzzBadge = `<span class="delta-badge neutral">0.0%</span>`;
-      }
-    }
-
-    const epochTitle = isBest ? `★ ${row.epoch}` : (row.epoch || "Checkpoint");
-    const cerStr = row.normalized_cer != null ? safeNum(row.normalized_cer).toFixed(2) + '%' : '--';
-    const diagStr = row.diagnostic_wer != null ? safeNum(row.diagnostic_wer).toFixed(2) + '%' : '--';
-    const formalStr = row.formal_wer != null ? safeNum(row.formal_wer).toFixed(2) + '%' : '--';
-    const informalStr = row.informal_wer != null ? safeNum(row.informal_wer).toFixed(2) + '%' : '--';
-
-    html += `
-      <tr class="${rowClass}">
-        <td><span class="badge-epoch">${epochTitle}</span></td>
-        <td style="font-weight: 600; color: ${isBest ? '#10b981' : '#f8fafc'}">${rowWer.toFixed(2)}%</td>
-        <td>${cerStr}</td>
-        <td>${diagStr}</td>
-        <td>${formalStr}</td>
-        <td>${informalStr}</td>
-        <td>${deltaWhisperBadge}</td>
-        <td>${deltaBuzzBadge}</td>
-      </tr>
-    `;
-  });
-
-  if (benchmarkTbody) {
-    benchmarkTbody.innerHTML = html;
-  }
-
-  // Update canary cards with latest checkpoint's canary transcriptions
-  const latestWithCanary = [...list].reverse().find(r => r.canary_transcriptions && r.canary_transcriptions.length > 0);
-  if (latestWithCanary) {
-    renderCanary(latestWithCanary.canary_transcriptions);
-  }
+  const latest = [...list]
+    .reverse()
+    .find((r) => Array.isArray(r.canary_transcriptions) && r.canary_transcriptions.length > 0);
+  if (latest) renderCanary(latest.canary_transcriptions);
 }
 
-// Render Canary Audio Tokens
+// Canary sentences
+
+const PUNCTUATION = /[.,!?؟،؛:«»"'()\-]/g;
+
+// Word-level LCS diff. Reference words the model missed are dotted; model words that don't match are marked.
+function diffWords(refText, predText) {
+  const a = refText.split(/\s+/).filter(Boolean);
+  const b = predText.split(/\s+/).filter(Boolean);
+  const na = a.map((w) => w.replace(PUNCTUATION, ""));
+  const nb = b.map((w) => w.replace(PUNCTUATION, ""));
+  const n = a.length;
+  const m = b.length;
+
+  const lcs = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i][j] = na[i] === nb[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+
+  const refMatched = new Array(n).fill(false);
+  const predMatched = new Array(m).fill(false);
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (na[i] === nb[j]) {
+      refMatched[i] = true;
+      predMatched[j] = true;
+      i++;
+      j++;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+
+  const render = (words, matched, cls) =>
+    words
+      .map((w, k) => (matched[k] ? escapeHtml(w) : `<mark class="${cls}">${escapeHtml(w)}</mark>`))
+      .join(" ");
+
+  return {
+    ref: render(a, refMatched, "gone"),
+    pred: render(b, predMatched, "wrong"),
+  };
+}
+
 function renderCanary(canaries) {
-  if (!canaries || canaries.length === 0) return;
-  let html = "";
-  canaries.forEach(c => {
-    html += `
-      <div class="canary-item">
-        <div class="canary-meta">
-          <span class="canary-tag">${c.category || 'Canary'}</span>
-          <span style="color: #64748b; font-size: 11px;">${c.is_informal ? 'گفتاری' : 'رسمی'}</span>
-        </div>
-        <div class="canary-ref">${c.ref}</div>
-        <div class="canary-pred">${c.pred || '...در حال پردازش'}</div>
-      </div>
-    `;
-  });
-  canaryContainer.innerHTML = html;
+  if (!Array.isArray(canaries) || canaries.length === 0) return;
+  el.canaryContainer.innerHTML = canaries
+    .map((c) => {
+      const ref = c.ref || "";
+      const diff = diffWords(ref, c.pred || "");
+      const pred = c.pred ? diff.pred : `<span class="pending">Pending</span>`;
+      return `
+        <article class="canary-row">
+          <div class="canary-meta">
+            <span class="canary-kind">${c.is_informal ? "Informal" : "Formal"}</span>
+            <span class="canary-category">${escapeHtml(c.category || "Canary")}</span>
+          </div>
+          <div class="canary-lines">
+            <p class="canary-ref" dir="rtl">${c.pred ? diff.ref : escapeHtml(ref)}</p>
+            <p class="canary-pred" dir="rtl">${pred}</p>
+          </div>
+        </article>`;
+    })
+    .join("");
 }
 
-// Fetch periodic logs
+// Training log
+
 async function fetchLogs() {
   try {
     const res = await fetch("/api/logs?tail=80");
     const data = await res.json();
-    if (data.logs && Array.isArray(data.logs)) {
-      consoleBox.innerHTML = data.logs.map(line => {
-        let cls = "log-line";
-        if (line.includes("Error") || line.includes("Traceback")) cls += " error";
-        if (line.includes("Benchmark saved") || line.includes("Epoch")) cls += " success";
-        return `<div class="${cls}">${escapeHtml(line)}</div>`;
-      }).join("");
+    if (!Array.isArray(data.logs)) return;
 
-      if (autoScrollLogs) {
-        consoleBox.scrollTop = consoleBox.scrollHeight;
-      }
-    }
+    const box = el.consoleBox;
+    const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+
+    box.innerHTML = data.logs
+      .map((line) => {
+        let cls = "log-line";
+        if (line.includes("Error") || line.includes("Traceback")) cls += " is-error";
+        if (line.includes("Benchmark saved") || line.includes("Epoch")) cls += " is-success";
+        return `<div class="${cls}">${escapeHtml(line)}</div>`;
+      })
+      .join("");
+
+    if (pinned) box.scrollTop = box.scrollHeight;
   } catch (e) {
-    // quiet network fail
+    // Network hiccup: the next poll will retry.
   }
 }
 
-function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// Controls
 
-// Button Events
-btnStart.addEventListener("click", async () => {
-  btnStart.disabled = true;
+el.btnStart.addEventListener("click", async () => {
+  el.btnStart.disabled = true;
   try {
     const res = await fetch("/api/train/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        epochs: parseInt(inputEpochs.value, 10) || 4,
-        batch_size: parseInt(inputBatchSize.value, 10) || 16,
-        learning_rate: parseFloat(inputLearningRate.value) || 1e-4
-      })
+        epochs: parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS,
+        batch_size: parseInt(el.inputBatchSize.value, 10) || 16,
+        learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
+      }),
     });
     if (!res.ok) {
       const err = await res.json();
-      alert(`Start failed: ${err.detail || 'Unknown error'}`);
-      btnStart.disabled = false;
+      alert(`Start failed: ${err.detail || "Unknown error"}`);
+      el.btnStart.disabled = false;
     }
   } catch (e) {
-    alert(`Failed to trigger training: ${e}`);
-    btnStart.disabled = false;
+    alert(`Failed to start training: ${e}`);
+    el.btnStart.disabled = false;
   }
 });
 
-btnStop.addEventListener("click", async () => {
-  if (!confirm("Are you sure you want to halt the training job? A checkpoint will be saved.")) {
+el.btnStop.addEventListener("click", async () => {
+  if (!confirm("Halt the training run? A checkpoint will be saved first.")) {
     return;
   }
-  btnStop.disabled = true;
+  el.btnStop.disabled = true;
   try {
     await fetch("/api/train/stop", { method: "POST" });
   } catch (e) {
-    console.error("Stop failed", e);
+    console.error("Halt failed", e);
   }
 });
 
 // Init
+
 window.addEventListener("DOMContentLoaded", () => {
   connectWebSocket();
   pollTelemetryFallback();
-  setInterval(pollTelemetryFallback, 1000); // 1s polling fallback if WS inactive
+  setInterval(pollTelemetryFallback, 1000);
   fetchLogs();
-  setInterval(fetchLogs, 2500); // Poll logs every 2.5s
+  setInterval(fetchLogs, 2500);
+  new ResizeObserver(() => drawLoss()).observe(el.svgChart);
 });
