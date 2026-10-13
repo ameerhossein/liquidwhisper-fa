@@ -148,12 +148,13 @@ def test_duration_helpers():
     short = {"array": [0.0] * 3200, "sampling_rate": 16000}  # 0.2s
     ok = {"array": [0.0] * 80000, "sampling_rate": 16000}  # 5s
     long = {"array": list(range(16000 * 35)), "sampling_rate": 16000}  # 35s
+    edge = {"array": [0.0] * 16000 * 30, "sampling_rate": 16000}  # exactly 30s
     assert pipe.is_valid_duration(short) is False
     assert pipe.is_valid_duration(ok) is True
-    assert pipe.is_valid_duration(long) is True
-    trunc = pipe._truncate_audio(dict(long))
-    assert len(trunc["array"]) == 16000 * 30, f"truncate to 30s, got {len(trunc['array'])}"
-    print("✓ Duration filter/truncate passed.")
+    assert pipe.is_valid_duration(long) is False, "overlong must be dropped, not truncated"
+    assert pipe.is_valid_duration(edge) is True
+    assert not hasattr(pipe, "_truncate_audio"), "truncate helper removed to prevent misalignment"
+    print("✓ Duration drop (no truncate) passed.")
 
 
 def test_baselines_config():

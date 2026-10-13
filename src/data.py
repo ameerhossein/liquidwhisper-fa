@@ -48,25 +48,12 @@ class PersianASRDataPipeline:
         except Exception:
             return 0.0
 
-    def _truncate_audio(self, audio: Dict[str, Any]) -> Dict[str, Any]:
-        """Truncate waveform to max_duration_seconds (Whisper caps at 30s)."""
-        max_len = int(self.max_duration_seconds * 16000)
-        arr = audio.get("array", [])
-        if len(arr) > max_len:
-            audio = dict(audio)
-            # datasets Audio arrays may be list or numpy; slice preserves type for list,
-            # for numpy use slicing which also works.
-            try:
-                audio["array"] = arr[:max_len]
-            except Exception:
-                import numpy as np
-                audio["array"] = np.asarray(arr)[:max_len]
-        return audio
-
     def is_valid_duration(self, audio: Dict[str, Any]) -> bool:
-        """Check min-duration (and non-empty). Max is truncated, not dropped."""
+        """Check min <= duration <= max. Overlong clips are dropped (not truncated)
+        to avoid audio/text misalignment: truncating audio while keeping the full
+        transcript teaches the model to hallucinate cut-off words."""
         dur = self._audio_duration_seconds(audio)
-        return dur >= self.min_duration_seconds and dur > 0
+        return self.min_duration_seconds <= dur <= self.max_duration_seconds
 
     def load_raw_dataset(
         self,
@@ -115,8 +102,14 @@ class PersianASRDataPipeline:
             zwnj_mode="keep"
         )
 
-        # Truncate to max_duration (Whisper input caps at 30s / 3000 mel frames).
-        audio = self._truncate_audio(audio)
+        # Defensive guard: overlong clips must have been filtered upstream.
+        # Do NOT truncate here — that would misalign audio/text.
+        dur = self._audio_duration_seconds(audio)
+        if dur > self.max_duration_seconds:
+            raise ValueError(
+                f"Audio {dur:.2f}s exceeds max {self.max_duration_seconds}s; "
+                "filter with is_valid_duration / prepare_dataset_split instead of truncating."
+            )
 
         # 1. Audio feature extraction (128 mel bins for Whisper Large v3 / BuzzASR)
         input_features = self.processor.feature_extractor(
@@ -146,8 +139,8 @@ class PersianASRDataPipeline:
         remove_columns: Optional[list] = None
     ) -> Dataset:
         """Applies mapping over dataset to produce model-ready inputs."""
-        # Drop too-short clips (min_duration). Overlong clips are truncated
-        # in prepare_sample, not dropped.
+        # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
+        # not truncated, to keep audio/text aligned (Whisper caps at 30s).
         orig_len = len(dataset)
         try:
             dataset = dataset.filter(
@@ -156,7 +149,10 @@ class PersianASRDataPipeline:
             )
             dropped = orig_len - len(dataset)
             if dropped:
-                print(f"Filtered {dropped}/{orig_len} samples below {self.min_duration_seconds}s.")
+                print(
+                    f"Filtered {dropped}/{orig_len} samples outside "
+                    f"[{self.min_duration_seconds}s, {self.max_duration_seconds}s]."
+                )
         except Exception as e:
             print(f"Duration filtering skipped ({e}). Continuing without filter.")
 
