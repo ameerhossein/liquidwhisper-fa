@@ -34,6 +34,27 @@ pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/
 echo "Installing project dependencies from requirements.txt..."
 pip install -r requirements.txt
 
+# 5b. Check telephony codecs (Iran MCI/Irancell/TCI phone simulation)
+echo "Checking ffmpeg telephony codecs..."
+if command -v ffmpeg &> /dev/null; then
+    echo "ffmpeg found: $(ffmpeg -version 2>/dev/null | head -n 1)"
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopencore_amrnb; then
+        echo "AMR-NB encoder (mobile) available."
+    else
+        echo "WARNING: ffmpeg lacks libopencore_amrnb; mobile sim falls back to lite approximation."
+        echo "  On Ubuntu: sudo apt-get install -y ffmpeg libopencore-amrnb0"
+    fi
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q pcm_alaw; then
+        echo "G.711 A-law encoder (PSTN) available."
+    else
+        echo "WARNING: ffmpeg lacks pcm_alaw; PSTN sim falls back to lite approximation."
+    fi
+else
+    echo "WARNING: ffmpeg not found; phone simulation uses lite scipy-only fallback."
+    echo "  Install with: sudo apt-get update && sudo apt-get install -y ffmpeg"
+    echo "  (training still works; true AMR-NB/G.711 requires ffmpeg on the L40S server)"
+fi
+
 # 6. Verify GPU and Environment
 echo "=========================================================="
 echo " Verifying GPU Acceleration & BF16 Support"

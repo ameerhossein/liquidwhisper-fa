@@ -31,4 +31,16 @@ training:
   gradient_checkpointing: true
   num_workers: 4
   eval_batch_size: 16
-  max_benchmark_samples: 1000  # 0 = full test set (2149); 1000 per-epoch sample guard
+  max_benchmark_samples: 500  # subset decoded twice: 500 clean + same 500 phone (1000 decodes); 0 = full test set (2149)
+
+# Iranian telephony augmentation (MCI/Irancell mobile + TCI PSTN).
+# prob=0.5 means half the train samples are phone-simulated on-the-fly.
+telephony:
+  prob: 0.5
+  profiles: ["mobile", "pstn"]
+  seed: 42
+  use_ffmpeg: true
+
+benchmark:
+  phone_benchmark: true   # dual clean + phone eval each epoch
+  phone_seed: 1234

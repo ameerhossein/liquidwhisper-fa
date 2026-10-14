@@ -36,7 +36,57 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Inference batch size")
     parser.add_argument("--output_dir", type=str, default="results/evaluation", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--phone_eval", "--phone-eval", action=argparse.BooleanOptionalAction, default=True, help="Also evaluate on phone-simulated copy (MCI/Irancell/TCI) for dual clean+phone report")
+    parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
+    parser.add_argument("--telephony_profiles", type=str, default="mobile,pstn", help="Comma-separated phone profiles for eval")
+    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg codecs in phone eval when available")
     return parser.parse_args()
+
+
+def _parse_profiles(value: str):
+    return [p.strip() for p in str(value or "").split(",") if p.strip()] or ["mobile", "pstn"]
+
+
+def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
+                     use_amp, dtype, degrade_phone: bool = False,
+                     phone_seed: int = 1234, profiles=None,
+                     use_ffmpeg: bool = True) -> List[str]:
+    """Transcribe a split; degrade_phone=True applies deterministic phone sim."""
+    from tqdm import tqdm as _tqdm
+    degrade_fn = None
+    if degrade_phone:
+        try:
+            from src.telephone import degrade_for_eval as _degrade
+            degrade_fn = _degrade
+        except ImportError:
+            print("Warning: src.telephone missing; phone eval falls back to clean.")
+            degrade_fn = None
+    predictions: List[str] = []
+    total = len(test_ds)
+    for i in _tqdm(range(0, total, batch_size), desc="Evaluating (phone)" if degrade_phone else "Evaluating (clean)"):
+        batch_slice = test_ds[i: i + batch_size]
+        batch_audios = batch_slice["audio"] if isinstance(batch_slice["audio"], list) else [batch_slice["audio"]]
+        waveforms = []
+        for j, a in enumerate(batch_audios):
+            wav = a["array"]
+            if degrade_phone and degrade_fn is not None:
+                wav = degrade_fn(wav, index=i + j, seed_base=phone_seed,
+                                 profiles=profiles or ["mobile", "pstn"],
+                                 use_ffmpeg=use_ffmpeg)
+            waveforms.append(wav)
+
+        feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
+
+        if use_amp:
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+        else:
+            with torch.inference_mode():
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+
+        batch_preds = processor.batch_decode(predicted_ids, skip_special_tokens=True)
+        predictions.extend(batch_preds)
+    return predictions
 
 
 def main():
@@ -100,27 +150,16 @@ def main():
         else:
             is_informal.append(normalizer.is_colloquial(s.get("text", "")))
 
-    # 4. Run Batch Inference
-    predictions = []
-    print(f"Transcribing {total_samples} samples...")
-    for i in tqdm(range(0, total_samples, args.batch_size), desc="Evaluating"):
-        batch_slice = test_ds[i : i + args.batch_size]
-        batch_audios = batch_slice["audio"] if isinstance(batch_slice["audio"], list) else [batch_slice["audio"]]
-        waveforms = [a["array"] for a in batch_audios]
+    profiles = _parse_profiles(args.telephony_profiles)
 
-        feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(args.device)
+    # 4. Run Batch Inference (clean pass)
+    print(f"Transcribing {total_samples} samples (clean)...")
+    predictions = transcribe_split(
+        model, processor, test_ds, args.batch_size, args.device,
+        use_amp, dtype, degrade_phone=False,
+    )
 
-        if use_amp:
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
-        else:
-            with torch.inference_mode():
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
-
-        batch_preds = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-        predictions.extend(batch_preds)
-
-    # 5. Compute Metrics
+    # 5. Compute Metrics (clean)
     results = metrics_calc.evaluate_predictions(
         references=references,
         predictions=predictions,
@@ -128,7 +167,32 @@ def main():
     )
 
     eval_label = args.adapter_path or args.model_path or args.base_model
-    print("\n" + metrics_calc.format_results_table(eval_label, results) + "\n")
+    print("\n" + metrics_calc.format_results_table(f"{eval_label} [clean]", results) + "\n")
+
+    # 5b. Optional phone-simulated second pass (deterministic, same subset)
+    phone_results = None
+    phone_predictions: List[str] = []
+    if args.phone_eval:
+        print(f"Transcribing {total_samples} samples (phone-simulated, seed={args.phone_seed})...")
+        # Honor --telephony_use_ffmpeg if telephone module supports the flag.
+        phone_predictions = transcribe_split(
+            model, processor, test_ds, args.batch_size, args.device,
+            use_amp, dtype, degrade_phone=True,
+            phone_seed=args.phone_seed, profiles=profiles,
+            use_ffmpeg=bool(args.telephony_use_ffmpeg),
+        )
+        phone_results = metrics_calc.evaluate_predictions(
+            references=references,
+            predictions=phone_predictions,
+            is_informal_flags=is_informal,
+        )
+        print("\n" + metrics_calc.format_results_table(f"{eval_label} [phone]", phone_results) + "\n")
+        try:
+            clean_wer = results.get("overall", {}).get("normalized_wer", 0.0)
+            phone_wer = phone_results.get("overall", {}).get("normalized_wer", 0.0)
+            print(f"Clean WER: {clean_wer:.2f}% | Phone WER: {phone_wer:.2f}% | Gap: {phone_wer - clean_wer:+.2f}pp\n")
+        except Exception:
+            pass
 
     # 6. Save Detailed Predictions & Diagnostics
     output_records = []
@@ -147,8 +211,14 @@ def main():
         })
 
     eval_json = os.path.join(args.output_dir, "evaluation_details.json")
+    payload: Dict[str, Any] = {"metrics": results, "samples": output_records}
+    if phone_results is not None:
+        payload["phone_metrics"] = phone_results
+        payload["phone_seed"] = args.phone_seed
+        payload["phone_profiles"] = profiles
+        payload["phone_predictions"] = phone_predictions
     with open(eval_json, "w", encoding="utf-8") as f:
-        json.dump({"metrics": results, "samples": output_records}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
     # Print Top 5 Hardest Errors for Qualitative Diagnosis
     sorted_by_err = sorted(output_records, key=lambda x: x["sample_wer"], reverse=True)

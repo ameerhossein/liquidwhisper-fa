@@ -94,6 +94,10 @@ class WebTelemetryCallback(TrainerCallback):
         baselines_path: Optional[str] = None,
         eval_batch_size: int = 16,
         max_benchmark_samples: Optional[int] = 300,
+        phone_benchmark: bool = True,
+        phone_seed: int = 1234,
+        telephony_profiles: Optional[List[str]] = None,
+        telephony_use_ffmpeg: bool = True,
     ):
         self.output_dir = output_dir
         self.results_dir = results_dir
@@ -105,6 +109,11 @@ class WebTelemetryCallback(TrainerCallback):
         self.eval_batch_size = max(1, int(eval_batch_size or 16))
         # None or <=0 means full test set; default 300 guards L40S OOM.
         self.max_benchmark_samples = max_benchmark_samples
+        # Dual clean + phone-simulated benchmark (Iran MCI/Irancell/TCI).
+        self.phone_benchmark = bool(phone_benchmark)
+        self.phone_seed = int(phone_seed or 1234)
+        self.telephony_profiles = list(telephony_profiles) if telephony_profiles else ["mobile", "pstn"]
+        self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
 
         # Baselines to compare against (single source: configs/baselines.json)
         self.baseline_benchmark = baseline_benchmark or load_baselines(baselines_path)
@@ -294,8 +303,55 @@ class WebTelemetryCallback(TrainerCallback):
         })
         return control
 
+    def _transcribe_pass(self, eval_ds, model, device, dtype, use_amp,
+                         batch_size: int, total_test: int,
+                         degrade_phone: bool = False) -> list:
+        """Single inference pass; degrade_phone=True applies deterministic phone sim."""
+        degrade_fn = None
+        if degrade_phone:
+            try:
+                from src.telephone import degrade_for_eval as _degrade
+                degrade_fn = _degrade
+            except ImportError:
+                print("[TelemetryCallback] src.telephone missing; phone pass uses clean audio.")
+                degrade_fn = None
+        predictions: list = []
+        for i in range(0, total_test, batch_size):
+            batch = eval_ds[i: i + batch_size]
+            audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
+            waveforms = []
+            for j, a in enumerate(audios):
+                wav = a["array"]
+                if degrade_phone and degrade_fn is not None:
+                    try:
+                        wav = degrade_fn(
+                            wav, index=i + j, seed_base=self.phone_seed,
+                            profiles=self.telephony_profiles,
+                            use_ffmpeg=self.telephony_use_ffmpeg,
+                        )
+                    except Exception as e:
+                        print(f"[TelemetryCallback] phone degrade failed (idx={i + j}): {e}")
+                waveforms.append(wav)
+
+            feats = self.processor(
+                waveforms,
+                sampling_rate=16000,
+                return_tensors="pt"
+            ).input_features.to(device)
+
+            if use_amp:
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+            else:
+                with torch.inference_mode():
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+
+            batch_preds = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
+            predictions.extend(batch_preds)
+        return predictions
+
     def _evaluate_benchmark(self, model, epoch_num: int) -> Dict[str, Any]:
-        """Runs inference over the test dataset split and computes metrics."""
+        """Runs inference over the test split; dual clean + phone when enabled."""
         if not self.test_dataset or not self.processor or not self.metrics_calculator:
             print("[TelemetryCallback] Test dataset or calculator not provided, skipping benchmark eval.")
             return {}
@@ -333,7 +389,6 @@ class WebTelemetryCallback(TrainerCallback):
 
         try:
             model.eval()
-            predictions = []
             references = [s.get("text", "") or "" for s in eval_ds]
 
             is_informal = []
@@ -347,26 +402,11 @@ class WebTelemetryCallback(TrainerCallback):
                 else:
                     is_informal.append(False)
 
-            for i in range(0, total_test, batch_size):
-                batch = eval_ds[i : i + batch_size]
-                audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
-                waveforms = [a["array"] for a in audios]
-
-                feats = self.processor(
-                    waveforms,
-                    sampling_rate=16000,
-                    return_tensors="pt"
-                ).input_features.to(device)
-
-                if use_amp:
-                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                        pred_ids = model.generate(input_features=feats, max_new_tokens=225)
-                else:
-                    with torch.inference_mode():
-                        pred_ids = model.generate(input_features=feats, max_new_tokens=225)
-
-                batch_preds = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
-                predictions.extend(batch_preds)
+            print("[TelemetryCallback] Clean benchmark pass...")
+            predictions = self._transcribe_pass(
+                eval_ds, model, device, dtype, use_amp,
+                batch_size, total_test, degrade_phone=False,
+            )
 
             # Compute full metrics
             metrics = self.metrics_calculator.evaluate_predictions(
@@ -374,6 +414,25 @@ class WebTelemetryCallback(TrainerCallback):
                 predictions=predictions,
                 is_informal_flags=is_informal
             )
+
+            # Optional phone-simulated second pass (same subset, deterministic).
+            if self.phone_benchmark:
+                print("[TelemetryCallback] Phone-simulated benchmark pass...")
+                try:
+                    phone_preds = self._transcribe_pass(
+                        eval_ds, model, device, dtype, use_amp,
+                        batch_size, total_test, degrade_phone=True,
+                    )
+                    phone_metrics = self.metrics_calculator.evaluate_predictions(
+                        references=references,
+                        predictions=phone_preds,
+                        is_informal_flags=is_informal,
+                    )
+                    metrics["phone_metrics"] = phone_metrics
+                    metrics["phone_seed"] = self.phone_seed
+                    metrics["phone_profiles"] = list(self.telephony_profiles)
+                except Exception as e:
+                    print(f"[TelemetryCallback] Phone benchmark failed ({e}); keeping clean only.")
 
             # Evaluate Canary Sentences (if provided)
             canary_evals = []
@@ -451,6 +510,19 @@ class WebTelemetryCallback(TrainerCallback):
             "canary_transcriptions": results.get("canary_transcriptions", []),
             "timestamp": time.time()
         }
+
+        # Phone-simulated twin metrics (same subset, deterministic degrade).
+        phone_metrics = results.get("phone_metrics") or {}
+        if phone_metrics and phone_metrics.get("overall"):
+            p_overall = phone_metrics.get("overall", {})
+            p_formal = phone_metrics.get("formal", {})
+            p_informal = phone_metrics.get("informal", {})
+            record["phone_normalized_wer"] = round(p_overall.get("normalized_wer", 0.0), 2)
+            record["phone_normalized_cer"] = round(p_overall.get("normalized_cer", 0.0), 2)
+            record["phone_formal_wer"] = round(p_formal.get("normalized_wer", 0.0), 2)
+            record["phone_informal_wer"] = round(p_informal.get("normalized_wer", 0.0), 2)
+            record["phone_seed"] = results.get("phone_seed", self.phone_seed)
+            record["phone_profiles"] = results.get("phone_profiles", list(self.telephony_profiles))
 
         # Read existing records
         records = []

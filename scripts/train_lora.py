@@ -12,7 +12,7 @@ import os
 import sys
 import argparse
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import torch
 import evaluate
 from transformers import (
@@ -65,10 +65,16 @@ def parse_args():
     parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
     parser.add_argument("--num_proc", type=int, default=4, help="Number of preprocessing workers")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Per-device eval + benchmark batch size")
-    parser.add_argument("--max_benchmark_samples", type=int, default=1000, help="Max test samples for end-of-epoch benchmark (0/None = full set). Default 1000.")
+    parser.add_argument("--max_benchmark_samples", type=int, default=500, help="Test subset for end-of-epoch benchmark, decoded twice (500 clean + same 500 phone). 0/None = full set (2149).")
     parser.add_argument("--run_post_test_eval", "--run-post-test-eval", action=argparse.BooleanOptionalAction, default=True, help="Run full test evaluation on best model post-training and save report")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
+    parser.add_argument("--telephony_prob", type=float, default=0.0, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed). YAML telephony.prob enables 0.5 on L40S.")
+    parser.add_argument("--telephony_profiles", type=str, default="mobile,pstn", help="Comma-separated phone profiles: mobile,pstn (MCI/Irancell cellular vs TCI landline)")
+    parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
+    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB/G.711 codecs when available (fallback to lite otherwise)")
+    parser.add_argument("--phone_benchmark", "--phone-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Dual clean + phone eval each epoch (--no-phone-benchmark for clean only)")
+    parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
     args = parser.parse_args()
     # YAML config overlay: file provides defaults, CLI wins only if explicitly passed.
     if args.config:
@@ -97,7 +103,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         print(f"Warning: failed to load config {path}: {e}")
         return
     flat: Dict[str, Any] = {}
-    for section in ("model", "lora", "training", "benchmark"):
+    for section in ("model", "lora", "training", "benchmark", "telephony"):
         sub = cfg.get(section, {})
         if isinstance(sub, dict):
             flat.update(sub)
@@ -117,11 +123,20 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "save_total_limit": "save_total_limit", "num_workers": "num_proc",
         "num_proc": "num_proc", "eval_batch_size": "eval_batch_size",
         "max_benchmark_samples": "max_benchmark_samples",
+        "prob": "telephony_prob", "telephony_prob": "telephony_prob",
+        "profiles": "telephony_profiles", "telephony_profiles": "telephony_profiles",
+        "seed": "telephony_seed", "telephony_seed": "telephony_seed",
+        "use_ffmpeg": "telephony_use_ffmpeg", "telephony_use_ffmpeg": "telephony_use_ffmpeg",
+        "phone_benchmark": "phone_benchmark", "phone_seed": "phone_seed",
     }
     for yk, ak in key_map.items():
         if yk in flat:
             cli_name = "--" + ak
             if cli_name not in normalized_cli and ("--" + ak.replace("_", "-")) not in normalized_cli:
+                if ak == "telephony_profiles":
+                    # Keep list from YAML as-is; CLI string normalized later.
+                    setattr(args, ak, flat[yk])
+                    continue
                 try:
                     setattr(args, ak, type(getattr(args, ak))(flat[yk]) if getattr(args, ak) is not None else flat[yk])
                 except Exception:
@@ -131,8 +146,17 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         print(f"Note: lora.target_modules from {path} ignored (code-fixed).")
 
 
+def _parse_telephony_profiles(value) -> list:
+    if value is None:
+        return ["mobile", "pstn"]
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
 def main():
     args = parse_args()
+    args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "mobile,pstn"))
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=======================================================")
@@ -142,6 +166,8 @@ def main():
     print(f" Output Dir:      {args.output_dir}")
     print(f" LoRA Rank:       r={args.lora_r}, alpha={args.lora_alpha}")
     print(f" Batch Size:      {args.batch_size} (accum: {args.grad_accum})")
+    print(f" Telephony:       prob={getattr(args, 'telephony_prob', 0.0)} profiles={args.telephony_profiles} ffmpeg={getattr(args, 'telephony_use_ffmpeg', True)}")
+    print(f" Phone Benchmark: {getattr(args, 'phone_benchmark', True)} (seed={getattr(args, 'phone_seed', 1234)})")
     print(f" CUDA Available:  {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f" GPU Device:      {torch.cuda.get_device_name(0)}")
@@ -184,23 +210,34 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # 4. Prepare Data
-    data_pipeline = PersianASRDataPipeline(
+    # 4. Prepare Data (train gets phone augmentation, eval stays clean)
+    train_pipeline = PersianASRDataPipeline(
         processor=processor,
         dataset_name=args.dataset_name,
         normalizer=normalizer,
-        num_proc=args.num_proc
+        num_proc=args.num_proc,
+        telephony_prob=float(getattr(args, "telephony_prob", 0.0) or 0.0),
+        telephony_profiles=args.telephony_profiles,
+        telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
+        telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+    )
+    eval_pipeline = PersianASRDataPipeline(
+        processor=processor,
+        dataset_name=args.dataset_name,
+        normalizer=normalizer,
+        num_proc=args.num_proc,
+        telephony_prob=0.0,
     )
 
-    raw_train = data_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples)
-    raw_eval = data_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples)
+    raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples)
+    raw_eval = eval_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples)
     raw_test = None
     if args.run_epoch_benchmark:
         print("Loading full test benchmark split for end-of-epoch evaluation...")
-        raw_test = data_pipeline.load_raw_dataset(split="test")
+        raw_test = eval_pipeline.load_raw_dataset(split="test")
 
-    train_dataset = data_pipeline.prepare_dataset_split(raw_train)
-    eval_dataset = data_pipeline.prepare_dataset_split(raw_eval)
+    train_dataset = train_pipeline.prepare_dataset_split(raw_train)
+    eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
 
     # 5. Data Collator
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
@@ -220,6 +257,10 @@ def main():
             normalizer=normalizer,
             eval_batch_size=args.eval_batch_size,
             max_benchmark_samples=args.max_benchmark_samples,
+            phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
+            phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
+            telephony_profiles=args.telephony_profiles,
+            telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
         )
         callbacks.append(telemetry_cb)
 

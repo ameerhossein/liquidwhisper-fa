@@ -9,7 +9,8 @@ Supports:
 """
 
 import os
-from typing import Optional, Dict, Any
+import random
+from typing import Optional, Dict, Any, Sequence
 try:
     from datasets import load_dataset, Audio, DatasetDict, Dataset
     _DATASETS_AVAILABLE = True
@@ -21,6 +22,13 @@ except ImportError:
     _DATASETS_AVAILABLE = False
 from src.normalizer import PersianTextNormalizer
 
+try:
+    from src.telephone import apply_random_telephone
+    _TELEPHONE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    apply_random_telephone = None  # type: ignore
+    _TELEPHONE_AVAILABLE = False
+
 
 class PersianASRDataPipeline:
     def __init__(
@@ -30,7 +38,11 @@ class PersianASRDataPipeline:
         normalizer: Optional[PersianTextNormalizer] = None,
         max_duration_seconds: float = 30.0,
         min_duration_seconds: float = 0.5,
-        num_proc: int = 4
+        num_proc: int = 4,
+        telephony_prob: float = 0.0,
+        telephony_profiles: Optional[Sequence[str]] = None,
+        telephony_seed: Optional[int] = None,
+        telephony_use_ffmpeg: bool = True,
     ):
         self.processor = processor
         self.dataset_name = dataset_name
@@ -38,6 +50,14 @@ class PersianASRDataPipeline:
         self.max_duration_seconds = max_duration_seconds
         self.min_duration_seconds = min_duration_seconds
         self.num_proc = num_proc
+        # Telephony augmentation (Iran MCI/Irancell mobile + TCI PSTN).
+        # prob=0 keeps legacy clean behavior; train typically uses 0.5.
+        self.telephony_prob = float(telephony_prob or 0.0)
+        self.telephony_profiles = tuple(telephony_profiles) if telephony_profiles else ("mobile", "pstn")
+        self.telephony_seed = telephony_seed
+        self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
+        self._tele_rng = random.Random(telephony_seed) if telephony_seed is not None else random.Random()
+        self._tele_warned_missing = False
 
     def _audio_duration_seconds(self, audio: Dict[str, Any]) -> float:
         """Compute duration from waveform length. Returns 0.0 if unknown."""
@@ -110,6 +130,29 @@ class PersianASRDataPipeline:
                 f"Audio {dur:.2f}s exceeds max {self.max_duration_seconds}s; "
                 "filter with is_valid_duration / prepare_dataset_split instead of truncating."
             )
+
+        # 0. Optional telephony augmentation (on-the-fly, length-preserving).
+        # Degrades 16k -> phone 8k -> back to 16k so Whisper still sees 16k
+        # input but with narrowband/codec artifacts (MCI/Irancell/TCI).
+        if self.telephony_prob > 0 and self.telephony_profiles:
+            if not _TELEPHONE_AVAILABLE:
+                if not self._tele_warned_missing:
+                    print("Warning: src.telephone not available; skipping phone simulation.")
+                    self._tele_warned_missing = True
+            else:
+                try:
+                    degraded, _ = apply_random_telephone(
+                        audio["array"],
+                        sr=int(audio.get("sampling_rate", 16000) or 16000),
+                        prob=self.telephony_prob,
+                        profiles=self.telephony_profiles,
+                        use_ffmpeg=self.telephony_use_ffmpeg,
+                        rng=self._tele_rng,
+                    )
+                    audio = {**audio, "array": degraded,
+                             "sampling_rate": int(audio.get("sampling_rate", 16000) or 16000)}
+                except Exception as e:
+                    print(f"Warning: telephone augmentation failed ({e}); using clean audio.")
 
         # 1. Audio feature extraction (128 mel bins for Whisper Large v3 / BuzzASR)
         input_features = self.processor.feature_extractor(
