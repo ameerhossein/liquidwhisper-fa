@@ -328,6 +328,7 @@ function updateBenchmarks(list) {
           </td>
           <td class="num">${isWhisper ? formatDelta(null) : formatDelta(wer - whisper)}</td>
           <td class="num">${isBuzz ? formatDelta(null) : formatDelta(wer - buzz)}</td>
+          <td class="num">${formatPct(row.phone_normalized_wer)}</td>
           <td class="num opt">${formatPct(row.normalized_cer)}</td>
           <td class="num opt">${formatPct(row.formal_wer)}</td>
           <td class="num opt">${formatPct(row.informal_wer)}</td>

@@ -359,6 +359,10 @@ def main():
             output_dir=args.output_dir,
             eval_batch_size=args.eval_batch_size,
             trainer_state=trainer.state,
+            phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
+            phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
+            telephony_profiles=args.telephony_profiles,
+            telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
         )
 
 
@@ -371,9 +375,14 @@ def _run_post_training_evaluation(
     output_dir: str,
     eval_batch_size: int = 16,
     trainer_state: Optional[Any] = None,
+    phone_benchmark: bool = True,
+    phone_seed: int = 1234,
+    telephony_profiles: Optional[list] = None,
+    telephony_use_ffmpeg: bool = True,
 ):
     import time
 
+    phone_profiles = list(telephony_profiles or ["mobile", "pstn"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = _resolve_infer_dtype(device)
     use_amp = _should_autocast(device)
@@ -397,34 +406,38 @@ def _run_post_training_evaluation(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    def _transcribe(label: str, degrade_fn=None):
+        preds = []
+        audio_seconds = 0.0
+        print(f"Transcribing {total_samples} samples ({label}, batch size = {eval_batch_size})...")
+        for i in range(0, total_samples, eval_batch_size):
+            batch = test_ds[i : i + eval_batch_size]
+            audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
+            waveforms = []
+            for j, a in enumerate(audios):
+                arr = a.get("array")
+                sr = a.get("sampling_rate", 16000)
+                if arr is not None and len(arr) > 0:
+                    audio_seconds += len(arr) / float(sr)
+                if degrade_fn is not None:
+                    arr = degrade_fn(arr, index=i + j, seed_base=phone_seed,
+                                     profiles=phone_profiles, use_ffmpeg=telephony_use_ffmpeg)
+                waveforms.append(arr)
+
+            feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
+            if use_amp:
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+            else:
+                with torch.inference_mode():
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+
+            preds.extend(processor.batch_decode(pred_ids, skip_special_tokens=True))
+        return preds, audio_seconds
+
     model.eval()
-    predictions = []
     start_eval_time = time.time()
-    total_audio_seconds = 0.0
-
-    print(f"Transcribing {total_samples} samples (batch size = {eval_batch_size})...")
-    for i in range(0, total_samples, eval_batch_size):
-        batch = test_ds[i : i + eval_batch_size]
-        audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
-        waveforms = [a["array"] for a in audios]
-
-        for a in audios:
-            arr = a.get("array")
-            sr = a.get("sampling_rate", 16000)
-            if arr is not None and len(arr) > 0:
-                total_audio_seconds += len(arr) / float(sr)
-
-        feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
-        if use_amp:
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                pred_ids = model.generate(input_features=feats, max_new_tokens=225)
-        else:
-            with torch.inference_mode():
-                pred_ids = model.generate(input_features=feats, max_new_tokens=225)
-
-        batch_preds = processor.batch_decode(pred_ids, skip_special_tokens=True)
-        predictions.extend(batch_preds)
-
+    predictions, total_audio_seconds = _transcribe("clean")
     elapsed_eval_time = max(0.001, time.time() - start_eval_time)
     rtfx = round(total_audio_seconds / elapsed_eval_time, 2) if total_audio_seconds > 0 else 0.0
 
@@ -434,6 +447,32 @@ def _run_post_training_evaluation(
         predictions=predictions,
         is_informal_flags=is_informal,
     )
+
+    # 2b. Phone-simulated second pass on the same test split (deterministic)
+    phone_block = None
+    if phone_benchmark:
+        try:
+            from src.telephone import degrade_for_eval
+            phone_predictions, _ = _transcribe("phone-simulated", degrade_fn=degrade_for_eval)
+            phone_results = metrics_calculator.evaluate_predictions(
+                references=references,
+                predictions=phone_predictions,
+                is_informal_flags=is_informal,
+            )
+            print(metrics_calculator.format_results_table("BuzzASR + LoRA (Final Full Test, phone)", phone_results))
+            p_overall = phone_results.get("overall", {})
+            phone_block = {
+                "normalized_wer": round(p_overall.get("normalized_wer", 0.0), 2),
+                "normalized_cer": round(p_overall.get("normalized_cer", 0.0), 2),
+                "formal_wer": round(phone_results.get("formal", {}).get("normalized_wer", 0.0), 2),
+                "informal_wer": round(phone_results.get("informal", {}).get("normalized_wer", 0.0), 2),
+                "gap_vs_clean_pp": round(p_overall.get("normalized_wer", 0.0) - eval_results.get("overall", {}).get("normalized_wer", 0.0), 2),
+                "seed": phone_seed,
+                "profiles": phone_profiles,
+                "details": phone_results,
+            }
+        except Exception as e:
+            print(f"[Final Report] Phone pass failed ({e}); report will be clean-only.")
 
     # 3. Read epoch benchmark history & trainer logs
     epoch_benchmarks = []
@@ -491,6 +530,7 @@ def _run_post_training_evaluation(
             "delta_vs_whisper_v3": delta_vs_whisper,
             "delta_vs_buzzasr_base": delta_vs_buzzasr,
             "details": eval_results,
+            "phone": phone_block,
         },
         "baselines_comparison": {
             "whisper_large_v3": baselines.get("whisper_v3"),
@@ -521,6 +561,13 @@ def _run_post_training_evaluation(
         "|---|---|",
         f"| **Normalized WER** | **{norm_wer:.2f}%** |",
         f"| **Normalized CER** | {norm_cer:.2f}% |",
+    ]
+    if phone_block:
+        md_lines.append(
+            f"| **Phone Normalized WER** (MCI/Irancell + TCI sim, seed={phone_block['seed']}) | "
+            f"**{phone_block['normalized_wer']:.2f}%** ({phone_block['gap_vs_clean_pp']:+.2f} pp vs clean) |"
+        )
+    md_lines += [
         f"| **Diagnostic WER (ZWNJ $\\to$ Space)** | {diag_wer:.2f}% |",
         f"| **Formal Subset WER** | {formal_wer:.2f}% ({eval_results.get('formal', {}).get('count', 0)} samples) |",
         f"| **Informal Subset WER** | {informal_wer:.2f}% ({eval_results.get('informal', {}).get('count', 0)} samples) |",
@@ -532,12 +579,14 @@ def _run_post_training_evaluation(
     ]
 
     if epoch_benchmarks:
-        md_lines.append("| Epoch | Samples | Norm WER (%) | Norm CER (%) | Formal WER (%) | Informal WER (%) | $\\Delta$ vs Whisper | $\\Delta$ vs BuzzASR |")
-        md_lines.append("|---|---|---|---|---|---|---|---|")
+        md_lines.append("| Epoch | Samples | Norm WER (%) | Phone WER (%) | Norm CER (%) | Formal WER (%) | Informal WER (%) | $\\Delta$ vs Whisper | $\\Delta$ vs BuzzASR |")
+        md_lines.append("|---|---|---|---|---|---|---|---|---|")
         for ep in epoch_benchmarks:
+            phone_wer = ep.get("phone_normalized_wer")
+            phone_str = f"{phone_wer:.2f}%" if phone_wer is not None else "--"
             md_lines.append(
                 f"| {ep.get('epoch', 'N/A')} | {ep.get('total_samples', '-')} | "
-                f"{ep.get('normalized_wer', 0.0):.2f}% | {ep.get('normalized_cer', 0.0):.2f}% | "
+                f"{ep.get('normalized_wer', 0.0):.2f}% | {phone_str} | {ep.get('normalized_cer', 0.0):.2f}% | "
                 f"{ep.get('formal_wer', 0.0):.2f}% | {ep.get('informal_wer', 0.0):.2f}% | "
                 f"{ep.get('delta_vs_whisper', 0.0):+.2f}% | {ep.get('delta_vs_buzzasr', 0.0):+.2f}% |"
             )
@@ -553,7 +602,9 @@ def _run_post_training_evaluation(
     # Print summary table to console
     print("\n" + metrics_calculator.format_results_table("BuzzASR + LoRA (Final Full Test)", eval_results))
     print(f"Improvement vs. Whisper v3: {delta_vs_whisper:+.2f}%")
-    print(f"Improvement vs. BuzzASR Base: {delta_vs_buzzasr:+.2f}%\n")
+    print(f"Improvement vs. BuzzASR Base: {delta_vs_buzzasr:+.2f}%")
+    if phone_block:
+        print(f"Clean WER: {norm_wer:.2f}% | Phone WER: {phone_block['normalized_wer']:.2f}% | Gap: {phone_block['gap_vs_clean_pp']:+.2f}pp\n")
 
 
 if __name__ == "__main__":
