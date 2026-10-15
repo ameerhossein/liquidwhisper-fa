@@ -21,9 +21,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Paths
+# Paths (RESULTS_DIR overridable so telemetry can live on the persistent volume,
+# e.g. ASR_RESULTS_DIR=/workspace/stt-outputs/results)
 BASE_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = BASE_DIR / "results"
+RESULTS_DIR = Path(os.environ.get("ASR_RESULTS_DIR", str(BASE_DIR / "results")))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,6 +50,19 @@ training_process: Optional[subprocess.Popen] = None
 training_log_fd = None
 connected_websockets: List[WebSocket] = []
 PID_FILE = RESULTS_DIR / "training.pid"
+
+
+def _default_output_dir() -> str:
+    """Persistent-volume-aware default (mirrors scripts/train_lora.py)."""
+    env = (os.environ.get("ASR_OUTPUT_DIR", "") or "").strip()
+    if env:
+        return env
+    try:
+        if Path("/workspace").is_dir():
+            return "/workspace/stt-outputs/buzzasr-neyshekar-lora"
+    except Exception:
+        pass
+    return "outputs/buzzasr-neyshekar-lora"
 
 _HARDCODED_BASELINES = [
     {
@@ -214,10 +228,33 @@ def _close_log_fd():
 
 
 def _sanitize_output_dir(raw: str) -> str:
-    """Confine output_dir under BASE_DIR to block ../ traversal."""
-    raw = (raw or "outputs/buzzasr-neyshekar-lora").strip() or "outputs/buzzasr-neyshekar-lora"
-    # Reject absolute paths outside repo and traversal.
-    p = (BASE_DIR / raw).resolve() if not os.path.isabs(raw) else Path(raw).resolve()
+    """Confine output_dir to repo or persistent-volume roots.
+
+    Allows relative paths under BASE_DIR (legacy behavior) plus absolute
+    paths under /workspace, /runpod-volume, /mnt, or colon-separated
+    ASR_ALLOWED_OUTPUT_ROOTS. Returns absolute path as string so the trainer
+    can write checkpoints directly to the persistent volume (auto-resumable).
+    """
+    raw = (raw or _default_output_dir()).strip() or _default_output_dir()
+    extra_roots = [r for r in os.environ.get("ASR_ALLOWED_OUTPUT_ROOTS", "").split(":") if r.strip()]
+    allowed_abs = [Path("/workspace"), Path("/runpod-volume"), Path("/mnt")]
+    for r in extra_roots:
+        try:
+            allowed_abs.append(Path(r).resolve())
+        except Exception:
+            continue
+    if os.path.isabs(raw):
+        p = Path(raw).resolve()
+        if p == BASE_DIR.resolve() or BASE_DIR.resolve() in p.parents:
+            return str(p)
+        for root in allowed_abs:
+            try:
+                if p == root or root in p.parents:
+                    return str(p)
+            except Exception:
+                continue
+        raise HTTPException(status_code=400, detail="output_dir must be inside project or /workspace, /runpod-volume, /mnt (or ASR_ALLOWED_OUTPUT_ROOTS).")
+    p = (BASE_DIR / raw).resolve()
     try:
         p.relative_to(BASE_DIR.resolve())
     except Exception:
@@ -352,10 +389,19 @@ async def start_training(config: Dict[str, Any] = None):
     if not (0 <= max_bench_i <= 10000):
         raise HTTPException(status_code=400, detail="max_benchmark_samples must be 0..10000 (0=full).")
 
-    output_dir = _sanitize_output_dir(str(config.get("output_dir", "outputs/buzzasr-neyshekar-lora")))
+    output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
     dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
+    # Resume controls: default auto-resume ON so pod restarts continue from
+    # persistent-volume checkpoints. Send {"fresh_start": true} for clean run,
+    # or {"resume_from_checkpoint": "<path|last>"} to force a checkpoint.
+    fresh_start = bool(config.get("fresh_start", config.get("fresh", False)))
+    resume_explicit = str(config.get("resume_from_checkpoint", "") or "").strip()
+    auto_resume = config.get("auto_resume", True)
+    auto_resume_on = (str(auto_resume).strip().lower() not in ("0", "false", "no", "off", "")) if isinstance(auto_resume, str) else bool(auto_resume)
+    if fresh_start:
+        auto_resume_on = False
 
     # Remove any old stop signal
     if STOP_SIGNAL_FILE.exists():
@@ -376,6 +422,14 @@ async def start_training(config: Dict[str, Any] = None):
         "--enable_telemetry",
         "--run_epoch_benchmark"
     ]
+    if resume_explicit:
+        cmd += ["--resume_from_checkpoint", resume_explicit]
+    if auto_resume_on:
+        cmd += ["--auto_resume"]
+    else:
+        cmd += ["--no-auto_resume"]
+    if fresh_start:
+        cmd += ["--fresh_start"]
 
     _close_log_fd()
     training_log_fd = open(LOG_FILE, "w", encoding="utf-8")
@@ -402,7 +456,10 @@ async def start_training(config: Dict[str, Any] = None):
             "epochs": str(epochs_i),
             "batch_size": str(batch_i),
             "learning_rate": str(lr_f),
-            "output_dir": output_dir
+            "output_dir": output_dir,
+            "auto_resume": auto_resume_on,
+            "fresh_start": fresh_start,
+            "resume_from_checkpoint": resume_explicit or None
         }
     }
 

@@ -39,13 +39,29 @@ from src.data import PersianASRDataPipeline
 from src.trainer_callbacks import WebTelemetryCallback, load_baselines, _resolve_infer_dtype, _should_autocast
 
 
+def _default_output_dir() -> str:
+    """Persistent-volume-aware default: /workspace/... on RunPod, else local.
+
+    Env ASR_OUTPUT_DIR wins, then /workspace if present, else repo-local.
+    """
+    env = (os.environ.get("ASR_OUTPUT_DIR", "") or "").strip()
+    if env:
+        return env
+    try:
+        if Path("/workspace").is_dir():
+            return "/workspace/stt-outputs/buzzasr-neyshekar-lora"
+    except Exception:
+        pass
+    return "outputs/buzzasr-neyshekar-lora"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train BuzzASR with LoRA on Persian Speech")
     # Model & Data
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config (e.g. configs/l40s_train_config.yaml). CLI flags override file.")
     parser.add_argument("--base_model", type=str, default="BuzzASR/persian", help="Base model identifier")
     parser.add_argument("--dataset_name", type=str, default="shekar-ai/Neyshekar", help="Dataset identifier")
-    parser.add_argument("--output_dir", type=str, default="outputs/buzzasr-neyshekar-lora", help="Output directory for checkpoints")
+    parser.add_argument("--output_dir", type=str, default=_default_output_dir(), help="Output directory for checkpoints (default: /workspace/... on RunPod, else outputs/...)")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Limit train samples (smoke test)")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Limit eval samples")
 
@@ -63,6 +79,9 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=500, help="Evaluate every N steps")
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Explicit checkpoint to resume from: path, or 'last' for latest in output_dir. Overrides --auto_resume.")
+    parser.add_argument("--auto_resume", "--auto-resume", action=argparse.BooleanOptionalAction, default=True, help="Automatically resume from latest checkpoint in output_dir (for pod restarts). Use --no-auto_resume for a fresh run.")
+    parser.add_argument("--fresh_start", "--fresh-start", action=argparse.BooleanOptionalAction, default=False, help="Start fresh: delete prior checkpoint-*, best_adapter, reports and telemetry history in output_dir/results before training.")
     parser.add_argument("--num_proc", type=int, default=4, help="Number of preprocessing workers")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Per-device eval + benchmark batch size")
     parser.add_argument("--max_benchmark_samples", type=int, default=500, help="Test subset for end-of-epoch benchmark, decoded twice (500 clean + same 500 phone). 0/None = full set (2149).")
@@ -128,7 +147,11 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "seed": "telephony_seed", "telephony_seed": "telephony_seed",
         "use_ffmpeg": "telephony_use_ffmpeg", "telephony_use_ffmpeg": "telephony_use_ffmpeg",
         "phone_benchmark": "phone_benchmark", "phone_seed": "phone_seed",
+        "resume_from_checkpoint": "resume_from_checkpoint",
+        "auto_resume": "auto_resume", "auto-resume": "auto_resume",
+        "fresh_start": "fresh_start", "fresh-start": "fresh_start",
     }
+    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark"}
     for yk, ak in key_map.items():
         if yk in flat:
             cli_name = "--" + ak
@@ -138,7 +161,14 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
                     setattr(args, ak, flat[yk])
                     continue
                 try:
-                    setattr(args, ak, type(getattr(args, ak))(flat[yk]) if getattr(args, ak) is not None else flat[yk])
+                    if ak in _BOOL_KEYS:
+                        v = flat[yk]
+                        if isinstance(v, str):
+                            setattr(args, ak, v.strip().lower() in ("1", "true", "yes", "y", "on"))
+                        else:
+                            setattr(args, ak, bool(v))
+                    else:
+                        setattr(args, ak, type(getattr(args, ak))(flat[yk]) if getattr(args, ak) is not None else flat[yk])
                 except Exception:
                     setattr(args, ak, flat[yk])
     # Target modules are code-fixed; warn if config disagrees.
@@ -154,10 +184,172 @@ def _parse_telephony_profiles(value) -> list:
     return [p.strip() for p in str(value).split(",") if p.strip()]
 
 
+def _resolve_output_dir(raw: str) -> str:
+    """Fall back to repo-local dir when the persistent root is absent.
+
+    Lets the committed /workspace default work on RunPod while local runs
+    without /workspace still write to outputs/... instead of failing.
+    """
+    raw = (raw or "").strip() or _default_output_dir()
+    try:
+        p = Path(raw)
+        if p.is_absolute():
+            parts = p.parts
+            if len(parts) > 1 and parts[1] in ("workspace", "runpod-volume"):
+                if not Path("/" + parts[1]).is_dir():
+                    local = "outputs/buzzasr-neyshekar-lora"
+                    print(f"Note: {raw} unavailable (/{parts[1]} missing); using {local}.")
+                    return local
+    except Exception:
+        pass
+    return raw
+
+
+def _clear_previous_state(output_dir: str, results_dir: str = "results") -> None:
+    """Delete prior run state so --fresh_start truly starts clean.
+
+    Removes only known training artifacts inside output_dir
+    (checkpoint-*, best_adapter, final reports, runs/) and the live
+    telemetry history in results_dir (loss_history, epoch benchmarks are
+    rebuilt with baselines by the callback). Never deletes output_dir itself.
+    """
+    import shutil
+    removed = []
+    try:
+        base = Path(output_dir)
+        if base.is_dir():
+            for ckpt in sorted(base.glob("checkpoint-*")):
+                try:
+                    if ckpt.is_dir():
+                        shutil.rmtree(ckpt, ignore_errors=True)
+                        removed.append(ckpt.name)
+                except Exception:
+                    continue
+            for name in ("best_adapter", "runs"):
+                try:
+                    t = base / name
+                    if t.is_dir():
+                        shutil.rmtree(t, ignore_errors=True)
+                        removed.append(name)
+                except Exception:
+                    continue
+            for name in ("final_evaluation_report.json", "final_evaluation_report.md", "trainer_state.json"):
+                try:
+                    t = base / name
+                    if t.is_file():
+                        t.unlink(missing_ok=True)
+                        removed.append(name)
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"Warning: fresh-start output cleanup failed: {e}")
+    try:
+        rdir = Path(results_dir)
+        for name in ("loss_history.json", "live_telemetry.json", "training_live.log"):
+            try:
+                t = rdir / name
+                if t.is_file():
+                    t.unlink(missing_ok=True)
+                    removed.append(f"results/{name}")
+            except Exception:
+                continue
+        # Reset epoch benchmarks to baselines-only (callback rebuilds if missing).
+        try:
+            bfile = rdir / "epoch_benchmarks.json"
+            if bfile.is_file():
+                bfile.unlink(missing_ok=True)
+                removed.append("results/epoch_benchmarks.json")
+        except Exception:
+            pass
+        # Clear stale stop signal so the fresh run is not halted immediately.
+        try:
+            sfile = rdir / "stop_training.signal"
+            if sfile.is_file():
+                sfile.unlink(missing_ok=True)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Warning: fresh-start results cleanup failed: {e}")
+    if removed:
+        print(f"Fresh start: cleared {', '.join(removed)}")
+
+
+def _find_last_checkpoint(output_dir: str) -> Optional[str]:
+    """Return latest checkpoint-* dir in output_dir, or None.
+
+    Prefers transformers.trainer_utils.get_last_checkpoint, falls back to
+    mtime-sorted scan so training stays resumable even across versions.
+    A valid checkpoint must contain trainer_state.json.
+    """
+    try:
+        from transformers.trainer_utils import get_last_checkpoint
+        found = get_last_checkpoint(output_dir)
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        base = Path(output_dir)
+        if not base.is_dir():
+            return None
+        cands = [p for p in base.glob("checkpoint-*") if p.is_dir() and (p / "trainer_state.json").exists()]
+        if not cands:
+            return None
+        def _step(p: Path) -> float:
+            try:
+                return int(p.name.split("-")[-1])
+            except Exception:
+                try:
+                    return p.stat().st_mtime
+                except Exception:
+                    return 0
+        cands.sort(key=_step)
+        return str(cands[-1])
+    except Exception:
+        return None
+
+
+def _resolve_resume_checkpoint(args) -> Optional[bool | str]:
+    """Decide what to pass as trainer.train(resume_from_checkpoint=...).
+
+    Returns None (fresh), True (let Trainer pick latest), or a path.
+    Explicit --resume_from_checkpoint wins; otherwise --auto_resume picks up
+    the latest checkpoint in --output_dir (which should live on the persistent
+    volume, e.g. /workspace/stt-outputs/...). --fresh_start disables resume.
+    """
+    if bool(getattr(args, "fresh_start", False)):
+        return None
+    explicit = (getattr(args, "resume_from_checkpoint", None) or "").strip() if isinstance(getattr(args, "resume_from_checkpoint", None), str) else getattr(args, "resume_from_checkpoint", None)
+    if explicit:
+        low = str(explicit).strip().lower()
+        if low in ("last", "true", "yes", "1", "auto"):
+            last = _find_last_checkpoint(args.output_dir)
+            if last:
+                print(f"Resuming from latest checkpoint: {last}")
+                return last
+            print("No checkpoint found in output_dir; starting fresh.")
+            return None
+        p = Path(str(explicit))
+        if p.is_dir():
+            print(f"Resuming from explicit checkpoint: {p}")
+            return str(p)
+        print(f"Warning: --resume_from_checkpoint '{explicit}' not found; starting fresh.")
+        return None
+    if bool(getattr(args, "auto_resume", True)):
+        last = _find_last_checkpoint(args.output_dir)
+        if last:
+            print(f"Auto-resume: found checkpoint {last}")
+            return last
+    return None
+
+
 def main():
     args = parse_args()
     args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "mobile,pstn"))
+    args.output_dir = _resolve_output_dir(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
+    if bool(getattr(args, "fresh_start", False)):
+        _clear_previous_state(args.output_dir, results_dir="results")
 
     print("=======================================================")
     print(" Persian ASR Fine-Tuning: BuzzASR + Neyshekar LoRA")
@@ -289,6 +481,7 @@ def main():
         use_bf16 = False
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
+        overwrite_output_dir=True,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -334,9 +527,13 @@ def main():
         except Exception:
             trainer = Seq2SeqTrainer(tokenizer=processor, **_trainer_common)
 
-    # 9. Execute Training
-    print("\nStarting training loop...")
-    trainer.train()
+    # 9. Execute Training (auto-resumable from persistent-volume checkpoints)
+    resume_ckpt = _resolve_resume_checkpoint(args)
+    if resume_ckpt:
+        print(f"\nResuming training from: {resume_ckpt}")
+    else:
+        print("\nStarting training loop (fresh)...")
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # 10. Save Best Adapter & Processor
     best_save_path = os.path.join(args.output_dir, "best_adapter")

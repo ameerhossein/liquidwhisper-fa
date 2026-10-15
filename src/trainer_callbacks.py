@@ -124,11 +124,19 @@ class WebTelemetryCallback(TrainerCallback):
         self.stop_signal_file = os.path.join(self.results_dir, "stop_training.signal")
         self.loss_history_file = os.path.join(self.results_dir, "loss_history.json")
 
-        # Runtime trackers
+        # Runtime trackers (restore loss history so resumed runs keep the curve)
         self.start_time = time.time()
         self.last_step_time = time.time()
         self.step_durations: List[float] = []
         self.loss_history: List[Dict[str, Any]] = []
+        try:
+            if os.path.exists(self.loss_history_file):
+                with open(self.loss_history_file, "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                if isinstance(prev, list):
+                    self.loss_history = prev[-500:]
+        except Exception:
+            self.loss_history = []
 
         # Initialize telemetry file
         self._write_telemetry({

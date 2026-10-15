@@ -3,7 +3,10 @@
 model:
   base_model: "BuzzASR/persian"
   dataset_name: "shekar-ai/Neyshekar"
-  output_dir: "outputs/buzzasr-neyshekar-lora"
+  # Persistent-volume default on RunPod. Local runs without /workspace fall
+  # back to outputs/buzzasr-neyshekar-lora automatically (see train_lora.py).
+  # Override: --output_dir <path> or ASR_OUTPUT_DIR=<path>.
+  output_dir: "/workspace/stt-outputs/buzzasr-neyshekar-lora"
 
 lora:
   r: 64
