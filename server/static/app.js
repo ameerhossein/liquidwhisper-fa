@@ -182,6 +182,13 @@ function updateTelemetry(tel) {
     el.gpuModel.textContent = gpu.device_name || "NVIDIA GPU";
     el.vramText.textContent = `${gpu.allocated_gb || 0} / ${gpu.total_gb || 0} GB`;
     el.vramFill.style.width = `${gpu.utilization_pct || 0}%`;
+  } else if (gpu.device_name && gpu.device_name !== "N/A") {
+    // Trainer on CPU reports device_name "CPU": show it instead of "unavailable".
+    el.gpuModel.textContent = gpu.device_name;
+    el.vramText.textContent = "—";
+    el.vramFill.style.width = "0%";
+  } else if (!tel.gpu) {
+    // No reading yet (first paint before /api/status resolves): keep placeholder.
   } else {
     el.gpuModel.textContent = "GPU unavailable";
     el.vramText.textContent = "—";

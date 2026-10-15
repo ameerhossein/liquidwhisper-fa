@@ -235,7 +235,43 @@ def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any
 
 
 def get_gpu_info() -> Dict[str, Any]:
-    """Lightweight check of GPU info via torch or nvidia-smi."""
+    """System-wide GPU info: prefer nvidia-smi, fall back to torch.
+
+    The previous torch-only check reported "GPU unavailable" whenever the
+    *server* process lacked a CUDA torch build (or CUDA_VISIBLE_DEVICES hid
+    the device), even on an L40S pod, and torch's memory_allocated() only
+    reflects this process (~0 GB), not the training job. nvidia-smi reports
+    machine-wide usage so the header meter is accurate.
+    """
+    # 1) nvidia-smi: works without torch and reflects the training process.
+    try:
+        import shutil
+        if shutil.which("nvidia-smi"):
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                first = out.stdout.strip().splitlines()[0]
+                parts = [p.strip() for p in first.split(",")]
+                if len(parts) >= 4:
+                    name, used, total, util = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+                    alloc_gb = round(used / 1024.0, 2)
+                    total_gb = round(total / 1024.0, 2)
+                    return {
+                        "available": True,
+                        "device_name": name,
+                        "allocated_gb": alloc_gb,
+                        "reserved_gb": alloc_gb,
+                        "total_gb": total_gb,
+                        "utilization_pct": round(util, 1),
+                        "source": "nvidia-smi",
+                    }
+    except Exception:
+        pass
+    # 2) torch fallback (server-process-local view).
     try:
         import torch
         if torch.cuda.is_available():
@@ -248,7 +284,8 @@ def get_gpu_info() -> Dict[str, Any]:
                 "allocated_gb": round(alloc, 2),
                 "reserved_gb": round(res, 2),
                 "total_gb": round(tot, 2),
-                "utilization_pct": round(alloc / tot * 100.0, 1) if tot > 0 else 0.0
+                "utilization_pct": round(alloc / tot * 100.0, 1) if tot > 0 else 0.0,
+                "source": "torch",
             }
     except Exception:
         pass
@@ -258,7 +295,8 @@ def get_gpu_info() -> Dict[str, Any]:
         "allocated_gb": 0.0,
         "reserved_gb": 0.0,
         "total_gb": 0.0,
-        "utilization_pct": 0.0
+        "utilization_pct": 0.0,
+        "source": "none",
     }
 
 
@@ -434,6 +472,7 @@ async def start_training(config: Dict[str, Any] = None):
 
     cmd = [
         sys.executable,
+        "-u",  # unbuffered: stream prints to training_live.log during long imports/downloads
         str(BASE_DIR / "scripts" / "train_lora.py"),
         "--base_model", "BuzzASR/persian",
         "--dataset_name", dataset_name,
@@ -476,13 +515,23 @@ async def start_training(config: Dict[str, Any] = None):
         "eta_seconds": 0,
     }), encoding="utf-8")
 
-    training_process = subprocess.Popen(
-        cmd,
-        stdout=training_log_fd,
-        stderr=subprocess.STDOUT,
-        cwd=str(BASE_DIR),
-        preexec_fn=os.setsid if sys.platform != "win32" else None
-    )
+    training_process = None
+    try:
+        training_process = subprocess.Popen(
+            cmd,
+            stdout=training_log_fd,
+            stderr=subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            preexec_fn=os.setsid if sys.platform != "win32" else None
+        )
+    except Exception as e:
+        try:
+            training_log_fd.write(f"\n!!! Failed to launch training process: {e}\n")
+            training_log_fd.flush()
+        except Exception:
+            pass
+        _close_log_fd()
+        raise HTTPException(status_code=500, detail=f"Failed to launch training: {e}")
     try:
         PID_FILE.write_text(str(training_process.pid), encoding="utf-8")
     except Exception:
@@ -550,6 +599,9 @@ async def websocket_telemetry(websocket: WebSocket):
             is_running = _training_running()
             telemetry = _derive_status(telemetry, is_running)
             telemetry["process_running"] = is_running
+            # WS clients otherwise never get a fresh GPU reading (the trainer
+            # only rewrites telemetry on steps); mirror /api/status behavior.
+            telemetry["gpu"] = telemetry.get("gpu") or get_gpu_info()
 
             payload = {
                 "telemetry": telemetry,

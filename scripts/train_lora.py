@@ -238,7 +238,12 @@ def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) ->
     except Exception as e:
         print(f"Warning: fresh-start output cleanup failed: {e}")
     try:
-        for name in ("loss_history.json", "live_telemetry.json", "training_live.log"):
+        for name in ("loss_history.json",):
+            # NOTE: do NOT delete live_telemetry.json / training_live.log here.
+            # The web server creates both for the *current* run just before
+            # spawning this trainer; deleting them orphans the server's open
+            # log fd (stdout goes to an unlinked inode) so /api/logs reports
+            # "Log buffer empty" while training is actually running.
             try:
                 t = rdir / name
                 if t.is_file():
