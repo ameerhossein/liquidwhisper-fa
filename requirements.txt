@@ -24,9 +24,13 @@ soundfile>=0.12.1
 # Required by datasets>=3/4 for Audio decoding (datasets uses torchcodec;
 # without it .map/.filter over the "audio" column fails with
 # "To support decoding audio data, please install 'torchcodec'").
-# Must match the torch CUDA build: install from the same PyTorch index, e.g.
-#   pip install torchcodec --index-url https://download.pytorch.org/whl/cu124
-torchcodec>=0.8.0
+# Pinned to match torch 2.6 (cu124): torchcodec 0.5.x ↔ torch 2.6,
+# 0.7 ↔ torch 2.8, 0.8 ↔ torch 2.9, 0.14+ ↔ torch >=2.11.
+# Do NOT upgrade alone — bump torch + torchcodec together, e.g.
+#   pip install -U torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu128
+# (cu124 caps torch at 2.6, so latest torchcodec 0.17 breaks with
+# OSError: libnvrtc.so.13: cannot open shared object file).
+torchcodec==0.5.0
 
 # Metrics & Utilities
 jiwer>=3.0.4

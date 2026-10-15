@@ -30,14 +30,17 @@ pip install --upgrade pip setuptools wheel
 echo "Installing PyTorch with CUDA support..."
 pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-# 4b. Install torchcodec from the SAME PyTorch index so the build matches
-# torch/CUDA (datasets>=3/4 requires it to decode the "audio" column;
-# PyPI-only installs can mismatch the torch build and fail at runtime).
-echo "Installing torchcodec (required for datasets Audio decoding)..."
-pip install --upgrade torchcodec --index-url https://download.pytorch.org/whl/cu124 || pip install --upgrade torchcodec
+# 4b. Install torchcodec pinned to match torch 2.6 (cu124).
+# torch/CUDA (datasets>=3/4 requires it to decode the "audio" column).
+# Unpinned installs pull 0.17 which needs torch>=2.11 / CUDA 13
+# (OSError: libnvrtc.so.13) while cu124 caps torch at 2.6.
+# Pairing: torchcodec 0.5.x <-> torch 2.6. Bump together for cu128+.
+echo "Installing torchcodec 0.5.0 to match torch 2.6 (cu124)..."
+pip uninstall -y torchcodec 2>/dev/null || true
+pip install "torchcodec==0.5.0" --index-url https://download.pytorch.org/whl/cu124
 python3 -c "import torchcodec; print('torchcodec OK:', torchcodec.__version__)" || {
     echo "WARNING: torchcodec import failed; audio decoding will fail."
-    echo "  Retry with: pip install -U 'datasets[audio]' torchcodec --index-url https://download.pytorch.org/whl/cu124"
+    echo "  Retry with: pip install 'torchcodec==0.5.0' --index-url https://download.pytorch.org/whl/cu124"
 }
 
 # 5. Install project dependencies
@@ -48,11 +51,40 @@ pip install -r requirements.txt
 echo "Checking ffmpeg telephony codecs..."
 if command -v ffmpeg &> /dev/null; then
     echo "ffmpeg found: $(ffmpeg -version 2>/dev/null | head -n 1)"
+    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopencore_amrnb; then
+        echo "ffmpeg lacks libopencore_amrnb; installing true static ffmpeg..."
+        if command -v apt-get &> /dev/null; then
+            (sudo apt-get update -qq && sudo apt-get install -y -qq libopencore-amrnb0 libopencore-amrwb0 ffmpeg xz-utils curl 2>&1 | tail -n 3) || \
+            (apt-get update -qq && apt-get install -y -qq libopencore-amrnb0 libopencore-amrwb0 ffmpeg xz-utils curl 2>&1 | tail -n 3) || true
+        fi
+    fi
+    # Ubuntu apt ffmpeg is often built without AMR-NB; static johnvansickle
+    # builds ship libopencore_amrnb + pcm_alaw. Install to /usr/local/bin
+    # so it shadows /usr/bin/ffmpeg on PATH.
+    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopencore_amrnb; then
+        TMPD=$(mktemp -d)
+        if (curl -fsSL -o "$TMPD/ffmpeg.tar.xz" https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz || \
+            wget -qO "$TMPD/ffmpeg.tar.xz" https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz); then
+            tar -xf "$TMPD/ffmpeg.tar.xz" -C "$TMPD"
+            STATIC_FFMPEG=$(echo "$TMPD"/ffmpeg-*-amd64-static/ffmpeg | head -n 1)
+            if [ -f "$STATIC_FFMPEG" ]; then
+                cp -f "$STATIC_FFMPEG" /usr/local/bin/ffmpeg
+                chmod +x /usr/local/bin/ffmpeg
+                hash -r 2>/dev/null || true
+                echo "static ffmpeg installed: $(/usr/local/bin/ffmpeg -version 2>/dev/null | head -n 1)"
+            fi
+        else
+            echo "WARNING: static ffmpeg download failed; keeping system ffmpeg."
+        fi
+        rm -rf "$TMPD"
+    fi
     if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopencore_amrnb; then
         echo "AMR-NB encoder (mobile) available."
     else
-        echo "WARNING: ffmpeg lacks libopencore_amrnb; mobile sim falls back to lite approximation."
-        echo "  On Ubuntu: sudo apt-get install -y ffmpeg libopencore-amrnb0"
+        echo "WARNING: ffmpeg still lacks libopencore_amrnb; mobile sim falls back to lite approximation."
+        echo "  Manual fix: curl -fsSL -o /tmp/ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        echo "    && tar -xf /tmp/ffmpeg.tar.xz -C /tmp && cp -f /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg"
+        echo "  Training still works; src/telephone.py uses alaw_quantize fallback."
     fi
     if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q pcm_alaw; then
         echo "G.711 A-law encoder (PSTN) available."

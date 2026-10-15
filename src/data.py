@@ -42,8 +42,8 @@ def _check_audio_backend() -> None:
     except ImportError as e:
         raise ImportError(
             "Missing 'torchcodec': datasets cannot decode the 'audio' column. "
-            "Install it from the same PyTorch index as torch, e.g. "
-            "pip install torchcodec --index-url https://download.pytorch.org/whl/cu124 "
+            "Install the torch-2.6-pinned build, e.g. "
+            "pip install 'torchcodec==0.5.0' --index-url https://download.pytorch.org/whl/cu124 "
             "(or pip install -U 'datasets[audio]'). Then retry training."
         ) from e
 
