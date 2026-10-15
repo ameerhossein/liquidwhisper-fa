@@ -16,7 +16,7 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +66,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_to_json(request: Request, exc: Exception):
+    """Always return JSON (never plain-text "Internal Server Error").
+
+    The Web UI calls ``await res.json()`` on error responses; a plain-text
+    500 body surfaces there as ``SyntaxError: Unexpected token 'I',
+    "Internal S..." is not valid JSON`` and hides the real cause. This
+    handler logs the traceback server-side and returns the message as JSON.
+    """
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    try:
+        import traceback
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    except Exception:
+        pass
+    return JSONResponse(status_code=500, content={"detail": f"Internal error: {exc}"})
 
 # Global process manager
 training_process: Optional[subprocess.Popen] = None
@@ -360,7 +379,11 @@ def _check_audio_backend_or_400() -> None:
     """
     try:
         import torchcodec  # noqa: F401
-    except ImportError:
+    except Exception as e:
+        # Catch-all (not just ImportError): a version/CUDA mismatch raises
+        # RuntimeError/OSError on import, which would otherwise bubble up as
+        # an unhandled 500 with a plain-text "Internal Server Error" body.
+        reason = f" (import failed{': ' + str(e).strip()[:300] if str(e).strip() else ''})"
         raise HTTPException(
             status_code=500,
             detail=(
@@ -369,7 +392,7 @@ def _check_audio_backend_or_400() -> None:
                 "source .venv/bin/activate && pip install torchcodec "
                 "--index-url https://download.pytorch.org/whl/cu124 "
                 "(same index as torch), then restart training. "
-                "Fresh pods: ./setup_server.sh now installs it automatically."
+                f"Fresh pods: ./setup_server.sh now installs it automatically.{reason}"
             ),
         )
 

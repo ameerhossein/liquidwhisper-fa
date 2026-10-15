@@ -432,6 +432,7 @@ function renderCanary(canaries) {
 async function fetchLogs() {
   try {
     const res = await fetch("/api/logs?tail=80");
+    if (!res.ok) return;
     const data = await res.json();
     if (!Array.isArray(data.logs)) return;
 
@@ -470,8 +471,22 @@ async function startRun(freshStart) {
       }),
     });
     if (!res.ok) {
-      const err = await res.json();
-      alert(`Start failed: ${err.detail || "Unknown error"}`);
+      // Read the body as text first: error responses are JSON
+      // ({"detail": ...}) but proxies/legacy servers may return plain-text
+      // "Internal Server Error". Parsing text directly avoids masking the
+      // real message as "SyntaxError: Unexpected token 'I' ...".
+      const text = await res.text();
+      let detail = text;
+      try {
+        const err = JSON.parse(text);
+        detail = err.detail || err.error || text || "Unknown error";
+      } catch {
+        // Non-JSON body: keep the raw text.
+      }
+      if (typeof detail === "string" && detail.length > 500) {
+        detail = `${detail.slice(0, 500)}…`;
+      }
+      alert(`Start failed: ${detail || "Unknown error"}`);
       el.btnStart.disabled = false;
       el.btnFresh.disabled = false;
     }
