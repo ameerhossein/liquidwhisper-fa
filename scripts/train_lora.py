@@ -11,6 +11,7 @@ Optimized for NVIDIA L40S (48 GB VRAM):
 import os
 import sys
 import argparse
+import json
 
 # Must precede any HF tokenizer import: forked datasets.map workers deadlock
 # if the parent created tokenizers with parallelism enabled (see src/data.py).
@@ -469,9 +470,9 @@ def main():
         use_bf16 = torch.cuda.is_bf16_supported()
     except Exception:
         use_bf16 = False
-    training_args = Seq2SeqTrainingArguments(
+    import inspect as _inspect
+    _all_kwargs: Dict[str, Any] = dict(
         output_dir=args.output_dir,
-        overwrite_output_dir=True,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -497,6 +498,19 @@ def main():
         dataloader_num_workers=args.num_proc,
         remove_unused_columns=False,
     )
+    try:
+        _sig_params = _inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
+        # transformers>=5 removed overwrite_output_dir; v4 still needs it.
+        if "overwrite_output_dir" in _sig_params:
+            _all_kwargs["overwrite_output_dir"] = True
+        training_args = Seq2SeqTrainingArguments(
+            **{k: v for k, v in _all_kwargs.items() if k in _sig_params}
+        )
+    except TypeError:
+        # Fallback for very old transformers with evaluation_strategy naming.
+        if "eval_strategy" in _all_kwargs:
+            _all_kwargs["evaluation_strategy"] = _all_kwargs.pop("eval_strategy")
+        training_args = Seq2SeqTrainingArguments(**_all_kwargs)
 
     # 8. Initialize Trainer (transformers>=4.46 uses processing_class)
     _trainer_common = dict(
