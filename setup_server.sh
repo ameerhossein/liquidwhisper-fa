@@ -34,13 +34,13 @@ pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/
 # torch/CUDA (datasets>=3/4 requires it to decode the "audio" column).
 # Unpinned installs pull 0.17 which needs torch>=2.11 / CUDA 13
 # (OSError: libnvrtc.so.13) while cu124 caps torch at 2.6.
-# Pairing: torchcodec 0.5.x <-> torch 2.6. Bump together for cu128+.
-echo "Installing torchcodec 0.5.0 to match torch 2.6 (cu124)..."
+# cu124 index tops out at torchcodec 0.2.1 (0.3+ needs cu126+).
+echo "Installing torchcodec 0.2.1 to match torch 2.6 (cu124)..."
 pip uninstall -y torchcodec 2>/dev/null || true
-pip install "torchcodec==0.5.0" --index-url https://download.pytorch.org/whl/cu124
+pip install "torchcodec==0.2.1" --index-url https://download.pytorch.org/whl/cu124
 python3 -c "import torchcodec; print('torchcodec OK:', torchcodec.__version__)" || {
     echo "WARNING: torchcodec import failed; audio decoding will fail."
-    echo "  Retry with: pip install 'torchcodec==0.5.0' --index-url https://download.pytorch.org/whl/cu124"
+    echo "  Retry with: pip install 'torchcodec==0.2.1' --index-url https://download.pytorch.org/whl/cu124"
 }
 
 # 5. Install project dependencies

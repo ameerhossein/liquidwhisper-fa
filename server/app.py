@@ -389,7 +389,7 @@ def _check_audio_backend_or_400() -> None:
             detail=(
                 "Audio backend missing: 'torchcodec' is not installed, so the "
                 "dataset 'audio' column cannot be decoded. On the server run: "
-                "source .venv/bin/activate && pip install 'torchcodec==0.5.0' "
+                "source .venv/bin/activate && pip install 'torchcodec==0.2.1' "
                 "--index-url https://download.pytorch.org/whl/cu124 "
                 "(pinned for torch 2.6; same index as torch), then restart training. "
                 f"Fresh pods: ./setup_server.sh now installs it automatically.{reason}"
