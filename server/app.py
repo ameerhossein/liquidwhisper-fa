@@ -21,20 +21,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Paths: both checkpoints and telemetry/benchmarks default to the persistent
-# volume on RunPod (/workspace/...), else repo-local. Env overrides:
-# ASR_RESULTS_DIR, ASR_OUTPUT_DIR.
+# Paths: managed via src/paths.py (single source of truth).
+# Persistent volume on RunPod (/workspace/...), else repo-local. Env overrides:
+# ASR_OUTPUT_DIR, ASR_RESULTS_DIR, ASR_MERGED_DIR.
 BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from src import paths as _managed_paths  # noqa: E402
+
+
 def _default_results_dir() -> Path:
-    env = (os.environ.get("ASR_RESULTS_DIR", "") or "").strip()
-    if env:
-        return Path(env)
-    try:
-        if Path("/workspace").is_dir():
-            return Path("/workspace/stt-outputs/results")
-    except Exception:
-        pass
-    return BASE_DIR / "results"
+    resolved = _managed_paths.resolve_results_dir(None)
+    p = Path(resolved)
+    return p if p.is_absolute() else BASE_DIR / p
+
+
+def _default_output_dir() -> str:
+    """Managed default (see src/paths.py). Kept as wrapper for backward compat."""
+    return _managed_paths.default_output_dir()
+
+
 RESULTS_DIR = _default_results_dir()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,18 +71,6 @@ halt_requested = False
 ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
-
-def _default_output_dir() -> str:
-    """Persistent-volume-aware default (mirrors scripts/train_lora.py)."""
-    env = (os.environ.get("ASR_OUTPUT_DIR", "") or "").strip()
-    if env:
-        return env
-    try:
-        if Path("/workspace").is_dir():
-            return "/workspace/stt-outputs/buzzasr-neyshekar-lora"
-    except Exception:
-        pass
-    return "outputs/buzzasr-neyshekar-lora"
 
 _HARDCODED_BASELINES = [
     {

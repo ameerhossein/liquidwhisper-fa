@@ -37,55 +37,22 @@ from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding
 from src.data import PersianASRDataPipeline
 from src.trainer_callbacks import WebTelemetryCallback, load_baselines, _resolve_infer_dtype, _should_autocast
+from src import paths as _managed_paths
 
 
 def _default_output_dir() -> str:
-    """Persistent-volume-aware default: /workspace/... on RunPod, else local.
-
-    Env ASR_OUTPUT_DIR wins, then /workspace if present, else repo-local.
-    """
-    env = (os.environ.get("ASR_OUTPUT_DIR", "") or "").strip()
-    if env:
-        return env
-    try:
-        if Path("/workspace").is_dir():
-            return "/workspace/stt-outputs/buzzasr-neyshekar-lora"
-    except Exception:
-        pass
-    return "outputs/buzzasr-neyshekar-lora"
+    """Managed default (see src/paths.py). Kept as wrapper for backward compat."""
+    return _managed_paths.default_output_dir()
 
 
 def _default_results_dir() -> str:
-    """Persistent-volume-aware default for telemetry/benchmarks.
-
-    Env ASR_RESULTS_DIR wins, then /workspace if present, else repo-local.
-    Keeps trainer telemetry and the web cockpit reading the same directory.
-    """
-    env = (os.environ.get("ASR_RESULTS_DIR", "") or "").strip()
-    if env:
-        return env
-    try:
-        if Path("/workspace").is_dir():
-            return "/workspace/stt-outputs/results"
-    except Exception:
-        pass
-    return "results"
+    """Managed default (see src/paths.py). Kept as wrapper for backward compat."""
+    return _managed_paths.default_results_dir()
 
 
 def _resolve_results_dir(raw: Optional[str]) -> str:
-    """Fall back to repo-local results when the persistent root is absent."""
-    raw = (raw or "").strip() or _default_results_dir()
-    try:
-        p = Path(raw)
-        if p.is_absolute():
-            parts = p.parts
-            if len(parts) > 1 and parts[1] in ("workspace", "runpod-volume"):
-                if not Path("/" + parts[1]).is_dir():
-                    print(f"Note: {raw} unavailable (/{parts[1]} missing); using results.")
-                    return "results"
-    except Exception:
-        pass
-    return raw
+    """Managed resolver (see src/paths.py). Kept as wrapper for backward compat."""
+    return _managed_paths.resolve_results_dir(raw)
 
 
 def parse_args():
@@ -220,24 +187,8 @@ def _parse_telephony_profiles(value) -> list:
 
 
 def _resolve_output_dir(raw: str) -> str:
-    """Fall back to repo-local dir when the persistent root is absent.
-
-    Lets the committed /workspace default work on RunPod while local runs
-    without /workspace still write to outputs/... instead of failing.
-    """
-    raw = (raw or "").strip() or _default_output_dir()
-    try:
-        p = Path(raw)
-        if p.is_absolute():
-            parts = p.parts
-            if len(parts) > 1 and parts[1] in ("workspace", "runpod-volume"):
-                if not Path("/" + parts[1]).is_dir():
-                    local = "outputs/buzzasr-neyshekar-lora"
-                    print(f"Note: {raw} unavailable (/{parts[1]} missing); using {local}.")
-                    return local
-    except Exception:
-        pass
-    return raw
+    """Managed resolver (see src/paths.py). Kept as wrapper for backward compat."""
+    return _managed_paths.resolve_output_dir(raw)
 
 
 def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) -> None:
@@ -310,29 +261,8 @@ def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) ->
 
 
 def _find_last_checkpoint(output_dir: str) -> Optional[str]:
-    """Return the newest complete checkpoint-* dir in output_dir, or None.
-
-    Trainer writes trainer_state.json last, so a folder without it is an
-    interrupted save. transformers' get_last_checkpoint would pick it and the
-    resume would fail, so incomplete folders are skipped and reported.
-    """
-    base = Path(output_dir)
-    if not base.is_dir():
-        return None
-    complete, incomplete = [], []
-    for p in base.glob("checkpoint-*"):
-        if not p.is_dir():
-            continue
-        try:
-            step = int(p.name.split("-")[-1])
-        except ValueError:
-            continue
-        (complete if (p / "trainer_state.json").is_file() else incomplete).append((step, p))
-    for _, p in sorted(incomplete):
-        print(f"Skipping incomplete checkpoint (no trainer_state.json): {p}")
-    if not complete:
-        return None
-    return str(max(complete)[1])
+    """Managed lookup (see src/paths.find_last_checkpoint). Wrapper for backward compat."""
+    return _managed_paths.find_last_checkpoint(output_dir)
 
 
 def _resolve_resume_checkpoint(args) -> Optional[bool | str]:

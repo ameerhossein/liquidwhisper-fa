@@ -15,11 +15,14 @@ echo "   or: ./run_train.sh --output_dir /path/to/dir"
 echo " Fresh start (clears prior checkpoints): ./run_train.sh --fresh_start"
 echo "=========================================================="
 
-# Persistent-volume-aware default (env wins, then /workspace, then local).
+# Managed default via src/paths.py (env ASR_OUTPUT_DIR wins, then /workspace, then local).
 # Explicit --output_dir in "$@" still wins (argparse: last flag wins).
 DEFAULT_OUTPUT_DIR="${ASR_OUTPUT_DIR:-}"
 if [ -z "${DEFAULT_OUTPUT_DIR}" ]; then
-    if [ -d "/workspace" ]; then
+    MANAGED_DIR="$(python3 -c "from src.paths import default_output_dir; print(default_output_dir())" 2>/dev/null || true)"
+    if [ -n "${MANAGED_DIR}" ]; then
+        DEFAULT_OUTPUT_DIR="${MANAGED_DIR}"
+    elif [ -d "/workspace" ]; then
         DEFAULT_OUTPUT_DIR="/workspace/stt-outputs/buzzasr-neyshekar-lora"
     else
         DEFAULT_OUTPUT_DIR="outputs/buzzasr-neyshekar-lora"
