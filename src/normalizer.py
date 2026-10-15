@@ -24,13 +24,26 @@ class PersianTextNormalizer:
     def __init__(self, use_hazm: bool = True):
         self.use_hazm = use_hazm and _HAZM_AVAILABLE
         if self.use_hazm:
-            # Configure Hazm to not delete ZWNJ
-            self.hazm = HazmNormalizer(
-                remove_extra_spaces=True,
-                persian_style=True,
-                persian_numbers=False,
-                remove_diacritics=True
-            )
+            # Hazm API differs across versions/forks:
+            # - sobhe/hazm 0.7-0.9: Normalizer() takes no args
+            # - newer forks: Normalizer(remove_extra_spaces, persian_style, ...)
+            # Try kwargs first, fall back to no-arg constructor.
+            try:
+                self.hazm = HazmNormalizer(
+                    remove_extra_spaces=True,
+                    persian_style=True,
+                    persian_numbers=False,
+                    remove_diacritics=True
+                )
+            except TypeError:
+                try:
+                    self.hazm = HazmNormalizer()
+                except Exception:
+                    self.hazm = None
+                    self.use_hazm = False
+            except Exception:
+                self.hazm = None
+                self.use_hazm = False
         else:
             self.hazm = None
 
@@ -121,9 +134,12 @@ class PersianTextNormalizer:
         # Step 1: Unicode normalization (NFKC)
         text = unicodedata.normalize("NFKC", text)
 
-        # Step 2: Apply Hazm if available
+        # Step 2: Apply Hazm if available (guarded: never let Hazm crash training)
         if self.use_hazm and self.hazm is not None:
-            text = self.hazm.normalize(text)
+            try:
+                text = self.hazm.normalize(text)
+            except Exception:
+                pass
 
         # Step 3: Standardize Arabic to Persian characters
         text = self.standardize_characters(text)
