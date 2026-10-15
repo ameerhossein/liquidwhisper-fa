@@ -107,6 +107,11 @@ def parse_args():
     parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB/G.711 codecs when available (fallback to lite otherwise)")
     parser.add_argument("--phone_benchmark", "--phone-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Dual clean + phone eval each epoch (--no-phone-benchmark for clean only)")
     parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
+    # Prepared-feature cache (persistent volume): skip the 30-90min
+    # "Preparing ASR Features" map on restarts by reusing mel+tokens.
+    parser.add_argument("--prep_cache_dir", type=str, default=None, help="Dir for prepared train/eval Arrow cache (default: <output_dir>/prep_cache, persistent on RunPod).")
+    parser.add_argument("--reuse_prep", "--reuse-prep", action=argparse.BooleanOptionalAction, default=True, help="Load prepared datasets from prep_cache_dir when fingerprint matches (skips re-prep).")
+    parser.add_argument("--overwrite_prep_cache", "--overwrite-prep-cache", action=argparse.BooleanOptionalAction, default=False, help="Force re-prep even if cache hits (use after data/code/telephone-seed changes).")
     args = parser.parse_args()
     # YAML config overlay: file provides defaults, CLI wins only if explicitly passed.
     if args.config:
@@ -164,8 +169,12 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "auto_resume": "auto_resume", "auto-resume": "auto_resume",
         "fresh_start": "fresh_start", "fresh-start": "fresh_start",
         "results_dir": "results_dir", "results-dir": "results_dir",
+        "prep_cache_dir": "prep_cache_dir", "prep-cache-dir": "prep_cache_dir",
+        "reuse_prep": "reuse_prep", "reuse-prep": "reuse_prep",
+        "overwrite_prep_cache": "overwrite_prep_cache",
+        "overwrite-prep-cache": "overwrite_prep_cache",
     }
-    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark"}
+    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark", "reuse_prep", "overwrite_prep_cache"}
     for yk, ak in key_map.items():
         if yk in flat:
             cli_name = "--" + ak
@@ -196,6 +205,73 @@ def _parse_telephony_profiles(value) -> list:
     if isinstance(value, (list, tuple)):
         return [str(v).strip() for v in value if str(v).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _default_prep_cache_dir(output_dir: str) -> str:
+    """Prepared-feature cache lives next to checkpoints, so it is persistent
+    on RunPod (/workspace/...) and repo-local otherwise."""
+    try:
+        return os.path.join(output_dir, "prep_cache")
+    except Exception:
+        return "prep_cache"
+
+
+def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> Dict[str, Any]:
+    """Fingerprint for a prepared split. Any change forces re-prep."""
+    try:
+        profiles = list(getattr(args, "telephony_profiles", []) or [])
+    except Exception:
+        profiles = []
+    return {
+        "dataset_name": getattr(args, "dataset_name", ""),
+        "base_model": getattr(args, "base_model", ""),
+        "split": split,
+        "max_samples": max_samples,
+        "telephony_prob": float(telephony_prob or 0.0),
+        "telephony_profiles": sorted(str(p) for p in profiles),
+        "telephony_seed": int(getattr(args, "telephony_seed", 42) or 42),
+        "telephony_use_ffmpeg": bool(getattr(args, "telephony_use_ffmpeg", True)),
+    }
+
+
+def _try_load_prep_cache(cache_subdir: str, fingerprint: Dict[str, Any]):
+    """Return cached Dataset if fingerprint matches, else None."""
+    from pathlib import Path as _Path
+    fp_file = _Path(cache_subdir) / "fingerprint.json"
+    data_dir = _Path(cache_subdir) / "data"
+    try:
+        if not fp_file.is_file() or not data_dir.is_dir():
+            return None
+        with open(fp_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved != fingerprint:
+            print(f"Prep cache mismatch at {cache_subdir}; re-preparing.")
+            return None
+        from datasets import load_from_disk
+        ds = load_from_disk(str(data_dir))
+        print(f"Prep cache HIT: loaded {len(ds)} samples from {data_dir} (skipped re-prep).")
+        return ds
+    except Exception as e:
+        print(f"Prep cache load failed at {cache_subdir} ({e}); re-preparing.")
+        return None
+
+
+def _save_prep_cache(ds, cache_subdir: str, fingerprint: Dict[str, Any]) -> None:
+    """Persist prepared Dataset + fingerprint for future runs."""
+    import shutil
+    from pathlib import Path as _Path
+    try:
+        base = _Path(cache_subdir)
+        data_dir = base / "data"
+        base.mkdir(parents=True, exist_ok=True)
+        if data_dir.is_dir():
+            shutil.rmtree(data_dir, ignore_errors=True)
+        ds.save_to_disk(str(data_dir))
+        with open(base / "fingerprint.json", "w", encoding="utf-8") as f:
+            json.dump(fingerprint, f, ensure_ascii=False, indent=2)
+        print(f"Prep cache SAVED: {len(ds)} samples -> {data_dir}")
+    except Exception as e:
+        print(f"Warning: prep cache save failed at {cache_subdir}: {e}")
 
 
 def _resolve_output_dir(raw: str) -> str:
@@ -368,15 +444,54 @@ def main():
         telephony_prob=0.0,
     )
 
-    raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples)
-    raw_eval = eval_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples)
-    raw_test = None
-    if args.run_epoch_benchmark:
-        print("Loading full test benchmark split for end-of-epoch evaluation...")
-        raw_test = eval_pipeline.load_raw_dataset(split="test")
+    # Keep raw HF downloads on the persistent volume too when available,
+    # so restarts skip re-download. Explicit args/env still win.
+    try:
+        if not os.environ.get("HF_DATASETS_CACHE") and Path("/workspace").is_dir():
+            os.environ["HF_DATASETS_CACHE"] = "/workspace/stt-outputs/hf_cache"
+    except Exception:
+        pass
 
-    train_dataset = train_pipeline.prepare_dataset_split(raw_train)
-    eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
+    raw_train = None
+    raw_eval = None
+    raw_test = None
+    train_dataset = None
+    eval_dataset = None
+    prep_cache_dir = (getattr(args, "prep_cache_dir", None) or "").strip() or _default_prep_cache_dir(args.output_dir)
+    reuse_prep = bool(getattr(args, "reuse_prep", True))
+    overwrite_prep = bool(getattr(args, "overwrite_prep_cache", False))
+    print(f" Prep Cache Dir:  {prep_cache_dir} (reuse={reuse_prep}, overwrite={overwrite_prep})")
+    try:
+        os.makedirs(prep_cache_dir, exist_ok=True)
+    except Exception:
+        pass
+    train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), float(getattr(args, "telephony_prob", 0.0) or 0.0))
+    eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), 0.0)
+    if reuse_prep and not overwrite_prep:
+        train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
+        eval_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "validation"), eval_fp)
+        if train_dataset is not None and float(getattr(args, "telephony_prob", 0.0) or 0.0) > 0:
+            print("Note: reused train prep freezes phone augmentation to the cached draw; "
+                  "use --overwrite_prep_cache for a fresh random draw.")
+    need_train = train_dataset is None
+    need_eval = eval_dataset is None
+
+    if need_train or need_eval or args.run_epoch_benchmark:
+        raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples) if need_train else None
+        raw_eval = eval_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples) if need_eval else None
+        if args.run_epoch_benchmark:
+            print("Loading full test benchmark split for end-of-epoch evaluation...")
+            raw_test = eval_pipeline.load_raw_dataset(split="test")
+
+    if need_train:
+        assert raw_train is not None
+        train_dataset = train_pipeline.prepare_dataset_split(raw_train)
+        _save_prep_cache(train_dataset, os.path.join(prep_cache_dir, "train"), train_fp)
+    if need_eval:
+        assert raw_eval is not None
+        eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
+        _save_prep_cache(eval_dataset, os.path.join(prep_cache_dir, "validation"), eval_fp)
+    assert train_dataset is not None and eval_dataset is not None
     # Release raw Arrow tables before the multi-GB model load.
     del raw_train, raw_eval
     try:
