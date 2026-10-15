@@ -11,6 +11,10 @@ Optimized for NVIDIA L40S (48 GB VRAM):
 import os
 import sys
 import argparse
+
+# Must precede any HF tokenizer import: forked datasets.map workers deadlock
+# if the parent created tokenizers with parallelism enabled (see src/data.py).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from pathlib import Path
 from typing import Dict, Any, Optional
 import torch
@@ -331,49 +335,20 @@ def main():
     print(f" Batch Size:      {args.batch_size} (accum: {args.grad_accum})")
     print(f" Telephony:       prob={getattr(args, 'telephony_prob', 0.0)} profiles={args.telephony_profiles} ffmpeg={getattr(args, 'telephony_use_ffmpeg', True)}")
     print(f" Phone Benchmark: {getattr(args, 'phone_benchmark', True)} (seed={getattr(args, 'phone_seed', 1234)})")
-    print(f" CUDA Available:  {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f" GPU Device:      {torch.cuda.get_device_name(0)}")
-        print(f" BF16 Supported:  {torch.cuda.is_bf16_supported()}")
+    print(f" Preprocess procs:{args.num_proc}")
     print("=======================================================\n")
 
-    # 1. Load Processor
+    # 1. Load Processor (CPU-only; safe before fork).
     print(f"Loading processor for '{args.base_model}'...")
     processor = WhisperProcessor.from_pretrained(args.base_model)
     normalizer = PersianTextNormalizer()
 
-    # 2. Load Base Model in BF16 (fallback to fp32 on CPU)
-    try:
-        _bf16_ok = torch.cuda.is_bf16_supported()
-    except Exception:
-        _bf16_ok = False
-    if torch.cuda.is_available():
-        dtype = torch.bfloat16 if _bf16_ok else torch.float16
-    else:
-        dtype = torch.float32
-    print(f"Loading base model in {dtype}...")
-    model = WhisperForConditionalGeneration.from_pretrained(
-        args.base_model,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True
-    )
-
-    # Disable cache when training with gradient checkpointing
-    model.config.use_cache = False
-
-    # 3. Configure LoRA
-    print("Injecting LoRA adapters...")
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"],
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    # 4. Prepare Data (train gets phone augmentation, eval stays clean)
+    # 2. Prepare Data BEFORE any CUDA init / model load.
+    # datasets.map(num_proc>1) forks workers. Forking after CUDA init or with
+    # the multi-GB model resident deadlocks/bloats workers (observed: 4 forked
+    # workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58243).
+    # Feature extraction + tokenization need only the processor, so prep runs
+    # first (train gets phone augmentation, eval stays clean).
     train_pipeline = PersianASRDataPipeline(
         processor=processor,
         dataset_name=args.dataset_name,
@@ -401,6 +376,50 @@ def main():
 
     train_dataset = train_pipeline.prepare_dataset_split(raw_train)
     eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
+    # Release raw Arrow tables before the multi-GB model load.
+    del raw_train, raw_eval
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+    # 3. CUDA info + base model load (first CUDA touch happens here, after all
+    # forking work is done).
+    print(f"CUDA Available:  {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f" GPU Device:      {torch.cuda.get_device_name(0)}")
+        print(f" BF16 Supported:  {torch.cuda.is_bf16_supported()}")
+    # 4. Load Base Model in BF16 (fallback to fp32 on CPU)
+    try:
+        _bf16_ok = torch.cuda.is_bf16_supported()
+    except Exception:
+        _bf16_ok = False
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if _bf16_ok else torch.float16
+    else:
+        dtype = torch.float32
+    print(f"Loading base model in {dtype}...")
+    model = WhisperForConditionalGeneration.from_pretrained(
+        args.base_model,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True
+    )
+
+    # Disable cache when training with gradient checkpointing
+    model.config.use_cache = False
+
+    # 4. Configure LoRA
+    print("Injecting LoRA adapters...")
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     # 5. Data Collator
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)

@@ -507,8 +507,14 @@ async def start_training(config: Dict[str, Any] = None):
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 300)
         max_bench_i = int(max_bench) if max_bench not in (None, "") else 300
+        # Preprocessing workers for datasets.map (fork-based). Default 1 for
+        # the Web UI: single-process cannot fork-deadlock and uses the least
+        # RAM. Power users may POST {"num_proc": 4}: train_lora.py prepares
+        # datasets before any CUDA init so multiprocess is safe there, and
+        # src/data.py still forces single-process if CUDA is already up.
+        num_proc_i = int(config.get("num_proc", 1))
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size must be integers; learning_rate numeric.")
+        raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate numeric.")
     if not (1 <= epochs_i <= 20):
         raise HTTPException(status_code=400, detail="epochs must be 1..20.")
     if not (1 <= batch_i <= 64):
@@ -521,6 +527,8 @@ async def start_training(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="eval_batch_size must be 1..64.")
     if not (0 <= max_bench_i <= 10000):
         raise HTTPException(status_code=400, detail="max_benchmark_samples must be 0..10000 (0=full).")
+    if not (1 <= num_proc_i <= 16):
+        raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
 
     output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
     results_cfg = (config.get("results_dir", "") or "")
@@ -556,6 +564,7 @@ async def start_training(config: Dict[str, Any] = None):
         "--learning_rate", str(lr_f),
         "--eval_batch_size", str(eval_bs_i),
         "--max_benchmark_samples", str(max_bench_i),
+        "--num_proc", str(num_proc_i),
         "--enable_telemetry",
         "--run_epoch_benchmark"
     ]
@@ -616,6 +625,7 @@ async def start_training(config: Dict[str, Any] = None):
             "epochs": str(epochs_i),
             "batch_size": str(batch_i),
             "learning_rate": str(lr_f),
+            "num_proc": str(num_proc_i),
             "output_dir": output_dir,
             "results_dir": results_dir,
             "auto_resume": auto_resume_on,

@@ -11,6 +11,11 @@ Supports:
 import os
 import random
 from typing import Optional, Dict, Any, Sequence
+
+# Must be set before any HF tokenizer import: the Rust tokenizers thread pool
+# deadlocks when a process that created a tokenizer is fork()ed by
+# datasets.map(num_proc>1) (workers sit at 0% CPU forever).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 try:
     from datasets import load_dataset, Audio, DatasetDict, Dataset
     _DATASETS_AVAILABLE = True
@@ -119,6 +124,21 @@ def _get_audio_array_and_sr(audio: Any) -> tuple:
     except Exception:
         sr = 16000
     return arr, sr
+
+
+def _cuda_already_initialized() -> bool:
+    """True if this process already initialized a CUDA context.
+
+    datasets.map(num_proc>1) uses fork(); forking with a live CUDA context
+    deadlocks the workers (observed: 4 forked workers stuck in S at 0% CPU
+    while the parent spins). Callers must prepare datasets BEFORE any CUDA
+    init / model load; this is a safety net for any caller order.
+    """
+    try:
+        import torch
+        return bool(torch.cuda.is_initialized())
+    except Exception:
+        return False
 
 
 def _check_audio_backend() -> None:
@@ -358,6 +378,21 @@ class PersianASRDataPipeline:
             if self.num_proc and self.num_proc > 1:
                 effective_proc = min(self.num_proc, os.cpu_count() or 1)
         except Exception:
+            effective_proc = 1
+
+        # Fork-after-CUDA deadlock guard: datasets.map(num_proc>1) forks
+        # workers. If this process already initialized CUDA (e.g. model was
+        # loaded before data prep), the forked workers hang at 0% CPU and the
+        # run looks stuck with no exception to trigger the fallback below.
+        # train_lora.py orders data prep before model load so multiprocess can
+        # be used; this forces single-process for any other caller order.
+        if effective_proc > 1 and _cuda_already_initialized():
+            print(
+                "WARNING: CUDA context already initialized; forcing "
+                "single-process dataset.map to avoid fork deadlock "
+                f"(requested num_proc={effective_proc}). Prepare datasets "
+                "before model load to use multiprocess."
+            )
             effective_proc = 1
 
         map_kwargs: Dict[str, Any] = {
