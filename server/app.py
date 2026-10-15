@@ -507,12 +507,11 @@ async def start_training(config: Dict[str, Any] = None):
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 300)
         max_bench_i = int(max_bench) if max_bench not in (None, "") else 300
-        # Preprocessing workers for datasets.map (fork-based). Default 1 for
-        # the Web UI: single-process cannot fork-deadlock and uses the least
-        # RAM. Power users may POST {"num_proc": 4}: train_lora.py prepares
+        # Preprocessing workers for datasets.map (fork-based). Default 16:
+        # this pod has 16 cores / 100GB RAM. train_lora.py prepares
         # datasets before any CUDA init so multiprocess is safe there, and
         # src/data.py still forces single-process if CUDA is already up.
-        num_proc_i = int(config.get("num_proc", 1))
+        num_proc_i = int(config.get("num_proc", 16))
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate numeric.")
     if not (1 <= epochs_i <= 20):
