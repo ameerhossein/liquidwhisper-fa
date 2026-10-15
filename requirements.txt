@@ -8,7 +8,15 @@ peft>=0.11.1
 
 # Hugging Face Stack
 transformers>=4.42.0
-datasets>=2.19.0
+# datasets 4.x decodes audio via torchcodec.decoders.AudioDecoder, but the
+# pinned torchcodec==0.2.1 (cu124/torch 2.6, the max cu124 ships) only has
+# VideoDecoder -> ImportError: cannot import name 'AudioDecoder' ...
+# (AudioDecoder needs torchcodec>=0.3 / torch>=2.7 / cu126+). Keep the
+# cu124 stack by capping datasets to the 3.x soundfile backend (3.6.0 tested).
+# Upgrade path (both together, needs CUDA>=12.8 driver):
+#   pip install -U torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu128
+#   + relax this pin to datasets>=4.
+datasets>=2.19,<4
 evaluate>=0.4.2
 huggingface_hub>=0.23.0
 tensorboard>=2.14.0  # required by train_lora.py report_to=["tensorboard"]
@@ -21,15 +29,17 @@ hazm>=0.9.4
 # Speech & Audio Processing
 librosa>=0.10.1
 soundfile>=0.12.1
-# Required by datasets>=3/4 for Audio decoding (datasets uses torchcodec;
-# without it .map/.filter over the "audio" column fails with
-# "To support decoding audio data, please install 'torchcodec'").
-# Pinned to match torch 2.6 (cu124): cu124 index only ships up to
-# torchcodec 0.2.1 (0.3+ moved to cu126+). Pairing: 0.2.1 <-> torch 2.6.
-# Do NOT upgrade alone — bump torch + torchcodec together, e.g.
+# Audio backend for the pinned datasets<4 stack is soundfile/librosa (no
+# torchcodec needed). torchcodec==0.2.1 is kept only as an optional extra
+# matching torch 2.6 (cu124): cu124 index only ships up to torchcodec 0.2.1
+# (0.3+ moved to cu126+). Pairing: 0.2.1 <-> torch 2.6.
+# WARNING: torchcodec 0.2.1 does NOT provide AudioDecoder (only VideoDecoder),
+# so it can NEVER satisfy datasets>=4. Do NOT upgrade torchcodec alone —
+# bump torch + torchcodec together, e.g.
 #   pip install -U torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu128
 # (cu124 caps torch at 2.6, so latest torchcodec 0.17 breaks with
 # OSError: libnvrtc.so.13: cannot open shared object file).
+# If you move to datasets>=4, use e.g. torch 2.8 + torchcodec 0.7 (cu128).
 torchcodec==0.2.1
 
 # Metrics & Utilities

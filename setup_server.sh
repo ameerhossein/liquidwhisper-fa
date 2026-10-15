@@ -31,21 +31,58 @@ echo "Installing PyTorch with CUDA support..."
 pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # 4b. Install torchcodec pinned to match torch 2.6 (cu124).
-# torch/CUDA (datasets>=3/4 requires it to decode the "audio" column).
+# NOTE: torchcodec==0.2.1 only ships VideoDecoder (no AudioDecoder), so it
+# can NEVER satisfy datasets>=4 (which decodes audio via
+# torchcodec.decoders.AudioDecoder -> ImportError: cannot import name
+# 'AudioDecoder' ... Did you mean: 'VideoDecoder'?). AudioDecoder needs
+# torchcodec>=0.3 / torch>=2.7 / cu126+. This repo therefore pins
+# datasets<4 (3.x soundfile backend, see requirements.txt) to keep the
+# cu124/torch-2.6 stack. torchcodec below is optional, not the audio backend.
 # Unpinned installs pull 0.17 which needs torch>=2.11 / CUDA 13
 # (OSError: libnvrtc.so.13) while cu124 caps torch at 2.6.
 # cu124 index tops out at torchcodec 0.2.1 (0.3+ needs cu126+).
+# To move to datasets>=4 instead: upgrade torch+torchcodec TOGETHER, e.g.
+#   pip install -U torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu128
 echo "Installing torchcodec 0.2.1 to match torch 2.6 (cu124)..."
 pip uninstall -y torchcodec 2>/dev/null || true
 pip install "torchcodec==0.2.1" --index-url https://download.pytorch.org/whl/cu124
 python3 -c "import torchcodec; print('torchcodec OK:', torchcodec.__version__)" || {
-    echo "WARNING: torchcodec import failed; audio decoding will fail."
+    echo "WARNING: torchcodec import failed (optional for datasets<4; audio uses soundfile)."
     echo "  Retry with: pip install 'torchcodec==0.2.1' --index-url https://download.pytorch.org/whl/cu124"
 }
+# Guard against the broken combo: datasets>=4 + torchcodec 0.2.1.
+python3 -c "
+try:
+    import datasets
+    print('datasets:', datasets.__version__)
+except Exception as e:
+    print('datasets import check skipped:', e)
+"
 
 # 5. Install project dependencies
 echo "Installing project dependencies from requirements.txt..."
 pip install -r requirements.txt
+
+# 5a. Verify audio stack consistency (datasets<4 + soundfile, NOT torchcodec).
+# datasets>=4 + torchcodec 0.2.1 is the broken combo from the traceback
+# (ImportError: cannot import name 'AudioDecoder' ... Did you mean 'VideoDecoder'?).
+echo "Verifying audio backend (datasets + soundfile)..."
+python3 -c "
+import datasets
+print('datasets:', datasets.__version__)
+major = int(str(datasets.__version__).split('.')[0].split('a')[0].split('b')[0].split('rc')[0] or 0)
+assert major < 4, (
+    f\"Installed datasets {datasets.__version__} needs torchcodec AudioDecoder, \"
+    \"which torchcodec==0.2.1 (cu124) does not provide. Fix: pip install 'datasets>=2.19,<4'.\"
+)
+import soundfile
+print('soundfile OK:', soundfile.__version__)
+" || {
+    echo "WARNING: audio-stack check failed (likely datasets>=4 slipped in)."
+    echo "  Remediation (keeps torch 2.6/cu124): pip install 'datasets>=2.19,<4'"
+    echo "  Or upgrade torch+torchcodec together for datasets>=4:"
+    echo "    pip install -U torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cu128"
+}
 
 # 5b. Check telephony codecs (Iran MCI/Irancell/TCI phone simulation)
 echo "Checking ffmpeg telephony codecs..."

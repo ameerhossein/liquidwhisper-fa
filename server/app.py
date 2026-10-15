@@ -373,26 +373,51 @@ def _sanitize_output_dir(raw: str) -> str:
 def _check_audio_backend_or_400() -> None:
     """Fail /api/train/start fast if datasets cannot decode audio.
 
-    Without torchcodec the trainer dies later inside dataset.filter/map with
-    "To support decoding audio data, please install 'torchcodec'". Surfacing it
-    here saves a wasted launch cycle from the Web UI.
+    datasets 4.x decodes the ``audio`` column via
+    ``torchcodec.decoders.AudioDecoder``, but torchcodec==0.2.1 (cu124)
+    only ships VideoDecoder -> ImportError at first filter/map. datasets<4
+    uses the soundfile backend and needs no torchcodec. Check the right
+    backend for the installed datasets version so the Web UI surfaces the
+    real fix instead of a wasted launch cycle.
     """
     try:
-        import torchcodec  # noqa: F401
+        import datasets as _ds
+        _ver = str(getattr(_ds, "__version__", "0") or "0")
+        _major = int(_ver.split(".")[0] or 0)
+    except Exception:
+        _major = 0
+    if _major >= 4:
+        try:
+            from torchcodec.decoders import AudioDecoder  # noqa: F401
+            return
+        except Exception as e:
+            reason = f" (import failed{': ' + str(e).strip()[:300] if str(e).strip() else ''})"
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Incompatible audio stack: datasets>=4 needs "
+                    "'torchcodec.decoders.AudioDecoder', but installed torchcodec "
+                    "does not provide it (0.2.1/cu124 has only VideoDecoder). Pick ONE: "
+                    "(1) downgrade to the pinned backend: source .venv/bin/activate && "
+                    "pip install 'datasets>=2.19,<4' (keeps torch 2.6/cu124), OR "
+                    "(2) upgrade torch+torchcodec together: pip install -U torch torchaudio "
+                    "torchcodec --index-url https://download.pytorch.org/whl/cu128 "
+                    "(needs CUDA 12.8 driver). Do NOT upgrade torchcodec alone."
+                    f"{reason}"
+                ),
+            )
+    try:
+        import soundfile  # noqa: F401
+        return
     except Exception as e:
-        # Catch-all (not just ImportError): a version/CUDA mismatch raises
-        # RuntimeError/OSError on import, which would otherwise bubble up as
-        # an unhandled 500 with a plain-text "Internal Server Error" body.
         reason = f" (import failed{': ' + str(e).strip()[:300] if str(e).strip() else ''})"
         raise HTTPException(
             status_code=500,
             detail=(
-                "Audio backend missing: 'torchcodec' is not installed, so the "
-                "dataset 'audio' column cannot be decoded. On the server run: "
-                "source .venv/bin/activate && pip install 'torchcodec==0.2.1' "
-                "--index-url https://download.pytorch.org/whl/cu124 "
-                "(pinned for torch 2.6; same index as torch), then restart training. "
-                f"Fresh pods: ./setup_server.sh now installs it automatically.{reason}"
+                "Audio backend missing: datasets<4 decodes 'audio' via 'soundfile'. "
+                "On the server run: source .venv/bin/activate && pip install soundfile librosa "
+                "(or pip install -U 'datasets[audio]'), then restart training. "
+                f"Fresh pods: ./setup_server.sh installs it automatically.{reason}"
             ),
         )
 

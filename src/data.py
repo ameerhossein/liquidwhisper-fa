@@ -30,20 +30,138 @@ except ImportError:  # pragma: no cover
     _TELEPHONE_AVAILABLE = False
 
 
+def _datasets_version_tuple() -> Optional[tuple]:
+    """Return datasets version as (major, minor, ...) or None if unavailable."""
+    try:
+        import datasets
+        ver = getattr(datasets, "__version__", "") or ""
+        parts = []
+        for tok in ver.split("."):
+            num = "".join(c for c in tok if c.isdigit())
+            if num == "":
+                break
+            parts.append(int(num))
+        return tuple(parts) if parts else None
+    except Exception:
+        return None
+
+
+def _uses_torchcodec_backend() -> bool:
+    """True when the installed datasets decodes audio via torchcodec.
+
+    datasets 4.x decodes the ``audio`` column via
+    ``torchcodec.decoders.AudioDecoder``; datasets 2.x/3.x uses the
+    soundfile/librosa backend and does not need torchcodec at all.
+    """
+    v = _datasets_version_tuple()
+    if v is None:
+        return False
+    try:
+        return v[0] >= 4
+    except Exception:
+        return False
+
+
+def _get_audio_array_and_sr(audio: Any) -> tuple:
+    """Extract (array, sampling_rate) from dict- or torchcodec-style audio.
+
+    Handles:
+    - dicts: ``{"array": np.ndarray, "sampling_rate": int}`` (datasets 2/3).
+    - datasets 4.x ``AudioDecoder`` objects supporting ``audio["array"]`` /
+      ``audio["sampling_rate"]`` but no ``.get()``.
+    """
+    if audio is None:
+        return None, 16000
+    # Dict path (datasets 2/3, and datasets 4 with decode=False).
+    if isinstance(audio, dict):
+        try:
+            arr = audio.get("array", None)
+        except Exception:
+            arr = None
+        try:
+            sr = audio.get("sampling_rate", 16000) or 16000
+        except Exception:
+            sr = 16000
+        if arr is None:
+            # Maybe torchcodec-style dict access on a non-dict? fall through.
+            pass
+        else:
+            return arr, int(sr)
+        # Fall back to __getitem__ for dict-like wrappers.
+        try:
+            arr = audio["array"]
+            sr = audio["sampling_rate"]
+            return arr, int(sr or 16000)
+        except Exception:
+            return None, 16000
+    # Object path: datasets 4.x AudioDecoder (has __getitem__, no .get).
+    try:
+        arr = audio["array"]  # type: ignore[index]
+    except Exception:
+        arr = None
+    try:
+        sr = audio["sampling_rate"]  # type: ignore[index]
+    except Exception:
+        sr = 16000
+    # Last resort: raw torchcodec AudioDecoder API (get_all_samples()).
+    if arr is None and hasattr(audio, "get_all_samples"):
+        try:
+            import numpy as _np
+            samples = audio.get_all_samples()
+            data = samples.data.cpu().numpy() if hasattr(samples, "data") else None
+            if data is not None:
+                arr = _np.mean(data, axis=tuple(range(data.ndim - 1))) if data.ndim > 1 else data
+            sr = getattr(samples, "sample_rate", sr) or sr
+        except Exception:
+            pass
+    try:
+        sr = int(sr or 16000)
+    except Exception:
+        sr = 16000
+    return arr, sr
+
+
 def _check_audio_backend() -> None:
     """Fail fast with an actionable message if audio decoding is unavailable.
 
-    datasets>=3/4 decodes the ``audio`` column via torchcodec. Without it,
-    the first ``filter``/``map`` over audio raises:
-    ``ImportError: To support decoding audio data, please install 'torchcodec'``.
+    Root cause of the reported crash: datasets 4.x decodes the ``audio``
+    column via ``torchcodec.decoders.AudioDecoder``, but the pinned
+    ``torchcodec==0.2.1`` (cu124 / torch 2.6) only ships ``VideoDecoder``:
+
+        ImportError: cannot import name 'AudioDecoder' from
+        'torchcodec.decoders' (... Did you mean: 'VideoDecoder'?)
+
+    ``AudioDecoder`` was added in later torchcodec releases (0.3+ needs
+    torch 2.7+/cu126+), so torchcodec 0.2.1 can never satisfy datasets>=4.
+    This repo pins ``datasets<4`` (3.x soundfile backend) to keep the
+    cu124/torch-2.6 stack. Only datasets>=4 needs torchcodec.
     """
+    if _uses_torchcodec_backend():
+        try:
+            from torchcodec.decoders import AudioDecoder  # noqa: F401
+        except Exception as e:
+            raise ImportError(
+                "Incompatible audio stack: installed 'datasets>=4' decodes audio "
+                "via 'torchcodec.decoders.AudioDecoder', but the installed "
+                "torchcodec does not provide it (e.g. torchcodec==0.2.1 only has "
+                "VideoDecoder; AudioDecoder needs torchcodec>=0.3 / torch>=2.7). "
+                "Pick ONE fix: (1) downgrade datasets to the pinned 3.x backend: "
+                "pip install 'datasets>=2.19,<4'  (keeps torch 2.6/cu124), OR "
+                "(2) upgrade torch+torchcodec together, e.g. "
+                "pip install -U torch torchaudio torchcodec "
+                "--index-url https://download.pytorch.org/whl/cu128 "
+                "(needs CUDA 12.8 driver + torch>=2.8). Do NOT upgrade torchcodec "
+                "alone — it must match torch (else OSError: libnvrtc.so.13)."
+            ) from e
+        return
+    # datasets 2/3 path: soundfile backend; torchcodec is optional.
     try:
-        import torchcodec  # noqa: F401
+        import soundfile  # noqa: F401
+        return
     except ImportError as e:
         raise ImportError(
-            "Missing 'torchcodec': datasets cannot decode the 'audio' column. "
-            "Install the torch-2.6-pinned build, e.g. "
-            "pip install 'torchcodec==0.2.1' --index-url https://download.pytorch.org/whl/cu124 "
+            "Missing audio backend: datasets<4 decodes the 'audio' column via "
+            "'soundfile' (librosa). Install it with: pip install soundfile librosa "
             "(or pip install -U 'datasets[audio]'). Then retry training."
         ) from e
 
@@ -77,16 +195,18 @@ class PersianASRDataPipeline:
         self._tele_rng = random.Random(telephony_seed) if telephony_seed is not None else random.Random()
         self._tele_warned_missing = False
 
-    def _audio_duration_seconds(self, audio: Dict[str, Any]) -> float:
+    def _audio_duration_seconds(self, audio: Any) -> float:
         """Compute duration from waveform length. Returns 0.0 if unknown."""
         try:
-            arr = audio.get("array", [])
-            sr = audio.get("sampling_rate", 16000) or 16000
+            arr, sr = _get_audio_array_and_sr(audio)
+            sr = sr or 16000
+            if arr is None:
+                return 0.0
             return len(arr) / float(sr) if sr else 0.0
         except Exception:
             return 0.0
 
-    def is_valid_duration(self, audio: Dict[str, Any]) -> bool:
+    def is_valid_duration(self, audio: Any) -> bool:
         """Check min <= duration <= max. Overlong clips are dropped (not truncated)
         to avoid audio/text misalignment: truncating audio while keeping the full
         transcript teaches the model to hallucinate cut-off words."""
@@ -128,7 +248,14 @@ class PersianASRDataPipeline:
 
     def prepare_sample(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Processes audio waveform into log-mel spectrogram and text into token IDs."""
-        audio = batch["audio"]
+        audio_raw = batch["audio"]
+        array, sr = _get_audio_array_and_sr(audio_raw)
+        if array is None:
+            raise ValueError("Missing audio array; check dataset 'audio' decoding.")
+        try:
+            sr = int(sr or 16000)
+        except Exception:
+            sr = 16000
         raw_text = batch.get("text", "") or ""
 
         # NOTE: Training keeps punctuation (remove_punctuation=False) to preserve
@@ -143,7 +270,10 @@ class PersianASRDataPipeline:
 
         # Defensive guard: overlong clips must have been filtered upstream.
         # Do NOT truncate here — that would misalign audio/text.
-        dur = self._audio_duration_seconds(audio)
+        try:
+            dur = len(array) / float(sr) if sr else 0.0
+        except Exception:
+            dur = 0.0
         if dur > self.max_duration_seconds:
             raise ValueError(
                 f"Audio {dur:.2f}s exceeds max {self.max_duration_seconds}s; "
@@ -161,22 +291,21 @@ class PersianASRDataPipeline:
             else:
                 try:
                     degraded, _ = apply_random_telephone(
-                        audio["array"],
-                        sr=int(audio.get("sampling_rate", 16000) or 16000),
+                        array,
+                        sr=sr,
                         prob=self.telephony_prob,
                         profiles=self.telephony_profiles,
                         use_ffmpeg=self.telephony_use_ffmpeg,
                         rng=self._tele_rng,
                     )
-                    audio = {**audio, "array": degraded,
-                             "sampling_rate": int(audio.get("sampling_rate", 16000) or 16000)}
+                    array = degraded
                 except Exception as e:
                     print(f"Warning: telephone augmentation failed ({e}); using clean audio.")
 
         # 1. Audio feature extraction (128 mel bins for Whisper Large v3 / BuzzASR)
         input_features = self.processor.feature_extractor(
-            audio["array"],
-            sampling_rate=audio["sampling_rate"]
+            array,
+            sampling_rate=sr
         ).input_features[0]
 
         # 2. Tokenize target transcript
