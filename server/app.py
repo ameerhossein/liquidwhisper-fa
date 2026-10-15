@@ -21,10 +21,21 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Paths (RESULTS_DIR overridable so telemetry can live on the persistent volume,
-# e.g. ASR_RESULTS_DIR=/workspace/stt-outputs/results)
+# Paths: both checkpoints and telemetry/benchmarks default to the persistent
+# volume on RunPod (/workspace/...), else repo-local. Env overrides:
+# ASR_RESULTS_DIR, ASR_OUTPUT_DIR.
 BASE_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = Path(os.environ.get("ASR_RESULTS_DIR", str(BASE_DIR / "results")))
+def _default_results_dir() -> Path:
+    env = (os.environ.get("ASR_RESULTS_DIR", "") or "").strip()
+    if env:
+        return Path(env)
+    try:
+        if Path("/workspace").is_dir():
+            return Path("/workspace/stt-outputs/results")
+    except Exception:
+        pass
+    return BASE_DIR / "results"
+RESULTS_DIR = _default_results_dir()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -390,6 +401,8 @@ async def start_training(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="max_benchmark_samples must be 0..10000 (0=full).")
 
     output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
+    results_cfg = (config.get("results_dir", "") or "")
+    results_dir = _sanitize_output_dir(str(results_cfg).strip()) if str(results_cfg).strip() else str(RESULTS_DIR)
     dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
@@ -413,6 +426,7 @@ async def start_training(config: Dict[str, Any] = None):
         "--base_model", "BuzzASR/persian",
         "--dataset_name", dataset_name,
         "--output_dir", output_dir,
+        "--results_dir", results_dir,
         "--epochs", str(epochs_i),
         "--batch_size", str(batch_i),
         "--grad_accum", str(accum_i),
@@ -457,6 +471,7 @@ async def start_training(config: Dict[str, Any] = None):
             "batch_size": str(batch_i),
             "learning_rate": str(lr_f),
             "output_dir": output_dir,
+            "results_dir": results_dir,
             "auto_resume": auto_resume_on,
             "fresh_start": fresh_start,
             "resume_from_checkpoint": resume_explicit or None

@@ -55,6 +55,39 @@ def _default_output_dir() -> str:
     return "outputs/buzzasr-neyshekar-lora"
 
 
+def _default_results_dir() -> str:
+    """Persistent-volume-aware default for telemetry/benchmarks.
+
+    Env ASR_RESULTS_DIR wins, then /workspace if present, else repo-local.
+    Keeps trainer telemetry and the web cockpit reading the same directory.
+    """
+    env = (os.environ.get("ASR_RESULTS_DIR", "") or "").strip()
+    if env:
+        return env
+    try:
+        if Path("/workspace").is_dir():
+            return "/workspace/stt-outputs/results"
+    except Exception:
+        pass
+    return "results"
+
+
+def _resolve_results_dir(raw: Optional[str]) -> str:
+    """Fall back to repo-local results when the persistent root is absent."""
+    raw = (raw or "").strip() or _default_results_dir()
+    try:
+        p = Path(raw)
+        if p.is_absolute():
+            parts = p.parts
+            if len(parts) > 1 and parts[1] in ("workspace", "runpod-volume"):
+                if not Path("/" + parts[1]).is_dir():
+                    print(f"Note: {raw} unavailable (/{parts[1]} missing); using results.")
+                    return "results"
+    except Exception:
+        pass
+    return raw
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train BuzzASR with LoRA on Persian Speech")
     # Model & Data
@@ -62,6 +95,7 @@ def parse_args():
     parser.add_argument("--base_model", type=str, default="BuzzASR/persian", help="Base model identifier")
     parser.add_argument("--dataset_name", type=str, default="shekar-ai/Neyshekar", help="Dataset identifier")
     parser.add_argument("--output_dir", type=str, default=_default_output_dir(), help="Output directory for checkpoints (default: /workspace/... on RunPod, else outputs/...)")
+    parser.add_argument("--results_dir", type=str, default=None, help="Telemetry/benchmark directory (default: /workspace/stt-outputs/results on RunPod, else results/). Env ASR_RESULTS_DIR also works.")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Limit train samples (smoke test)")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Limit eval samples")
 
@@ -150,6 +184,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "resume_from_checkpoint": "resume_from_checkpoint",
         "auto_resume": "auto_resume", "auto-resume": "auto_resume",
         "fresh_start": "fresh_start", "fresh-start": "fresh_start",
+        "results_dir": "results_dir", "results-dir": "results_dir",
     }
     _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark"}
     for yk, ak in key_map.items():
@@ -205,7 +240,7 @@ def _resolve_output_dir(raw: str) -> str:
     return raw
 
 
-def _clear_previous_state(output_dir: str, results_dir: str = "results") -> None:
+def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) -> None:
     """Delete prior run state so --fresh_start truly starts clean.
 
     Removes only known training artifacts inside output_dir
@@ -215,6 +250,7 @@ def _clear_previous_state(output_dir: str, results_dir: str = "results") -> None
     """
     import shutil
     removed = []
+    rdir = Path(_resolve_results_dir(results_dir))
     try:
         base = Path(output_dir)
         if base.is_dir():
@@ -244,7 +280,6 @@ def _clear_previous_state(output_dir: str, results_dir: str = "results") -> None
     except Exception as e:
         print(f"Warning: fresh-start output cleanup failed: {e}")
     try:
-        rdir = Path(results_dir)
         for name in ("loss_history.json", "live_telemetry.json", "training_live.log"):
             try:
                 t = rdir / name
@@ -347,15 +382,18 @@ def main():
     args = parse_args()
     args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "mobile,pstn"))
     args.output_dir = _resolve_output_dir(args.output_dir)
+    args.results_dir = _resolve_results_dir(getattr(args, "results_dir", None))
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.results_dir, exist_ok=True)
     if bool(getattr(args, "fresh_start", False)):
-        _clear_previous_state(args.output_dir, results_dir="results")
+        _clear_previous_state(args.output_dir, results_dir=args.results_dir)
 
     print("=======================================================")
     print(" Persian ASR Fine-Tuning: BuzzASR + Neyshekar LoRA")
     print(f" Base Model:      {args.base_model}")
     print(f" Dataset:         {args.dataset_name}")
     print(f" Output Dir:      {args.output_dir}")
+    print(f" Results Dir:     {args.results_dir}")
     print(f" LoRA Rank:       r={args.lora_r}, alpha={args.lora_alpha}")
     print(f" Batch Size:      {args.batch_size} (accum: {args.grad_accum})")
     print(f" Telephony:       prob={getattr(args, 'telephony_prob', 0.0)} profiles={args.telephony_profiles} ffmpeg={getattr(args, 'telephony_use_ffmpeg', True)}")
@@ -442,7 +480,7 @@ def main():
     if args.enable_telemetry:
         telemetry_cb = WebTelemetryCallback(
             output_dir=args.output_dir,
-            results_dir="results",
+            results_dir=args.results_dir,
             test_dataset=raw_test,
             processor=processor,
             metrics_calculator=metrics_calculator,
@@ -554,6 +592,7 @@ def main():
             normalizer=normalizer,
             dataset_name=args.dataset_name,
             output_dir=args.output_dir,
+            results_dir=args.results_dir,
             eval_batch_size=args.eval_batch_size,
             trainer_state=trainer.state,
             phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
@@ -570,6 +609,7 @@ def _run_post_training_evaluation(
     normalizer: PersianTextNormalizer,
     dataset_name: str,
     output_dir: str,
+    results_dir: Optional[str] = None,
     eval_batch_size: int = 16,
     trainer_state: Optional[Any] = None,
     phone_benchmark: bool = True,
@@ -673,7 +713,7 @@ def _run_post_training_evaluation(
 
     # 3. Read epoch benchmark history & trainer logs
     epoch_benchmarks = []
-    benchmarks_path = os.path.join("results", "epoch_benchmarks.json")
+    benchmarks_path = os.path.join(_resolve_results_dir(results_dir), "epoch_benchmarks.json")
     if os.path.exists(benchmarks_path):
         try:
             with open(benchmarks_path, "r", encoding="utf-8") as f:
