@@ -26,6 +26,12 @@ from fastapi.middleware.cors import CORSMiddleware
 # ASR_OUTPUT_DIR, ASR_RESULTS_DIR, ASR_MERGED_DIR.
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
+# Load .env (repo root / CWD) before any os.environ reads. Stdlib-only.
+try:
+    from src.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
 from src import paths as _managed_paths  # noqa: E402
 
 

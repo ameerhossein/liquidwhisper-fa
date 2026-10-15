@@ -18,6 +18,14 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+# Load .env early so ASR_* defaults below pick up repo-root/.env values.
+# Import is lazy-safe: src.dotenv has no package dependencies.
+try:
+    from .dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 PERSISTENT_ROOTS = ("workspace", "runpod-volume")

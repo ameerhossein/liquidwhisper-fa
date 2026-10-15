@@ -18,6 +18,15 @@ import urllib.parse
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "server" / "static"
 
+# Load .env (repo root / CWD) before any os.environ reads. Stdlib-only,
+# so the local demo keeps its zero-dependency (no pip) property.
+sys.path.insert(0, str(BASE_DIR))
+try:
+    from src.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
 
 def _load_demo_baselines():
     """Load shared baselines so demo matches server/training numbers."""

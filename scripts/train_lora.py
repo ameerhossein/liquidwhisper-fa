@@ -32,6 +32,13 @@ except ImportError:
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Load .env (repo root / CWD) before any os.environ reads. Stdlib-only.
+try:
+    from src.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
 from src.normalizer import PersianTextNormalizer
 from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding

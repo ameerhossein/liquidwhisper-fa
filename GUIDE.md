@@ -67,6 +67,17 @@ chmod +x setup_server.sh run_baseline.sh run_train.sh
 - Installs all dependencies (`transformers`, `peft`, `datasets`, `hazm`, `jiwer`, etc.).
 - Verifies GPU hardware, memory, and native Bfloat16 support on the L40S.
 
+### Configuration via `.env` (optional)
+
+Copy `.env.example` to `.env` and set tokens/paths there instead of exporting
+them in every shell. Python entrypoints and `run_*.sh` / `runpod_web.sh` load
+it automatically (exported variables still win):
+
+```bash
+cp .env.example .env
+# edit .env: HF_TOKEN, ASR_OUTPUT_DIR, ASR_RESULTS_DIR, PORT, ASR_COCKPIT_TOKEN, ...
+```
+
 ---
 
 ## 3. Run Baseline Benchmarks

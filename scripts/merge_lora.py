@@ -8,10 +8,20 @@ Usage:
 """
 
 import os
+import sys
 import argparse
+from pathlib import Path
 import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 from peft import PeftModel
+
+# Load .env (repo root / CWD) before any os.environ reads. Stdlib-only.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from src.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
 
 
 def parse_args():

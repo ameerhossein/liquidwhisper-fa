@@ -22,6 +22,10 @@ models/
 .cache/
 hf_cache/
 
+# Local environment (secrets, tokens, paths). See .env.example.
+.env
+.env.local
+
 # IDE & OS
 .vscode/
 .idea/

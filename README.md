@@ -103,6 +103,10 @@ This will:
 * Install Hugging Face, Peft, Hazm, and JiWER.
 * Verify GPU acceleration and native BF16 compatibility on the L40S.
 
+Optional: copy `.env.example` to `.env` to set `HF_TOKEN`, `ASR_OUTPUT_DIR`,
+`ASR_RESULTS_DIR`, `PORT`, `ASR_COCKPIT_TOKEN`, etc. Python entrypoints and
+`run_*.sh` / `runpod_web.sh` load it automatically (exported vars win).
+
 ---
 
 ## Step 1: Baseline Benchmarking

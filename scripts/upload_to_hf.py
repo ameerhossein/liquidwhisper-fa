@@ -28,6 +28,13 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Load .env (repo root / CWD) before any os.environ reads. Stdlib-only.
+try:
+    from src.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
 from src.paths import (
     find_complete_checkpoints,
     find_incomplete_checkpoints,
