@@ -144,6 +144,26 @@ th {
   border-color: var(--ink);
 }
 
+.dot-initializing {
+  border-color: var(--firoozeh);
+  background: var(--firoozeh-wash);
+}
+
+.dot-stopping {
+  border-color: var(--ink-2);
+  background: var(--paper-deep);
+}
+
+.dot-stopped {
+  background: var(--ink-3);
+  border-color: var(--ink-3);
+}
+
+.dot-failed {
+  background: var(--brick);
+  border-color: var(--brick);
+}
+
 .gpu {
   display: inline-flex;
   align-items: center;

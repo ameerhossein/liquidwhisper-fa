@@ -124,6 +124,8 @@ class WebTelemetryCallback(TrainerCallback):
         self.stop_signal_file = os.path.join(self.results_dir, "stop_training.signal")
         self.loss_history_file = os.path.join(self.results_dir, "loss_history.json")
 
+        self.halt_requested = False
+
         # Runtime trackers (restore loss history so resumed runs keep the curve)
         self.start_time = time.time()
         self.last_step_time = time.time()
@@ -217,6 +219,8 @@ class WebTelemetryCallback(TrainerCallback):
         # 1. Check for web stop signal
         if os.path.exists(self.stop_signal_file):
             print("\n[TelemetryCallback] Stop signal received from Web Dashboard! Halting training...")
+            self.halt_requested = True
+            control.should_save = True
             control.should_training_stop = True
             try:
                 os.remove(self.stop_signal_file)
@@ -549,7 +553,7 @@ class WebTelemetryCallback(TrainerCallback):
 
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         self._write_telemetry({
-            "status": "completed",
+            "status": "stopped" if self.halt_requested else "completed",
             "step": state.global_step,
             "max_steps": state.max_steps,
             "epoch": round(state.epoch or 0.0, 2),

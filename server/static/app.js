@@ -153,24 +153,29 @@ function renderTicks(total) {
   ).join("");
 }
 
+const STATE_LABELS = {
+  idle: "Idle",
+  initializing: "Initializing",
+  training: "Training",
+  stopping: "Stopping (saving checkpoint)",
+  evaluating: "Evaluating on held-out test",
+  stopped: "Stopped",
+  completed: "Run completed",
+  failed: "Run failed (see log)",
+};
+
 function updateTelemetry(tel) {
   const status = tel.status || "idle";
-  const evaluating = status === "evaluating_benchmark";
-  const running = !!tel.process_running || status === "training" || evaluating;
+  const running = !!tel.process_running || ["initializing", "training", "stopping", "evaluating_benchmark"].includes(status);
 
-  const state = evaluating ? "evaluating" : running ? "training" : status === "completed" ? "completed" : "idle";
-  const labels = {
-    evaluating: "Evaluating on held-out test",
-    training: "Training",
-    completed: "Run completed",
-    idle: "Idle",
-  };
+  let state = status === "evaluating_benchmark" ? "evaluating" : status;
+  if (!STATE_LABELS[state]) state = running ? "training" : "idle";
   el.statusDot.className = `dot dot-${state}`;
-  el.statusLabel.textContent = labels[state];
+  el.statusLabel.textContent = STATE_LABELS[state];
 
   el.btnStart.disabled = running;
   el.btnFresh.disabled = running;
-  el.btnStop.disabled = !running;
+  el.btnStop.disabled = !running || state === "stopping";
 
   const gpu = tel.gpu || {};
   if (gpu.available) {
@@ -187,7 +192,7 @@ function updateTelemetry(tel) {
   const maxSteps = tel.max_steps || 0;
   const epoch = tel.epoch || 0;
   const total = totalEpochs(tel);
-  const started = running || step > 0 || status === "completed";
+  const started = running || step > 0 || ["completed", "stopped", "failed"].includes(status);
   const pct = maxSteps ? Math.min(100, (step / maxSteps) * 100) : 0;
 
   renderTicks(total);

@@ -61,6 +61,10 @@ training_process: Optional[subprocess.Popen] = None
 training_log_fd = None
 connected_websockets: List[WebSocket] = []
 PID_FILE = RESULTS_DIR / "training.pid"
+last_exit_code: Optional[int] = None
+halt_requested = False
+ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
+HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
 
 def _default_output_dir() -> str:
@@ -194,6 +198,43 @@ def read_json_safely(path: Path, default: Any) -> Any:
         return default
 
 
+def _training_running() -> bool:
+    """Poll the training child process, recording its exit code for status."""
+    global training_process, last_exit_code
+    if training_process is not None:
+        code = training_process.poll()
+        if code is None:
+            return True
+        last_exit_code = code
+        training_process = None
+        _close_log_fd()
+    try:
+        if PID_FILE.exists():
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
+            if _is_process_running(pid):
+                return True
+            PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return False
+
+
+def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any]:
+    """Map raw telemetry plus process state to the status shown in the UI."""
+    status = telemetry.get("status") or "idle"
+    if is_running:
+        if status in ("idle", "running"):
+            status = "training"
+        if halt_requested and status in ACTIVE_STATUSES:
+            status = "stopping"
+    elif status in ACTIVE_STATUSES:
+        status = "stopped" if halt_requested else "failed"
+    if not is_running and not halt_requested and last_exit_code not in (None, 0):
+        status = "failed"
+    telemetry["status"] = status
+    return telemetry
+
+
 def get_gpu_info() -> Dict[str, Any]:
     """Lightweight check of GPU info via torch or nvidia-smi."""
     try:
@@ -283,31 +324,7 @@ async def serve_index():
 
 @app.get("/api/status")
 async def get_status():
-    global training_process
-    is_running = False
-    if training_process is not None:
-        poll_res = training_process.poll()
-        if poll_res is None:
-            is_running = True
-        else:
-            training_process = None
-            _close_log_fd()
-            try:
-                if PID_FILE.exists():
-                    PID_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
-    if not is_running:
-        # Recover liveness across server restarts via PID file.
-        try:
-            if PID_FILE.exists():
-                pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
-                if _is_process_running(pid):
-                    is_running = True
-                else:
-                    PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+    is_running = _training_running()
 
     telemetry = read_json_safely(TELEMETRY_FILE, {
         "status": "running" if is_running else "idle",
@@ -321,11 +338,7 @@ async def get_status():
         "gpu": get_gpu_info()
     })
 
-    if is_running and telemetry.get("status") == "idle":
-        telemetry["status"] = "training"
-    elif not is_running and telemetry.get("status") in ["training", "evaluating_benchmark"]:
-        telemetry["status"] = "idle"
-
+    telemetry = _derive_status(telemetry, is_running)
     telemetry["process_running"] = is_running
     telemetry["gpu"] = telemetry.get("gpu") or get_gpu_info()
     return telemetry
@@ -360,7 +373,7 @@ async def get_logs(tail: int = 150):
 
 @app.post("/api/train/start")
 async def start_training(config: Dict[str, Any] = None):
-    global training_process, training_log_fd
+    global training_process, training_log_fd, last_exit_code, halt_requested
     _check_auth(config)
     if training_process is not None and training_process.poll() is None:
         raise HTTPException(status_code=400, detail="Training is already currently running.")
@@ -451,6 +464,19 @@ async def start_training(config: Dict[str, Any] = None):
     training_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
     training_log_fd.flush()
 
+    last_exit_code = None
+    halt_requested = False
+    TELEMETRY_FILE.write_text(json.dumps({
+        "status": "initializing",
+        "step": 0,
+        "max_steps": 0,
+        "epoch": 0.0,
+        "loss": None,
+        "learning_rate": 0.0,
+        "speed_s_per_step": 0.0,
+        "eta_seconds": 0,
+    }), encoding="utf-8")
+
     training_process = subprocess.Popen(
         cmd,
         stdout=training_log_fd,
@@ -479,34 +505,36 @@ async def start_training(config: Dict[str, Any] = None):
     }
 
 
-@app.post("/api/train/stop")
-async def stop_training(payload: Dict[str, Any] = None):
-    global training_process
-    _check_auth(payload)
-    # 1. Trigger graceful stop via file signal
-    with open(STOP_SIGNAL_FILE, "w") as f:
-        f.write("stop")
-
-    if training_process is not None and training_process.poll() is None:
-        # Give 3 seconds for graceful checkpoint save, then terminate if necessary
-        await asyncio.sleep(2)
-        if training_process.poll() is None:
+async def _escalate_halt(proc: subprocess.Popen) -> None:
+    """Wait for the trainer to checkpoint and exit; SIGTERM only after the grace period."""
+    deadline = time.time() + HALT_GRACE_SECONDS
+    while proc.poll() is None:
+        if time.time() >= deadline:
+            if read_json_safely(TELEMETRY_FILE, {}).get("status") in ("stopped", "completed"):
+                return
             try:
                 if sys.platform != "win32":
-                    os.killpg(os.getpgid(training_process.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 else:
-                    training_process.terminate()
+                    proc.terminate()
             except Exception:
                 pass
-        training_process = None
-    _close_log_fd()
-    try:
-        if PID_FILE.exists():
-            PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+            return
+        await asyncio.sleep(2)
 
-    return {"status": "stopped"}
+
+@app.post("/api/train/stop")
+async def stop_training(payload: Dict[str, Any] = None):
+    global halt_requested
+    _check_auth(payload)
+    if not _training_running():
+        return {"status": "not_running"}
+    halt_requested = True
+    with open(STOP_SIGNAL_FILE, "w") as f:
+        f.write("stop")
+    if training_process is not None:
+        asyncio.create_task(_escalate_halt(training_process))
+    return {"status": "stopping"}
 
 
 @app.websocket("/ws/live")
@@ -520,19 +548,9 @@ async def websocket_telemetry(websocket: WebSocket):
             benchmarks = read_json_safely(BENCHMARKS_FILE, get_default_benchmarks())
             loss_hist = read_json_safely(LOSS_HISTORY_FILE, [])
 
-            # Check process status (in-memory + PID file for restart recovery)
-            global training_process
-            is_running = training_process is not None and training_process.poll() is None
-            if not is_running:
-                try:
-                    if PID_FILE.exists():
-                        pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
-                        is_running = _is_process_running(pid)
-                except Exception:
-                    pass
+            is_running = _training_running()
+            telemetry = _derive_status(telemetry, is_running)
             telemetry["process_running"] = is_running
-            if not is_running and telemetry.get("status") in ["training", "evaluating_benchmark"]:
-                telemetry["status"] = "idle"
 
             payload = {
                 "telemetry": telemetry,

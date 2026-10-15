@@ -310,38 +310,29 @@ def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) ->
 
 
 def _find_last_checkpoint(output_dir: str) -> Optional[str]:
-    """Return latest checkpoint-* dir in output_dir, or None.
+    """Return the newest complete checkpoint-* dir in output_dir, or None.
 
-    Prefers transformers.trainer_utils.get_last_checkpoint, falls back to
-    mtime-sorted scan so training stays resumable even across versions.
-    A valid checkpoint must contain trainer_state.json.
+    Trainer writes trainer_state.json last, so a folder without it is an
+    interrupted save. transformers' get_last_checkpoint would pick it and the
+    resume would fail, so incomplete folders are skipped and reported.
     """
-    try:
-        from transformers.trainer_utils import get_last_checkpoint
-        found = get_last_checkpoint(output_dir)
-        if found:
-            return found
-    except Exception:
-        pass
-    try:
-        base = Path(output_dir)
-        if not base.is_dir():
-            return None
-        cands = [p for p in base.glob("checkpoint-*") if p.is_dir() and (p / "trainer_state.json").exists()]
-        if not cands:
-            return None
-        def _step(p: Path) -> float:
-            try:
-                return int(p.name.split("-")[-1])
-            except Exception:
-                try:
-                    return p.stat().st_mtime
-                except Exception:
-                    return 0
-        cands.sort(key=_step)
-        return str(cands[-1])
-    except Exception:
+    base = Path(output_dir)
+    if not base.is_dir():
         return None
+    complete, incomplete = [], []
+    for p in base.glob("checkpoint-*"):
+        if not p.is_dir():
+            continue
+        try:
+            step = int(p.name.split("-")[-1])
+        except ValueError:
+            continue
+        (complete if (p / "trainer_state.json").is_file() else incomplete).append((step, p))
+    for _, p in sorted(incomplete):
+        print(f"Skipping incomplete checkpoint (no trainer_state.json): {p}")
+    if not complete:
+        return None
+    return str(max(complete)[1])
 
 
 def _resolve_resume_checkpoint(args) -> Optional[bool | str]:

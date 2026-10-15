@@ -45,6 +45,8 @@ def _load_demo_baselines():
 _WHISPER_WER, _WHISPER_CER, _WHISPER_DIAG, _WHISPER_FORMAL, _WHISPER_INFORMAL, \
     _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, _BUZZ_INFORMAL = _load_demo_baselines()
 
+DEMO_FAIL_AT_STEP = int(os.environ.get("DEMO_FAIL_AT_STEP", "0") or 0)
+
 # Simulation State
 sim_state = {
     "is_running": False,
@@ -154,12 +156,28 @@ def simulation_worker():
 
     while True:
         time.sleep(0.5)
+        if sim_state["status"] == "stopping":
+            time.sleep(2.0)  # Simulated checkpoint save before halt
+            sim_state.update({"is_running": False, "status": "stopped"})
+            sim_logs.append("[Demo Engine] >>> Checkpoint saved. Halted by user. (Launch resumes.)")
+            continue
+        if sim_state["status"] == "initializing":
+            time.sleep(2.0)  # Simulated model and dataset loading
+            sim_state["status"] = "training"
+            sim_logs.append("[Demo Engine] >>> Model and data ready. Training started.")
+            continue
         if not sim_state["is_running"]:
             continue
 
         sim_state["step"] += 25
         sim_state["elapsed_seconds"] += 1
         sim_state["eta_seconds"] = max(0, sim_state["eta_seconds"] - 3)
+
+        if DEMO_FAIL_AT_STEP and sim_state["step"] >= DEMO_FAIL_AT_STEP:
+            sim_state.update({"is_running": False, "status": "failed"})
+            sim_logs.append("Traceback (most recent call last):")
+            sim_logs.append("RuntimeError: CUDA out of memory (simulated failure, DEMO_FAIL_AT_STEP)")
+            continue
 
         # Smooth loss curve decay
         current_step = sim_state["step"]
@@ -185,6 +203,7 @@ def simulation_worker():
             sim_state["current_epoch_int"] = epoch_idx
             sim_state["status"] = "evaluating_benchmark"
             sim_logs.append(f"\n>>> [Epoch {epoch_idx}] Evaluation Started on held-out test split (2,149 samples)...")
+            # Halt may arrive during the pause below; the status must not be overwritten.
             time.sleep(2.0)  # Pause to show evaluation status
 
             metrics = epoch_targets[epoch_idx - 1]
@@ -228,7 +247,8 @@ def simulation_worker():
                 "timestamp": time.time()
             })
             sim_logs.append(f">>> [Epoch {epoch_idx}] Benchmark Finished! Normalized WER: {metrics[0]}% (Improvement: {delta_whisper}% vs Whisper v3, {delta_buzz}% vs BuzzASR)")
-            sim_state["status"] = "training"
+            if sim_state["status"] == "evaluating_benchmark":
+                sim_state["status"] = "training"
 
         sim_state["epoch"] = round(current_step / 1820, 2)
 
@@ -321,8 +341,8 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
                 del sim_benchmarks[2:]
                 sim_logs.append("[Demo Engine] >>> Previous run completed; state reset for fresh run.")
             sim_state["is_running"] = True
-            sim_state["status"] = "training"
-            sim_logs.append("[Demo Engine] >>> Training initiated by user.")
+            sim_state["status"] = "initializing"
+            sim_logs.append("[Demo Engine] >>> Training initiated by user. Initializing model and data...")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -330,13 +350,16 @@ class LocalDemoHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/train/stop":
-            sim_state["is_running"] = False
-            sim_state["status"] = "idle"
-            sim_logs.append("[Demo Engine] >>> Training halted by user. (State kept; Launch resumes.)")
+            if sim_state["is_running"]:
+                sim_state["status"] = "stopping"
+                sim_logs.append("[Demo Engine] >>> Halt requested. Saving checkpoint...")
+                result = "stopping"
+            else:
+                result = "not_running"
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "stopped"}).encode("utf-8"))
+            self.wfile.write(json.dumps({"status": result}).encode("utf-8"))
             return
 
         self.send_response(404)

@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--base_model", type=str, default="BuzzASR/persian", help="Base model identifier")
     parser.add_argument("--adapter_path", type=str, required=True, help="Path to trained LoRA adapter")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save merged standalone model")
-    parser.add_argument("--device", type=str, default="cpu", help="Device for merging (cpu is safer for exact precision)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for merging (default: cuda if available, else cpu)")
     return parser.parse_args()
 
 
