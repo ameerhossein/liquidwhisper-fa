@@ -30,6 +30,24 @@ except ImportError:  # pragma: no cover
     _TELEPHONE_AVAILABLE = False
 
 
+def _check_audio_backend() -> None:
+    """Fail fast with an actionable message if audio decoding is unavailable.
+
+    datasets>=3/4 decodes the ``audio`` column via torchcodec. Without it,
+    the first ``filter``/``map`` over audio raises:
+    ``ImportError: To support decoding audio data, please install 'torchcodec'``.
+    """
+    try:
+        import torchcodec  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "Missing 'torchcodec': datasets cannot decode the 'audio' column. "
+            "Install it from the same PyTorch index as torch, e.g. "
+            "pip install torchcodec --index-url https://download.pytorch.org/whl/cu124 "
+            "(or pip install -U 'datasets[audio]'). Then retry training."
+        ) from e
+
+
 class PersianASRDataPipeline:
     def __init__(
         self,
@@ -83,6 +101,7 @@ class PersianASRDataPipeline:
         """Loads dataset from Hugging Face Hub, resamples audio to 16kHz."""
         if not _DATASETS_AVAILABLE:
             raise ImportError("datasets package not installed; cannot load HF dataset.")
+        _check_audio_backend()
         print(f"Loading dataset '{self.dataset_name}' (split={split})...")
         try:
             ds = load_dataset(self.dataset_name, split=split)
@@ -182,6 +201,7 @@ class PersianASRDataPipeline:
         remove_columns: Optional[list] = None
     ) -> Dataset:
         """Applies mapping over dataset to produce model-ready inputs."""
+        _check_audio_backend()
         # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
         # not truncated, to keep audio/text aligned (Whisper caps at 30s).
         orig_len = len(dataset)

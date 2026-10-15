@@ -1,13 +1,27 @@
 """
 Offline unit tests for Iranian telephony simulation (src/telephone.py).
 No network, no torch, no ffmpeg required (ffmpeg paths skip gracefully).
-Run: uv run --with numpy --with scipy --with soundfile -- pytest tests/test_telephone.py -q
+Scipy-dependent tests skip gracefully when scipy is absent; full run needs:
+  uv run --with numpy --with scipy --with soundfile --with pytest -- python -m pytest tests/ -q
+Run: uv run --with numpy --with scipy --with soundfile --with pytest -- python -m pytest tests/test_telephone.py -q
 """
 
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+try:
+    import scipy  # noqa: F401
+    _SCIPY_MISSING = False
+except ImportError:
+    _SCIPY_MISSING = True
+
+requires_scipy = pytest.mark.skipif(
+    _SCIPY_MISSING,
+    reason="scipy not installed; telephony DSP requires scipy>=1.12.0 (pip install scipy>=1.12.0)",
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -31,6 +45,7 @@ def _sine_mix(sr=16000, dur=1.0):
     return x.astype(np.float32)
 
 
+@requires_scipy
 def test_resample_roundtrip_length():
     x = _sine_mix()
     x8 = resample_16k_to_8k(x)
@@ -39,6 +54,7 @@ def test_resample_roundtrip_length():
     assert abs(len(x16) - len(x)) <= 2
 
 
+@requires_scipy
 def test_bandpass_suppresses_high_freq():
     sr = 16000
     dur = 1.5
@@ -66,6 +82,7 @@ def test_bandpass_suppresses_high_freq():
     assert hi_after < hi_before * 0.25
 
 
+@requires_scipy
 def test_lite_deterministic_and_length():
     x = _sine_mix(dur=0.8)
     a = simulate_mobile(x, seed=7, use_ffmpeg=False)
@@ -78,6 +95,7 @@ def test_lite_deterministic_and_length():
     assert not np.allclose(a, x)
 
 
+@requires_scipy
 def test_pstn_lite_runs_and_differs_from_mobile():
     x = _sine_mix(dur=0.8)
     m = simulate_mobile(x, seed=11, use_ffmpeg=False)
@@ -94,6 +112,7 @@ def test_alaw_quantize_bounds():
     assert float(np.max(np.abs(y))) <= 1.0
 
 
+@requires_scipy
 def test_apply_random_prob_edges():
     x = _sine_mix(dur=0.5)
     clean, prof = apply_random_telephone(x, prob=0.0, seed=1, use_ffmpeg=False)
@@ -104,6 +123,7 @@ def test_apply_random_prob_edges():
     assert not np.allclose(deg, x)
 
 
+@requires_scipy
 def test_degrade_for_eval_deterministic_profiles():
     x = _sine_mix(dur=0.5)
     a = degrade_for_eval(x, index=0, seed_base=1234, profiles=["mobile", "pstn"], use_ffmpeg=False)
@@ -124,6 +144,7 @@ def test_data_pipeline_stores_telephony_params():
     assert tuple(pipe.telephony_profiles) == ("mobile", "pstn")
 
 
+@requires_scipy
 def test_ffmpeg_roundtrip_if_available():
     if not is_ffmpeg_available():
         print("SKIP ffmpeg roundtrip (no binary).")

@@ -21,6 +21,12 @@ hazm>=0.9.4
 # Speech & Audio Processing
 librosa>=0.10.1
 soundfile>=0.12.1
+# Required by datasets>=3/4 for Audio decoding (datasets uses torchcodec;
+# without it .map/.filter over the "audio" column fails with
+# "To support decoding audio data, please install 'torchcodec'").
+# Must match the torch CUDA build: install from the same PyTorch index, e.g.
+#   pip install torchcodec --index-url https://download.pytorch.org/whl/cu124
+torchcodec>=0.8.0
 
 # Metrics & Utilities
 jiwer>=3.0.4

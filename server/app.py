@@ -351,6 +351,29 @@ def _sanitize_output_dir(raw: str) -> str:
     return str(p.relative_to(BASE_DIR.resolve()))
 
 
+def _check_audio_backend_or_400() -> None:
+    """Fail /api/train/start fast if datasets cannot decode audio.
+
+    Without torchcodec the trainer dies later inside dataset.filter/map with
+    "To support decoding audio data, please install 'torchcodec'". Surfacing it
+    here saves a wasted launch cycle from the Web UI.
+    """
+    try:
+        import torchcodec  # noqa: F401
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Audio backend missing: 'torchcodec' is not installed, so the "
+                "dataset 'audio' column cannot be decoded. On the server run: "
+                "source .venv/bin/activate && pip install torchcodec "
+                "--index-url https://download.pytorch.org/whl/cu124 "
+                "(same index as torch), then restart training. "
+                "Fresh pods: ./setup_server.sh now installs it automatically."
+            ),
+        )
+
+
 @app.get("/")
 async def serve_index():
     index_file = STATIC_DIR / "index.html"
@@ -412,6 +435,7 @@ async def get_logs(tail: int = 150):
 async def start_training(config: Dict[str, Any] = None):
     global training_process, training_log_fd, last_exit_code, halt_requested
     _check_auth(config)
+    _check_audio_backend_or_400()
     if training_process is not None and training_process.poll() is None:
         raise HTTPException(status_code=400, detail="Training is already currently running.")
     # Recover from PID file after restart.

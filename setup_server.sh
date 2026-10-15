@@ -30,6 +30,16 @@ pip install --upgrade pip setuptools wheel
 echo "Installing PyTorch with CUDA support..."
 pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 
+# 4b. Install torchcodec from the SAME PyTorch index so the build matches
+# torch/CUDA (datasets>=3/4 requires it to decode the "audio" column;
+# PyPI-only installs can mismatch the torch build and fail at runtime).
+echo "Installing torchcodec (required for datasets Audio decoding)..."
+pip install --upgrade torchcodec --index-url https://download.pytorch.org/whl/cu124 || pip install --upgrade torchcodec
+python3 -c "import torchcodec; print('torchcodec OK:', torchcodec.__version__)" || {
+    echo "WARNING: torchcodec import failed; audio decoding will fail."
+    echo "  Retry with: pip install -U 'datasets[audio]' torchcodec --index-url https://download.pytorch.org/whl/cu124"
+}
+
 # 5. Install project dependencies
 echo "Installing project dependencies from requirements.txt..."
 pip install -r requirements.txt
