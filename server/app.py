@@ -514,8 +514,9 @@ async def start_training(config: Dict[str, Any] = None):
         # multiprocess is safe, but slower here. Override via POST
         # {"num_proc": 4} for clean-eval-only speedups.
         num_proc_i = int(config.get("num_proc", 1))
+        tele_f = float(config.get("telephony_prob", 0.4))
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate numeric.")
+        raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate/telephone_prob numeric.")
     if not (1 <= epochs_i <= 20):
         raise HTTPException(status_code=400, detail="epochs must be 1..20.")
     if not (1 <= batch_i <= 64):
@@ -530,6 +531,8 @@ async def start_training(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="max_benchmark_samples must be 0..10000 (0=full).")
     if not (1 <= num_proc_i <= 16):
         raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
+    if not (0.0 <= tele_f <= 1.0):
+        raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
 
     output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
     results_cfg = (config.get("results_dir", "") or "")
@@ -566,6 +569,7 @@ async def start_training(config: Dict[str, Any] = None):
         "--eval_batch_size", str(eval_bs_i),
         "--max_benchmark_samples", str(max_bench_i),
         "--num_proc", str(num_proc_i),
+        "--telephony_prob", str(tele_f),
         "--enable_telemetry",
         "--run_epoch_benchmark"
     ]
@@ -627,6 +631,7 @@ async def start_training(config: Dict[str, Any] = None):
             "batch_size": str(batch_i),
             "learning_rate": str(lr_f),
             "num_proc": str(num_proc_i),
+            "telephony_prob": str(tele_f),
             "output_dir": output_dir,
             "results_dir": results_dir,
             "auto_resume": auto_resume_on,

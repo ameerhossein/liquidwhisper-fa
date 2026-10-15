@@ -101,7 +101,7 @@ def parse_args():
     parser.add_argument("--run_post_test_eval", "--run-post-test-eval", action=argparse.BooleanOptionalAction, default=True, help="Run full test evaluation on best model post-training and save report")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
-    parser.add_argument("--telephony_prob", type=float, default=0.0, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed). YAML telephony.prob enables 0.5 on L40S.")
+    parser.add_argument("--telephony_prob", type=float, default=0.4, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.4=mixed default, 0.5=L40S YAML).")
     parser.add_argument("--telephony_profiles", type=str, default="mobile,pstn", help="Comma-separated phone profiles: mobile,pstn (MCI/Irancell cellular vs TCI landline)")
     parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
     parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB/G.711 codecs when available (fallback to lite otherwise)")
