@@ -25,6 +25,7 @@ const el = {
   statElapsed: document.getElementById("statElapsed"),
   btnStart: document.getElementById("btnStart"),
   btnStop: document.getElementById("btnStop"),
+  btnFresh: document.getElementById("btnFresh"),
   inputEpochs: document.getElementById("inputEpochs"),
   inputBatchSize: document.getElementById("inputBatchSize"),
   inputLearningRate: document.getElementById("inputLearningRate"),
@@ -168,6 +169,7 @@ function updateTelemetry(tel) {
   el.statusLabel.textContent = labels[state];
 
   el.btnStart.disabled = running;
+  el.btnFresh.disabled = running;
   el.btnStop.disabled = !running;
 
   const gpu = tel.gpu || {};
@@ -441,8 +443,9 @@ async function fetchLogs() {
 
 // Controls
 
-el.btnStart.addEventListener("click", async () => {
+async function startRun(freshStart) {
   el.btnStart.disabled = true;
+  el.btnFresh.disabled = true;
   try {
     const res = await fetch("/api/train/start", {
       method: "POST",
@@ -451,17 +454,29 @@ el.btnStart.addEventListener("click", async () => {
         epochs: parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS,
         batch_size: parseInt(el.inputBatchSize.value, 10) || 16,
         learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
+        fresh_start: freshStart,
       }),
     });
     if (!res.ok) {
       const err = await res.json();
       alert(`Start failed: ${err.detail || "Unknown error"}`);
       el.btnStart.disabled = false;
+      el.btnFresh.disabled = false;
     }
   } catch (e) {
     alert(`Failed to start training: ${e}`);
     el.btnStart.disabled = false;
+    el.btnFresh.disabled = false;
   }
+}
+
+el.btnStart.addEventListener("click", () => startRun(false));
+
+el.btnFresh.addEventListener("click", () => {
+  if (!confirm("Fresh start deletes existing checkpoints, the best adapter, reports and telemetry history before training. This cannot be undone. Continue?")) {
+    return;
+  }
+  startRun(true);
 });
 
 el.btnStop.addEventListener("click", async () => {

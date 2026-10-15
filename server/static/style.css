@@ -361,6 +361,16 @@ th {
   background: var(--brick-wash);
 }
 
+.btn-fresh {
+  background: transparent;
+  color: var(--ink-2);
+  border-color: var(--rule);
+}
+
+.btn-fresh:hover:not(:disabled) {
+  background: var(--paper-deep);
+}
+
 /* ==========================================================================
    Sections
    ========================================================================== */
