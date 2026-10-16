@@ -6,10 +6,13 @@ HF raw downloads + datasets.map temp files at /workspace fills it and fails
 with OSError 28 during prepare. Checkpoints must stay on /workspace
 (persistence); caches are re-downloadable, so they belong on the big disk.
 
-Precedence: explicit env wins (HF_DATASETS_CACHE / HF_HOME /
-ASR_HF_CACHE_DIR), else auto-pick the roomiest writable disk. Must run
-before any datasets/transformers import (they snapshot config at import).
-Stdlib-only so it can run at module top.
+Precedence: ASR_HF_CACHE_DIR (our own var, always deliberate) wins, then
+explicit HF_DATASETS_CACHE leaf, else auto-pick the roomiest writable disk.
+Deliberately does NOT honor HF_HOME: pod images (e.g. RunPod templates)
+export HF_HOME=/workspace/.cache/huggingface by default, which silently
+pins multi-GB downloads + map temps to the small volume. Override that
+unless ASR_HONOR_HF_HOME=1. Must run before any datasets/transformers
+import (they snapshot config at import). Stdlib-only for module-top use.
 """
 
 from __future__ import annotations
@@ -59,11 +62,15 @@ def _auto_base() -> str:
 
 
 def default_hf_cache_dir() -> str:
-    """Resolved HF_HOME base without side effects (explicit env wins)."""
-    for key in ("ASR_HF_CACHE_DIR", "HF_HOME"):
-        v = (os.environ.get(key, "") or "").strip()
-        if v:
-            return v
+    """Resolved HF base without side effects.
+
+    ASR_HF_CACHE_DIR wins, then an explicit HF_DATASETS_CACHE leaf (its
+    parent). HF_HOME is ignored here on purpose: image templates export a
+    default HF_HOME pointing at the small persistent volume.
+    """
+    v = (os.environ.get("ASR_HF_CACHE_DIR", "") or "").strip()
+    if v:
+        return v
     ds = (os.environ.get("HF_DATASETS_CACHE", "") or "").strip()
     if ds:
         # HF_DATASETS_CACHE points at the datasets leaf; base is its parent.
@@ -74,16 +81,36 @@ def default_hf_cache_dir() -> str:
     return _auto_base()
 
 
+def default_datasets_cache_dir() -> str:
+    """Effective datasets leaf: explicit HF_DATASETS_CACHE or <base>/datasets."""
+    ds = (os.environ.get("HF_DATASETS_CACHE", "") or "").strip()
+    if ds:
+        return ds
+    return os.path.join(default_hf_cache_dir(), "datasets")
+
+
 def setup_hf_cache(verbose: bool = True) -> str:
-    """Point HF caches at the big disk. Returns chosen HF_HOME base."""
+    """Point HF caches at the big disk. Returns chosen base.
+
+    Overrides a template-default HF_HOME (e.g. /workspace/...) with a loud
+    warning; set ASR_HONOR_HF_HOME=1 to keep an HF_HOME you set deliberately.
+    """
     base = default_hf_cache_dir()
 
-    datasets_cache = (os.environ.get("HF_DATASETS_CACHE", "") or "").strip()
-    if not datasets_cache:
-        datasets_cache = os.path.join(base, "datasets")
-        os.environ["HF_DATASETS_CACHE"] = datasets_cache
+    datasets_cache = default_datasets_cache_dir()
+    os.environ["HF_DATASETS_CACHE"] = datasets_cache
 
-    if not (os.environ.get("HF_HOME", "") or "").strip():
+    honor = (os.environ.get("ASR_HONOR_HF_HOME", "") or "").strip().lower() in (
+        "1", "true", "yes", "y", "on",
+    )
+    prev_home = (os.environ.get("HF_HOME", "") or "").strip()
+    if honor and prev_home:
+        base = prev_home
+        datasets_cache = default_datasets_cache_dir()
+        os.environ["HF_DATASETS_CACHE"] = datasets_cache
+    else:
+        if prev_home and os.path.normpath(prev_home) != os.path.normpath(base):
+            print(f"HF cache: overriding HF_HOME={prev_home} -> {base} (small-volume template default; set ASR_HONOR_HF_HOME=1 to keep).")
         os.environ["HF_HOME"] = base
 
     hub_cache = (
@@ -108,9 +135,13 @@ def setup_hf_cache(verbose: bool = True) -> str:
 
         for attr, val in (
             ("HF_DATASETS_CACHE", datasets_cache),
+            ("DEFAULT_DATASETS_CACHE_PATH", datasets_cache),
+            ("DATASETS_CACHE_PATH", datasets_cache),
             ("HF_HOME", base),
             ("HUB_CACHE", hub_cache),
             ("HF_HUB_CACHE", hub_cache),
+            ("DEFAULT_HUB_CACHE_PATH", hub_cache),
+            ("HUB_CACHE_PATH", hub_cache),
         ):
             try:
                 if hasattr(_cfg, attr):

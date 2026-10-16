@@ -263,12 +263,25 @@ class PersianASRDataPipeline:
         if not _DATASETS_AVAILABLE:
             raise ImportError("datasets package not installed; cannot load HF dataset.")
         _check_audio_backend()
-        print(f"Loading dataset '{self.dataset_name}' (split={split})...")
+        # Explicit cache_dir: env/import-order independent. Map temps are
+        # written next to the dataset files, so this also pins map temps to
+        # the big disk regardless of any template HF_HOME (see src/cache.py).
         try:
-            ds = load_dataset(self.dataset_name, split=split)
+            from src.cache import default_datasets_cache_dir as _ds_cache_dir
+
+            _cache_dir = _ds_cache_dir()
+            os.makedirs(_cache_dir, exist_ok=True)
+        except Exception:
+            _cache_dir = None
+        print(f"Loading dataset '{self.dataset_name}' (split={split})...")
+        _ld_kwargs: Dict[str, Any] = {}
+        if _cache_dir:
+            _ld_kwargs["cache_dir"] = _cache_dir
+        try:
+            ds = load_dataset(self.dataset_name, split=split, **_ld_kwargs)
         except Exception as e:
             print(f"Error loading {self.dataset_name}: {e}. Retrying with trust_remote_code=True...")
-            ds = load_dataset(self.dataset_name, split=split, trust_remote_code=True)
+            ds = load_dataset(self.dataset_name, split=split, trust_remote_code=True, **_ld_kwargs)
 
         if max_samples and max_samples > 0:
             if isinstance(ds, (DatasetDict, dict)):
