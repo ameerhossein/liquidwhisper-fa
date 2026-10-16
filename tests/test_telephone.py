@@ -144,6 +144,28 @@ def test_data_pipeline_stores_telephony_params():
     assert tuple(pipe.telephony_profiles) == ("mobile", "pstn")
 
 
+def test_ffmpeg_encoder_probe_runs_once(monkeypatch):
+    from src import telephone
+    calls = []
+
+    class _Out:
+        stdout = " V..... libopencore_amrnb\n"
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Out()
+
+    telephone.ffmpeg_has_encoder.cache_clear()
+    monkeypatch.setattr(telephone, "is_ffmpeg_available", lambda: True)
+    monkeypatch.setattr(telephone.subprocess, "run", fake_run)
+    try:
+        assert telephone.ffmpeg_has_encoder("libopencore_amrnb")
+        assert telephone.ffmpeg_has_encoder("libopencore_amrnb")
+        assert len(calls) == 1
+    finally:
+        telephone.ffmpeg_has_encoder.cache_clear()
+
+
 @requires_scipy
 def test_ffmpeg_roundtrip_if_available():
     if not is_ffmpeg_available():

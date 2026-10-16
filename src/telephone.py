@@ -19,6 +19,7 @@ Only depends on numpy/scipy/soundfile (already in requirements.txt).
 No torch / datasets import so it stays usable inside data pipelines.
 """
 
+import functools
 import random
 import shutil
 import subprocess
@@ -61,8 +62,9 @@ def is_ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+@functools.lru_cache(maxsize=None)
 def ffmpeg_has_encoder(encoder: str) -> bool:
-    """Check `ffmpeg -encoders` output for a given encoder name."""
+    """Check `ffmpeg -encoders` output for a given encoder name (cached per process)."""
     if not is_ffmpeg_available():
         return False
     try:

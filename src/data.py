@@ -141,6 +141,17 @@ def _cuda_already_initialized() -> bool:
         return False
 
 
+def _set_torch_threads(n: int) -> Optional[int]:
+    """Set torch intra-op threads to ``n``; return the previous count (None if torch is absent)."""
+    try:
+        import torch
+        prev = torch.get_num_threads()
+        torch.set_num_threads(n)
+        return prev
+    except Exception:
+        return None
+
+
 def _check_audio_backend() -> None:
     """Fail fast with an actionable message if audio decoding is unavailable.
 
@@ -212,7 +223,8 @@ class PersianASRDataPipeline:
         self.telephony_profiles = tuple(telephony_profiles) if telephony_profiles else ("mobile", "pstn")
         self.telephony_seed = telephony_seed
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
-        self._tele_rng = random.Random(telephony_seed) if telephony_seed is not None else random.Random()
+        self._tele_base_seed = telephony_seed if telephony_seed is not None else random.SystemRandom().randrange(2 ** 31)
+        self._tele_rng = random.Random(self._tele_base_seed)
         self._tele_warned_missing = False
 
     def _audio_duration_seconds(self, audio: Any) -> float:
@@ -266,7 +278,16 @@ class PersianASRDataPipeline:
 
         return ds
 
-    def prepare_sample(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+    def _telephone_rng(self, index: Optional[int]) -> random.Random:
+        """Augmentation RNG for one row. Seeded per row index so every shard and
+        worker draws the same augmentation for a given row, regardless of how
+        datasets.map splits the work; a shared stateful RNG would be copied into
+        each worker and replay the same draws in every shard."""
+        if index is None:
+            return self._tele_rng
+        return random.Random(f"{self._tele_base_seed}:{index}")
+
+    def prepare_sample(self, batch: Dict[str, Any], index: Optional[int] = None) -> Dict[str, Any]:
         """Processes audio waveform into log-mel spectrogram and text into token IDs."""
         audio_raw = batch["audio"]
         array, sr = _get_audio_array_and_sr(audio_raw)
@@ -316,7 +337,7 @@ class PersianASRDataPipeline:
                         prob=self.telephony_prob,
                         profiles=self.telephony_profiles,
                         use_ffmpeg=self.telephony_use_ffmpeg,
-                        rng=self._tele_rng,
+                        rng=self._telephone_rng(index),
                     )
                     array = degraded
                 except Exception as e:
@@ -351,26 +372,6 @@ class PersianASRDataPipeline:
     ) -> Dataset:
         """Applies mapping over dataset to produce model-ready inputs."""
         _check_audio_backend()
-        # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
-        # not truncated, to keep audio/text aligned (Whisper caps at 30s).
-        orig_len = len(dataset)
-        try:
-            dataset = dataset.filter(
-                lambda x: self.is_valid_duration(x["audio"]),
-                desc="Filtering by duration",
-            )
-            dropped = orig_len - len(dataset)
-            if dropped:
-                print(
-                    f"Filtered {dropped}/{orig_len} samples outside "
-                    f"[{self.min_duration_seconds}s, {self.max_duration_seconds}s]."
-                )
-        except Exception as e:
-            print(f"Duration filtering skipped ({e}). Continuing without filter.")
-
-        cols_to_remove = remove_columns or [c for c in dataset.column_names if c not in ["input_features", "labels", "is_informal"]]
-
-        print("Transforming dataset (feature extraction & tokenization)...")
         # num_proc=0 (or 1) must run single-process; datasets.map with
         # num_proc>1 pickles prepare_sample (bound method) which can fail.
         effective_proc = 1
@@ -395,9 +396,56 @@ class PersianASRDataPipeline:
             )
             effective_proc = 1
 
+        # Forked workers would each start a torch thread pool sized to the core
+        # count; N workers x cores threads thrash on the small per-sample STFT
+        # ops. Forked children inherit the limit; the parent's is restored after.
+        prev_threads = _set_torch_threads(1) if effective_proc > 1 else None
+        try:
+            return self._prepare_split(dataset, remove_columns, effective_proc)
+        finally:
+            if prev_threads is not None:
+                _set_torch_threads(prev_threads)
+
+    def _filter_by_duration(self, dataset: Dataset, num_proc: int) -> Dataset:
+        def keep(x):
+            return self.is_valid_duration(x["audio"])
+
+        try:
+            return dataset.filter(keep, desc="Filtering by duration", num_proc=num_proc)
+        except Exception as e:
+            if num_proc <= 1:
+                raise
+            print(f"Multiprocess filter failed ({e}). Retrying single-process...")
+            return dataset.filter(keep, desc="Filtering by duration")
+
+    def _prepare_split(
+        self,
+        dataset: Dataset,
+        remove_columns: Optional[list],
+        effective_proc: int,
+    ) -> Dataset:
+        # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
+        # not truncated, to keep audio/text aligned (Whisper caps at 30s).
+        orig_len = len(dataset)
+        try:
+            dataset = self._filter_by_duration(dataset, effective_proc)
+            dropped = orig_len - len(dataset)
+            if dropped:
+                print(
+                    f"Filtered {dropped}/{orig_len} samples outside "
+                    f"[{self.min_duration_seconds}s, {self.max_duration_seconds}s]."
+                )
+        except Exception as e:
+            print(f"Duration filtering skipped ({e}). Continuing without filter.")
+
+        cols_to_remove = remove_columns or [c for c in dataset.column_names if c not in ["input_features", "labels", "is_informal"]]
+
+        print("Transforming dataset (feature extraction & tokenization)...")
+        # with_indices: prepare_sample receives each row's index to seed its augmentation.
         map_kwargs: Dict[str, Any] = {
             "remove_columns": cols_to_remove,
             "desc": "Preparing ASR Features",
+            "with_indices": True,
         }
         if effective_proc > 1:
             map_kwargs["num_proc"] = effective_proc

@@ -231,6 +231,8 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> D
         "telephony_profiles": sorted(str(p) for p in profiles),
         "telephony_seed": int(getattr(args, "telephony_seed", 42) or 42),
         "telephony_use_ffmpeg": bool(getattr(args, "telephony_use_ffmpeg", True)),
+        # Bump when augmentation draws change; forces re-prep of stale caches.
+        "telephony_rng": "per_row_index_v1",
     }
 
 
