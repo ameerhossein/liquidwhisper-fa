@@ -52,7 +52,12 @@ Persistent by default (when `/workspace` exists):
 
 Ephemeral (re-downloaded / lost on restart):
 - `~/stt/.venv/`, repo-local `outputs/`, `results/`, `models/`
-- `~/.cache/huggingface/` (base model + Neyshekar dataset; repo sets no `HF_HOME`)
+- HF caches (base model + Neyshekar raw + `map` temps) and `prep_cache`
+  (prepared Arrows): auto-routed by `src/cache.py` to the roomiest disk
+  (`~/.cache/huggingface`, `/tmp/hf_cache`), never `/workspace`.
+  Overrides: `ASR_HF_CACHE_DIR` / `HF_DATASETS_CACHE` / `ASR_PREP_CACHE_DIR`.
+  A template-default `HF_HOME` pointing at `/workspace` is overridden with
+  a warning (`ASR_HONOR_HF_HOME=1` keeps it).
 - Any merge output under `models/...` unless you point it at `/workspace`.
 
 Persistent merge:
