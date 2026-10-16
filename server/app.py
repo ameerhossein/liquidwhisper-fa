@@ -507,11 +507,11 @@ async def start_training(config: Dict[str, Any] = None):
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 300)
         max_bench_i = int(max_bench) if max_bench not in (None, "") else 300
-        # Preprocessing workers for datasets.map (fork-based). Default 16;
+        # Preprocessing workers for datasets.map (fork-based). Default 8;
         # capped at os.cpu_count(). Each worker pins torch to one thread and
         # the ffmpeg probe is cached, so workers scale. Override via POST
         # {"num_proc": N} with N in 1..16.
-        num_proc_i = int(config.get("num_proc", 16))
+        num_proc_i = int(config.get("num_proc", 8))
         tele_f = float(config.get("telephony_prob", 0.4))
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate/telephone_prob numeric.")
