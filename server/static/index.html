@@ -69,7 +69,22 @@
         </label>
         <label class="field">
           <span class="field-label">Batch size</span>
-          <input type="number" id="inputBatchSize" class="field-input" value="16" min="1" max="64">
+          <input type="number" id="inputBatchSize" class="field-input" value="8" min="1" max="64">
+        </label>
+        <label class="field">
+          <span class="field-label">Grad accum</span>
+          <input type="number" id="inputGradAccum" class="field-input" value="4" min="1" max="16">
+        </label>
+        <label class="field">
+          <span class="field-label">Gradient checkpointing</span>
+          <select id="inputGradCheckpoint" class="field-input">
+            <option value="off" selected>Off</option>
+            <option value="on">On</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">Eval every (steps)</span>
+          <input type="number" id="inputEvalSteps" class="field-input" value="1500" min="1" max="10000">
         </label>
         <label class="field">
           <span class="field-label">Learning rate</span>

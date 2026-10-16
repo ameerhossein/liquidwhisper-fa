@@ -501,8 +501,9 @@ async def start_training(config: Dict[str, Any] = None):
     config = config or {}
     try:
         epochs_i = int(config.get("epochs", 4))
-        batch_i = int(config.get("batch_size", 16))
-        accum_i = int(config.get("grad_accum", 2))
+        batch_i = int(config.get("batch_size", 8))
+        accum_i = int(config.get("grad_accum", 4))
+        eval_steps_i = int(config.get("eval_steps", 1500))
         lr_f = float(config.get("learning_rate", 1e-4))
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 300)
@@ -531,6 +532,12 @@ async def start_training(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
     if not (0.0 <= tele_f <= 1.0):
         raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
+    if not (1 <= eval_steps_i <= 10000):
+        raise HTTPException(status_code=400, detail="eval_steps must be 1..10000.")
+    ckpt_raw = config.get("gradient_checkpointing", False)
+    gradient_ckpt = (str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")) if isinstance(ckpt_raw, str) else bool(ckpt_raw)
+    if batch_i > 8 and not gradient_ckpt:
+        raise HTTPException(status_code=400, detail="batch_size above 8 needs gradient_checkpointing on; without it batch 16 runs out of memory on a 48 GB GPU.")
 
     output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
     results_cfg = (config.get("results_dir", "") or "")
@@ -569,7 +576,10 @@ async def start_training(config: Dict[str, Any] = None):
         "--num_proc", str(num_proc_i),
         "--telephony_prob", str(tele_f),
         "--enable_telemetry",
-        "--run_epoch_benchmark"
+        "--run_epoch_benchmark",
+        "--eval_steps", str(eval_steps_i),
+        "--save_steps", str(eval_steps_i),
+        "--gradient_checkpointing" if gradient_ckpt else "--no-gradient_checkpointing",
     ]
     if resume_explicit:
         cmd += ["--resume_from_checkpoint", resume_explicit]
@@ -628,6 +638,9 @@ async def start_training(config: Dict[str, Any] = None):
             "epochs": str(epochs_i),
             "batch_size": str(batch_i),
             "learning_rate": str(lr_f),
+            "grad_accum": str(accum_i),
+            "eval_steps": str(eval_steps_i),
+            "gradient_checkpointing": gradient_ckpt,
             "num_proc": str(num_proc_i),
             "telephony_prob": str(tele_f),
             "output_dir": output_dir,

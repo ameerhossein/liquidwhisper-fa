@@ -126,9 +126,9 @@ source .venv/bin/activate
 | **Dataset** | `shekar-ai/Neyshekar` (v6 official release, ~100 hours) |
 | **Precision** | Native Bfloat16 (`bf16`) |
 | **LoRA Configuration** | $r=64$, $\alpha=128$, target: `q_proj, v_proj, k_proj, out_proj, fc1, fc2` |
-| **Batch Size** | 16 per device $\times$ 2 gradient accumulation = **32 effective batch size** |
+| **Batch Size** | 8 per device $\times$ 4 gradient accumulation = **32 effective batch size**, gradient checkpointing off |
 | **Optimizer** | `adamw_torch_fused` |
-| **Duration** | **~3 to 5 hours** for 4 epochs |
+| **Duration** | **~10 hours** for 4 epochs (estimated from benchmark step time; not yet measured end to end) |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
 | **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |
 | **Epoch Benchmark** | 300-sample subset by default (`--max_benchmark_samples 0` = full 2,149) |
