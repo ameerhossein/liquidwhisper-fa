@@ -123,7 +123,7 @@ def parse_args():
     parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
     # Prepared-feature cache (persistent volume): skip the 30-90min
     # "Preparing ASR Features" map on restarts by reusing mel+tokens.
-    parser.add_argument("--prep_cache_dir", type=str, default=None, help="Dir for prepared train/eval Arrow cache (default: <output_dir>/prep_cache, persistent on RunPod).")
+    parser.add_argument("--prep_cache_dir", type=str, default=None, help="Dir for prepared train/eval Arrow cache (default: big disk via src/cache.py; --prep_cache_dir <output_dir>/prep_cache restores persistent-volume caching). Env ASR_PREP_CACHE_DIR also works.")
     parser.add_argument("--reuse_prep", "--reuse-prep", action=argparse.BooleanOptionalAction, default=True, help="Load prepared datasets from prep_cache_dir when fingerprint matches (skips re-prep).")
     parser.add_argument("--overwrite_prep_cache", "--overwrite-prep-cache", action=argparse.BooleanOptionalAction, default=False, help="Force re-prep even if cache hits (use after data/code/telephone-seed changes).")
     args = parser.parse_args()
@@ -222,8 +222,17 @@ def _parse_telephony_profiles(value) -> list:
 
 
 def _default_prep_cache_dir(output_dir: str) -> str:
-    """Prepared-feature cache lives next to checkpoints, so it is persistent
-    on RunPod (/workspace/...) and repo-local otherwise."""
+    """Prepared-feature cache lives on the big disk (see src/cache.py), NOT
+    next to checkpoints: the 85G+ Arrow save does not fit the small
+    /workspace volume alongside checkpoints (OSError 28). Explicit
+    --prep_cache_dir / ASR_PREP_CACHE_DIR still wins; point it at
+    <output_dir>/prep_cache only if that volume has room."""
+    try:
+        from src.cache import default_prep_cache_dir as _big_prep
+
+        return _big_prep()
+    except Exception:
+        pass
     try:
         return os.path.join(output_dir, "prep_cache")
     except Exception:

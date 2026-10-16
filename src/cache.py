@@ -137,3 +137,20 @@ def log_cache_space(label: str = "Cache") -> None:
         print(f"{label} disk: {base} (~{free:.0f}G free)")
     except Exception:
         pass
+
+
+def default_prep_cache_dir() -> str:
+    """Default dir for prepared Arrow datasets (85G+; must avoid /workspace).
+
+    Explicit ASR_PREP_CACHE_DIR wins (use a /workspace/... path there if you
+    want persistence across pod restarts at the cost of disk). Otherwise a
+    sibling of the HF base, i.e. same roomy disk: <parent>/prep_cache.
+    """
+    v = (os.environ.get("ASR_PREP_CACHE_DIR", "") or "").strip()
+    if v:
+        return v
+    try:
+        parent = os.path.dirname(default_hf_cache_dir().rstrip("/")) or str(Path.home())
+    except Exception:
+        parent = str(Path.home())
+    return os.path.join(parent, "prep_cache")
