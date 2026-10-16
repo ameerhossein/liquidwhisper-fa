@@ -10,7 +10,7 @@ Supports:
 
 import os
 import random
-from typing import Optional, Dict, Any, Sequence
+from typing import Optional, Dict, Any, List, Sequence
 
 # Must be set before any HF tokenizer import: the Rust tokenizers thread pool
 # deadlocks when a process that created a tokenizer is fork()ed by
@@ -219,6 +219,8 @@ class PersianASRDataPipeline:
         telephony_profiles: Optional[Sequence[str]] = None,
         telephony_seed: Optional[int] = None,
         telephony_use_ffmpeg: bool = True,
+        label_prefix_ids: Optional[Sequence[int]] = None,
+        label_eos_id: Optional[int] = None,
     ):
         self.processor = processor
         self.dataset_name = dataset_name
@@ -232,6 +234,8 @@ class PersianASRDataPipeline:
         self.telephony_profiles = tuple(telephony_profiles) if telephony_profiles else ("mobile", "pstn")
         self.telephony_seed = telephony_seed
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
+        self.label_prefix_ids = tuple(label_prefix_ids) if label_prefix_ids is not None else None
+        self.label_eos_id = label_eos_id
         self._tele_base_seed = telephony_seed if telephony_seed is not None else random.SystemRandom().randrange(2 ** 31)
         self._tele_rng = random.Random(self._tele_base_seed)
         self._tele_warned_missing = False
@@ -309,6 +313,14 @@ class PersianASRDataPipeline:
             return self._tele_rng
         return random.Random(f"{self._tele_base_seed}:{index}")
 
+    def _encode_labels(self, text: str) -> List[int]:
+        if self.label_prefix_ids is None or self.label_eos_id is None:
+            return self.processor.tokenizer(text).input_ids
+        # Use the model's own prompt and EOS ids; the tokenizer's special ids are
+        # different tokens to the model.
+        text_ids = self.processor.tokenizer(text, add_special_tokens=False).input_ids
+        return [*self.label_prefix_ids, *text_ids, self.label_eos_id]
+
     def prepare_sample(self, batch: Dict[str, Any], index: Optional[int] = None) -> Dict[str, Any]:
         """Processes audio waveform into log-mel spectrogram and text into token IDs."""
         audio_raw = batch["audio"]
@@ -372,7 +384,7 @@ class PersianASRDataPipeline:
         ).input_features[0]
 
         # 2. Tokenize target transcript
-        labels = self.processor.tokenizer(clean_text).input_ids
+        labels = self._encode_labels(clean_text)
 
         # 3. Detect if sample is informal
         if "informal" in batch:

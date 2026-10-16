@@ -239,12 +239,26 @@ def _default_prep_cache_dir(output_dir: str) -> str:
         return "prep_cache"
 
 
+# BuzzASR/persian decodes with its own prompt and EOS. Its tokenizer names these
+# ids differently (51865 is "<|en|>" there), so labels must use them directly.
+BUZZASR_LABEL_PREFIX_IDS = (51908, 51968, 51972)
+BUZZASR_EOS_ID = 51865
+
+
+def _label_format(base_model: str):
+    """(prefix_ids, eos_id) for training labels, or (None, None) for tokenizer labels."""
+    if base_model == "BuzzASR/persian":
+        return BUZZASR_LABEL_PREFIX_IDS, BUZZASR_EOS_ID
+    return None, None
+
+
 def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> Dict[str, Any]:
     """Fingerprint for a prepared split. Any change forces re-prep."""
     try:
         profiles = list(getattr(args, "telephony_profiles", []) or [])
     except Exception:
         profiles = []
+    prefix_ids, eos_id = _label_format(getattr(args, "base_model", ""))
     return {
         "dataset_name": getattr(args, "dataset_name", ""),
         "base_model": getattr(args, "base_model", ""),
@@ -256,6 +270,7 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> D
         "telephony_use_ffmpeg": bool(getattr(args, "telephony_use_ffmpeg", True)),
         # Bump when augmentation draws change; forces re-prep of stale caches.
         "telephony_rng": "per_row_index_v1",
+        "label_ids": None if prefix_ids is None else [*prefix_ids, eos_id],
     }
 
 
@@ -451,6 +466,7 @@ def main():
     # workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58243).
     # Feature extraction + tokenization need only the processor, so prep runs
     # first (train gets phone augmentation, eval stays clean).
+    label_prefix_ids, label_eos_id = _label_format(args.base_model)
     train_pipeline = PersianASRDataPipeline(
         processor=processor,
         dataset_name=args.dataset_name,
@@ -460,6 +476,8 @@ def main():
         telephony_profiles=args.telephony_profiles,
         telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
         telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+        label_prefix_ids=label_prefix_ids,
+        label_eos_id=label_eos_id,
     )
     eval_pipeline = PersianASRDataPipeline(
         processor=processor,
@@ -467,6 +485,8 @@ def main():
         normalizer=normalizer,
         num_proc=args.num_proc,
         telephony_prob=0.0,
+        label_prefix_ids=label_prefix_ids,
+        label_eos_id=label_eos_id,
     )
 
     # HF cache was routed to the big disk at import time (see top of file,
@@ -664,14 +684,14 @@ def main():
         compute_metrics=compute_metrics,
         callbacks=callbacks,
     )
+    # No processing_class: Trainer.__init__ would align model eos/pad/bos to the
+    # tokenizer's <|endoftext|> (id 0), and generation would stop on the wrong token.
+    # The processor is saved explicitly after training.
     try:
-        trainer = Seq2SeqTrainer(processing_class=processor, **_trainer_common)
+        trainer = Seq2SeqTrainer(processing_class=None, **_trainer_common)
     except TypeError:
-        # Older transformers: fall back to tokenizer kwarg.
-        try:
-            trainer = Seq2SeqTrainer(tokenizer=processor.tokenizer, **_trainer_common)
-        except Exception:
-            trainer = Seq2SeqTrainer(tokenizer=processor, **_trainer_common)
+        # Older transformers: no processing_class kwarg.
+        trainer = Seq2SeqTrainer(**_trainer_common)
 
     # 9. Execute Training (auto-resumable from persistent-volume checkpoints)
     resume_ckpt = _resolve_resume_checkpoint(args)

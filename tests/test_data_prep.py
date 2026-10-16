@@ -23,8 +23,9 @@ class _StubFeatureExtractor:
 
 
 class _StubTokenizer:
-    def __call__(self, text):
-        return SimpleNamespace(input_ids=[1, 2, 3])
+    def __call__(self, text, add_special_tokens=True):
+        ids = [2, 3]
+        return SimpleNamespace(input_ids=[1, 7, *ids, 0] if add_special_tokens else ids)
 
 
 class _StubProcessor:
@@ -71,6 +72,23 @@ def test_augmentation_differs_across_row_indices():
     pipe = _pipeline()
     outs = [pipe.prepare_sample(dict(row), index=i)["input_features"] for i in range(20)]
     assert len({np.asarray(o).tobytes() for o in outs}) == 20
+
+
+def test_model_native_labels_use_prompt_and_eos_ids():
+    pipe = PersianASRDataPipeline(
+        processor=_StubProcessor(),
+        normalizer=_StubNormalizer(),
+        telephony_prob=0.0,
+        label_prefix_ids=(51908, 51968, 51972),
+        label_eos_id=51865,
+    )
+    out = pipe.prepare_sample({"audio": _clip(), "text": "سلام"}, index=0)
+    assert out["labels"] == [51908, 51968, 51972, 2, 3, 51865]
+
+
+def test_tokenizer_labels_kept_without_label_format():
+    out = _pipeline(prob=0.0).prepare_sample({"audio": _clip(), "text": "سلام"}, index=0)
+    assert out["labels"] == [1, 7, 2, 3, 0]
 
 
 def test_prepare_split_matches_across_num_proc():
