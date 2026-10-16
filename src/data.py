@@ -206,6 +206,20 @@ def _check_audio_backend() -> None:
         ) from e
 
 
+def persian_label_ids(generation_config: Dict[str, Any]):
+    """(prompt_ids, eos_id) that a Persian Whisper model decodes with.
+
+    Read from the model's own generation_config.json. transformers' WhisperTokenizer
+    assigns different ids to these names for BuzzASR/persian (it maps <|fa|> to 51906).
+    """
+    prompt = (
+        generation_config["lang_to_id"]["<|fa|>"],
+        generation_config["task_to_id"]["transcribe"],
+        generation_config["no_timestamps_token_id"],
+    )
+    return prompt, generation_config["eos_token_id"]
+
+
 class PersianASRDataPipeline:
     def __init__(
         self,

@@ -61,7 +61,7 @@ except Exception:
 from src.normalizer import PersianTextNormalizer
 from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding
-from src.data import PersianASRDataPipeline
+from src.data import PersianASRDataPipeline, persian_label_ids
 from src.trainer_callbacks import WebTelemetryCallback, load_baselines, _resolve_infer_dtype, _should_autocast
 from src import paths as _managed_paths
 
@@ -126,6 +126,7 @@ def parse_args():
     parser.add_argument("--prep_cache_dir", type=str, default=None, help="Dir for prepared train/eval Arrow cache (default: big disk via src/cache.py; --prep_cache_dir <output_dir>/prep_cache restores persistent-volume caching). Env ASR_PREP_CACHE_DIR also works.")
     parser.add_argument("--reuse_prep", "--reuse-prep", action=argparse.BooleanOptionalAction, default=True, help="Load prepared datasets from prep_cache_dir when fingerprint matches (skips re-prep).")
     parser.add_argument("--overwrite_prep_cache", "--overwrite-prep-cache", action=argparse.BooleanOptionalAction, default=False, help="Force re-prep even if cache hits (use after data/code/telephone-seed changes).")
+    parser.add_argument("--gradient_checkpointing", "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Recompute activations in the backward pass to save VRAM. Off is ~35%% faster but needs batch_size 8 (16 runs out of memory on a 48 GB L40S).")
     args = parser.parse_args()
     # YAML config overlay: file provides defaults, CLI wins only if explicitly passed.
     if args.config:
@@ -133,6 +134,12 @@ def parse_args():
             print("Warning: PyYAML not installed; ignoring --config. pip install pyyaml")
         else:
             _apply_yaml_config(parser, args, args.config)
+    # load_best_model_at_end needs save_steps to be a multiple of eval_steps; the
+    # Trainer only checks this after data prep and model load.
+    if args.save_steps % args.eval_steps != 0:
+        parser.error(f"save_steps ({args.save_steps}) must be a multiple of eval_steps ({args.eval_steps}).")
+    if not args.gradient_checkpointing and args.batch_size > 8:
+        print("Warning: batch_size > 8 without gradient checkpointing may run out of VRAM on a 48 GB GPU.")
     return args
 
 
@@ -187,8 +194,10 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "reuse_prep": "reuse_prep", "reuse-prep": "reuse_prep",
         "overwrite_prep_cache": "overwrite_prep_cache",
         "overwrite-prep-cache": "overwrite_prep_cache",
+        "gradient_checkpointing": "gradient_checkpointing",
+        "gradient-checkpointing": "gradient_checkpointing",
     }
-    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark", "reuse_prep", "overwrite_prep_cache"}
+    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark", "reuse_prep", "overwrite_prep_cache", "gradient_checkpointing"}
     for yk, ak in key_map.items():
         if yk in flat:
             cli_name = "--" + ak
@@ -239,17 +248,14 @@ def _default_prep_cache_dir(output_dir: str) -> str:
         return "prep_cache"
 
 
-# BuzzASR/persian decodes with its own prompt and EOS. Its tokenizer names these
-# ids differently (51865 is "<|en|>" there), so labels must use them directly.
-BUZZASR_LABEL_PREFIX_IDS = (51908, 51968, 51972)
-BUZZASR_EOS_ID = 51865
-
-
 def _label_format(base_model: str):
     """(prefix_ids, eos_id) for training labels, or (None, None) for tokenizer labels."""
-    if base_model == "BuzzASR/persian":
-        return BUZZASR_LABEL_PREFIX_IDS, BUZZASR_EOS_ID
-    return None, None
+    if base_model != "BuzzASR/persian":
+        return None, None
+    from huggingface_hub import hf_hub_download
+
+    with open(hf_hub_download(base_model, "generation_config.json"), encoding="utf-8") as f:
+        return persian_label_ids(json.load(f))
 
 
 def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> Dict[str, Any]:
@@ -641,7 +647,7 @@ def main():
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         num_train_epochs=args.epochs,
-        gradient_checkpointing=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         fp16=not use_bf16 and torch.cuda.is_available(),
         bf16=use_bf16 and torch.cuda.is_available(),
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",

@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data import PersianASRDataPipeline
+from src.data import PersianASRDataPipeline, persian_label_ids
 
 
 class _StubFeatureExtractor:
@@ -84,6 +84,16 @@ def test_model_native_labels_use_prompt_and_eos_ids():
     )
     out = pipe.prepare_sample({"audio": _clip(), "text": "سلام"}, index=0)
     assert out["labels"] == [51908, 51968, 51972, 2, 3, 51865]
+
+
+def test_persian_label_ids_read_from_generation_config():
+    gen_cfg = {
+        "lang_to_id": {"<|fa|>": 51908},
+        "task_to_id": {"transcribe": 51968, "translate": 51967},
+        "no_timestamps_token_id": 51972,
+        "eos_token_id": 51865,
+    }
+    assert persian_label_ids(gen_cfg) == ((51908, 51968, 51972), 51865)
 
 
 def test_tokenizer_labels_kept_without_label_format():
