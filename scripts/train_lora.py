@@ -16,6 +16,22 @@ import json
 # Must precede any HF tokenizer import: forked datasets.map workers deadlock
 # if the parent created tokenizers with parallelism enabled (see src/data.py).
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Add project root to sys.path FIRST so src.cache is importable below.
+from pathlib import Path as _EarlyPath
+
+sys.path.insert(0, str(_EarlyPath(__file__).resolve().parent.parent))
+
+# HF caches (raw downloads + datasets.map temps) -> biggest disk, not the
+# small /workspace volume (OSError 28 root cause). Must precede any
+# datasets/transformers import (they snapshot cache paths at import).
+# Explicit HF_DATASETS_CACHE / HF_HOME / ASR_HF_CACHE_DIR still wins.
+try:
+    from src.cache import setup_hf_cache as _setup_hf_cache
+
+    _setup_hf_cache(verbose=True)
+except Exception:
+    pass
 from pathlib import Path
 from typing import Dict, Any, Optional
 import torch
@@ -34,9 +50,7 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
 
-# Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+# Project root already on sys.path (see top-of-file early insert for src.cache).
 # Load .env (repo root / CWD) before any os.environ reads. Stdlib-only.
 try:
     from src.dotenv import load_dotenv as _load_dotenv
@@ -446,11 +460,13 @@ def main():
         telephony_prob=0.0,
     )
 
-    # Keep raw HF downloads on the persistent volume too when available,
-    # so restarts skip re-download. Explicit args/env still win.
+    # HF cache was routed to the big disk at import time (see top of file,
+    # src/cache.py). Re-log here since output_dir/results are set up by now;
+    # checkpoints stay on /workspace (persistent), caches stay ephemeral.
     try:
-        if not os.environ.get("HF_DATASETS_CACHE") and Path("/workspace").is_dir():
-            os.environ["HF_DATASETS_CACHE"] = "/workspace/stt-outputs/hf_cache"
+        from src.cache import log_cache_space as _log_cache_space
+
+        _log_cache_space("HF cache")
     except Exception:
         pass
 

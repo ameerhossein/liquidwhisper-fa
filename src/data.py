@@ -16,6 +16,15 @@ from typing import Optional, Dict, Any, Sequence
 # deadlocks when a process that created a tokenizer is fork()ed by
 # datasets.map(num_proc>1) (workers sit at 0% CPU forever).
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# HF caches (raw downloads + map temps) belong on the big disk, not the
+# small /workspace volume. Must run before any datasets import (it snapshots
+# cache paths at import). Explicit HF_* / ASR_HF_CACHE_DIR env wins.
+try:
+    from src.cache import setup_hf_cache as _setup_hf_cache
+
+    _setup_hf_cache(verbose=False)
+except Exception:
+    pass
 try:
     from datasets import load_dataset, Audio, DatasetDict, Dataset
     _DATASETS_AVAILABLE = True
