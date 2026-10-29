@@ -37,9 +37,11 @@ except ImportError:
 from src.normalizer import PersianTextNormalizer
 
 try:
+    from src.telephone import DEFAULT_PROFILES as _DEFAULT_TELEPHONY_PROFILES
     from src.telephone import apply_random_telephone
     _TELEPHONE_AVAILABLE = True
 except ImportError:  # pragma: no cover
+    _DEFAULT_TELEPHONY_PROFILES = ("gated", "mobile", "pstn")
     apply_random_telephone = None  # type: ignore
     _TELEPHONE_AVAILABLE = False
 
@@ -242,10 +244,15 @@ class PersianASRDataPipeline:
         self.max_duration_seconds = max_duration_seconds
         self.min_duration_seconds = min_duration_seconds
         self.num_proc = num_proc
-        # Telephony augmentation (Iran MCI/Irancell mobile + TCI PSTN).
-        # prob=0 keeps legacy clean behavior; train typically uses 0.5.
+        # Telephony augmentation (gated clean line + Iran MCI/Irancell mobile
+        # + TCI PSTN). prob=0 keeps legacy clean behavior; train typically
+        # uses 0.5. Default profile mixture follows the real corpus:
+        # 70% gated/clean, 15% mobile, 15% PSTN.
         self.telephony_prob = float(telephony_prob or 0.0)
-        self.telephony_profiles = tuple(telephony_profiles) if telephony_profiles else ("mobile", "pstn")
+        self.telephony_profiles = (
+            tuple(telephony_profiles) if telephony_profiles
+            else tuple(_DEFAULT_TELEPHONY_PROFILES)
+        )
         self.telephony_seed = telephony_seed
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
         self.label_prefix_ids = tuple(label_prefix_ids) if label_prefix_ids is not None else None
@@ -371,7 +378,7 @@ class PersianASRDataPipeline:
 
         # 0. Optional telephony augmentation (on-the-fly, length-preserving).
         # Degrades 16k -> phone 8k -> back to 16k so Whisper still sees 16k
-        # input but with narrowband/codec artifacts (MCI/Irancell/TCI).
+        # input but with narrowband/codec artifacts (gated/MCI/Irancell/TCI).
         if self.telephony_prob > 0 and self.telephony_profiles:
             if not _TELEPHONE_AVAILABLE:
                 if not self._tele_warned_missing:

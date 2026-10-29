@@ -109,10 +109,10 @@ class WebTelemetryCallback(TrainerCallback):
         self.eval_batch_size = max(1, int(eval_batch_size or 16))
         # None or <=0 means full test set; default 300 guards L40S OOM.
         self.max_benchmark_samples = max_benchmark_samples
-        # Dual clean + phone-simulated benchmark (Iran MCI/Irancell/TCI).
+        # Dual clean + phone-simulated benchmark (gated + MCI/Irancell + TCI).
         self.phone_benchmark = bool(phone_benchmark)
         self.phone_seed = int(phone_seed or 1234)
-        self.telephony_profiles = list(telephony_profiles) if telephony_profiles else ["mobile", "pstn"]
+        self.telephony_profiles = list(telephony_profiles) if telephony_profiles else ["gated", "mobile", "pstn"]
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
 
         # Baselines to compare against (single source: configs/baselines.json)

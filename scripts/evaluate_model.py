@@ -43,15 +43,15 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Inference batch size")
     parser.add_argument("--output_dir", type=str, default="results/evaluation", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--phone_eval", "--phone-eval", action=argparse.BooleanOptionalAction, default=True, help="Also evaluate on phone-simulated copy (MCI/Irancell/TCI) for dual clean+phone report")
+    parser.add_argument("--phone_eval", "--phone-eval", action=argparse.BooleanOptionalAction, default=True, help="Also evaluate on phone-simulated copy (gated/MCI/Irancell/TCI) for dual clean+phone report")
     parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
-    parser.add_argument("--telephony_profiles", type=str, default="mobile,pstn", help="Comma-separated phone profiles for eval")
-    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg codecs in phone eval when available")
+    parser.add_argument("--telephony_profiles", type=str, default="gated,mobile,pstn", help="Comma-separated phone profiles for eval")
+    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB codec in phone eval when available; G.711 A-law storage is always exact")
     return parser.parse_args()
 
 
 def _parse_profiles(value: str):
-    return [p.strip() for p in str(value or "").split(",") if p.strip()] or ["mobile", "pstn"]
+    return [p.strip() for p in str(value or "").split(",") if p.strip()] or ["gated", "mobile", "pstn"]
 
 
 def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
@@ -78,7 +78,7 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
             wav = a["array"]
             if degrade_phone and degrade_fn is not None:
                 wav = degrade_fn(wav, index=i + j, seed_base=phone_seed,
-                                 profiles=profiles or ["mobile", "pstn"],
+                                 profiles=profiles or ["gated", "mobile", "pstn"],
                                  use_ffmpeg=use_ffmpeg)
             waveforms.append(wav)
 

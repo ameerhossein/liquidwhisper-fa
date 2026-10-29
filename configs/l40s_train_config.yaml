@@ -39,11 +39,11 @@ training:
   # Persistent on RunPod; local runs without /workspace fall back to results/.
   results_dir: "/workspace/stt-outputs/results"
 
-# Iranian telephony augmentation (MCI/Irancell mobile + TCI PSTN).
+# Iranian telephony augmentation (gated clean line + MCI/Irancell + TCI).
 # prob=0.5 means half the train samples are phone-simulated on-the-fly.
 telephony:
   prob: 0.5
-  profiles: ["mobile", "pstn"]
+  profiles: ["gated", "mobile", "pstn"]
   seed: 42
   use_ffmpeg: true
 

@@ -116,9 +116,9 @@ def parse_args():
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
     parser.add_argument("--telephony_prob", type=float, default=0.4, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.4=mixed default, 0.5=L40S YAML).")
-    parser.add_argument("--telephony_profiles", type=str, default="mobile,pstn", help="Comma-separated phone profiles: mobile,pstn (MCI/Irancell cellular vs TCI landline)")
+    parser.add_argument("--telephony_profiles", type=str, default="gated,mobile,pstn", help="Comma-separated phone profiles: gated,mobile,pstn (clean gated line vs MCI/Irancell cellular vs TCI landline)")
     parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
-    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB/G.711 codecs when available (fallback to lite otherwise)")
+    parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB codec when available; G.711 A-law storage is always exact")
     parser.add_argument("--phone_benchmark", "--phone-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Dual clean + phone eval each epoch (--no-phone-benchmark for clean only)")
     parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
     # Prepared-feature cache (persistent volume): skip the 30-90min
@@ -224,7 +224,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
 
 def _parse_telephony_profiles(value) -> list:
     if value is None:
-        return ["mobile", "pstn"]
+        return ["gated", "mobile", "pstn"]
     if isinstance(value, (list, tuple)):
         return [str(v).strip() for v in value if str(v).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
@@ -440,7 +440,7 @@ def _resolve_resume_checkpoint(args) -> Optional[bool | str]:
 
 def main():
     args = parse_args()
-    args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "mobile,pstn"))
+    args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "gated,mobile,pstn"))
     args.output_dir = _resolve_output_dir(args.output_dir)
     args.results_dir = _resolve_results_dir(getattr(args, "results_dir", None))
     os.makedirs(args.output_dir, exist_ok=True)
@@ -753,7 +753,7 @@ def _run_post_training_evaluation(
 ):
     import time
 
-    phone_profiles = list(telephony_profiles or ["mobile", "pstn"])
+    phone_profiles = list(telephony_profiles or ["gated", "mobile", "pstn"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = _resolve_infer_dtype(device)
     use_amp = _should_autocast(device)
@@ -935,7 +935,7 @@ def _run_post_training_evaluation(
     ]
     if phone_block:
         md_lines.append(
-            f"| **Phone Normalized WER** (MCI/Irancell + TCI sim, seed={phone_block['seed']}) | "
+            f"| **Phone Normalized WER** (gated/MCI/Irancell/TCI sim, seed={phone_block['seed']}) | "
             f"**{phone_block['normalized_wer']:.2f}%** ({phone_block['gap_vs_clean_pp']:+.2f} pp vs clean) |"
         )
     md_lines += [

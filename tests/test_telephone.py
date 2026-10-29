@@ -179,3 +179,211 @@ def test_ffmpeg_roundtrip_if_available():
     y = simulate_mobile(x, seed=3, use_ffmpeg=True)
     assert len(y) == len(x)
     assert not np.allclose(y, x)
+
+
+# ---------------------------------------------------------------------------
+# Match-report P0 regressions: A-law storage, gated profile, noise/dropouts.
+# ---------------------------------------------------------------------------
+
+def test_default_profiles_include_gated():
+    from src import telephone
+    assert "gated" in telephone.DEFAULT_PROFILES
+    assert abs(sum(telephone.DEFAULT_PROFILE_WEIGHTS.values()) - 1.0) < 1e-9
+    assert telephone.DEFAULT_PROFILE_WEIGHTS["gated"] >= 0.6
+
+
+def test_choose_telephone_profile_is_weighted():
+    import random
+    from src import telephone
+    rng = random.Random(0)
+    counts = {"gated": 0, "mobile": 0, "pstn": 0}
+    for _ in range(2000):
+        counts[telephone.choose_telephone_profile(telephone.DEFAULT_PROFILES, rng)] += 1
+    assert counts["gated"] > counts["mobile"] + counts["pstn"]
+    assert 0.60 < counts["gated"] / 2000.0 < 0.80
+
+
+def test_apply_dropouts_leaves_residual_not_zero():
+    from src import telephone
+    x = np.ones(8000, dtype=np.float32)
+    rng = np.random.default_rng(0)
+    y = telephone.apply_dropouts(x, 8000, p_frame=1.0, rng=rng)
+    assert float(np.min(y)) >= 0.019
+    assert bool(np.any(y < 0.5))
+
+
+def test_mobile_dropout_default_is_rare():
+    import inspect
+    from src import telephone
+    params = inspect.signature(telephone.simulate_mobile).parameters
+    assert params["dropout_p"].default <= 0.003
+
+
+def test_pstn_hum_default_is_light():
+    import inspect
+    from src import telephone
+    params = inspect.signature(telephone.simulate_pstn).parameters
+    assert params["hum_db_range"].default[1] <= -45.0
+    assert params["hum_prob"].default <= 0.2
+
+
+def test_alaw_roundtrip_grid_and_idempotent():
+    from src import telephone
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(8000) * 0.3).astype(np.float32)
+    y = telephone.alaw_roundtrip_8k(x)
+    yi = np.rint(y * 32768).astype(np.int32)
+    assert np.all(yi % 8 == 0)
+    assert len(np.unique(yi)) <= 256
+    assert int(np.min(np.abs(yi[yi != 0]))) >= 8
+    y2 = telephone.alaw_roundtrip_8k(y)
+    np.testing.assert_array_equal(yi, np.rint(y2 * 32768).astype(np.int32))
+
+
+def test_all_profiles_final_8k_is_alaw():
+    from src import telephone
+    x = _sine_mix(dur=0.5)
+    for profile in ("mobile", "pstn", "gated"):
+        y = telephone.simulate_telephone(
+            x, profile=profile, seed=3, use_ffmpeg=False, output_sr=8000
+        )
+        yi = np.rint(y * 32768).astype(np.int32)
+        assert len(y) == len(x) // 2
+        assert np.all(yi % 8 == 0), profile
+        assert len(np.unique(yi)) <= 256, profile
+
+
+def test_gated_silence_has_no_added_noise():
+    from src import telephone
+    x = np.zeros(16000, dtype=np.float32)
+    y = telephone.simulate_gated(x, seed=1, use_ffmpeg=False, output_sr=8000)
+    yi = np.rint(y * 32768).astype(np.int32)
+    assert int(np.max(np.abs(yi))) <= 8
+    assert len(np.unique(yi)) <= 2
+
+
+def test_gated_profile_is_darker_than_mobile():
+    from src import telephone
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(16000) * 0.2).astype(np.float32)
+
+    def hf_ratio(y):
+        spec = np.abs(np.fft.rfft(y * np.hanning(len(y)))) ** 2
+        freqs = np.fft.rfftfreq(len(y), 1.0 / 8000)
+        lo = np.sum(spec[(freqs >= 300) & (freqs < 1000)])
+        hi = np.sum(spec[(freqs >= 2000) & (freqs < 3400)])
+        return float(hi / (lo + 1e-20))
+
+    gated = telephone.simulate_gated(x, seed=1, use_ffmpeg=False, output_sr=8000)
+    mobile = telephone.simulate_mobile(
+        x, seed=1, use_ffmpeg=False, output_sr=8000, dropout_p=0.0
+    )
+    assert hf_ratio(gated) < hf_ratio(mobile)
+
+
+def test_colored_noise_is_low_frequency_heavy():
+    from src import telephone
+    n = 8000
+    rng = np.random.default_rng(0)
+    y = telephone.colored_noise(n, 8000, rng, color="pink")
+    assert len(y) == n
+    spec = np.abs(np.fft.rfft(y)) ** 2
+    freqs = np.fft.rfftfreq(n, 1.0 / 8000)
+    lo = np.mean(spec[(freqs >= 100) & (freqs < 500)])
+    hi = np.mean(spec[(freqs >= 2000) & (freqs < 3500)])
+    assert lo > 2.0 * hi
+    y2 = telephone.colored_noise(n, 8000, np.random.default_rng(0), color="pink")
+    np.testing.assert_allclose(y, y2, atol=1e-6)
+
+
+def test_add_colored_noise_hits_target_snr():
+    from src import telephone
+    x = _sine_mix(dur=0.5)
+    y = telephone.add_colored_noise_at_snr(x, 10.0, np.random.default_rng(0), color="pink")
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    snr = 10.0 * np.log10(np.mean(x.astype(np.float64) ** 2) / np.mean(noise ** 2))
+    assert abs(snr - 10.0) < 0.2
+
+
+def test_data_pipeline_default_profiles_include_gated():
+    from src.data import PersianASRDataPipeline
+    pipe = PersianASRDataPipeline(processor=None)
+    assert "gated" in pipe.telephony_profiles
+
+
+def test_active_speech_rms_and_calibration():
+    from src import telephone
+    t = np.arange(16000) / 16000.0
+    x = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    cur = telephone.active_speech_rms_db(x)
+    assert abs(cur - (-23.0)) < 1.0
+    y = telephone.calibrate_active_rms(
+        x, (-20.0, -20.0), np.random.default_rng(0), enabled=True
+    )
+    assert abs(telephone.active_speech_rms_db(y) - (-20.0)) < 1.0
+
+
+def test_add_noise_bed_is_low_frequency_and_hits_snr():
+    from src import telephone
+    t = np.arange(16000) / 16000.0
+    x = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    y = telephone.add_noise_bed(
+        x, 10.0, np.random.default_rng(0), color="brown", white_mix=0.12
+    )
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    snr = 10.0 * np.log10(np.mean(x.astype(np.float64) ** 2) / np.mean(noise ** 2))
+    assert abs(snr - 10.0) < 0.3
+    spec = np.abs(np.fft.rfft(noise)) ** 2
+    freqs = np.fft.rfftfreq(len(noise), 1.0 / 8000)
+    lo = np.mean(spec[(freqs >= 100) & (freqs < 500)])
+    hi = np.mean(spec[(freqs >= 2000) & (freqs < 3500)])
+    assert lo > 2.0 * hi
+
+
+def test_line_bed_darkens_mobile_profile():
+    from src import telephone
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(16000) * 0.1).astype(np.float32)
+
+    def centroid(y8):
+        spec = np.abs(np.fft.rfft(y8 * np.hanning(len(y8)))) ** 2
+        freqs = np.fft.rfftfreq(len(y8), 1.0 / 8000)
+        return float(np.sum(spec * freqs) / (np.sum(spec) + 1e-20))
+
+    common = dict(seed=1, use_ffmpeg=False, output_sr=8000,
+                  normalize_level=False, dropout_p=0.0)
+    dry = telephone.simulate_mobile(x, add_line_bed=False, **common)
+    wet = telephone.simulate_mobile(x, add_line_bed=True, **common)
+    assert centroid(wet) < centroid(dry)
+
+
+def test_gated_level_calibration():
+    from src import telephone
+    t = np.arange(16000) / 16000.0
+    x = (0.02 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    y = telephone.simulate_gated(
+        x, seed=0, normalize_level=True, target_rms_db=-21.2, output_sr=8000
+    )
+    assert abs(telephone.active_speech_rms_db(y) - (-21.2)) < 1.0
+
+
+def test_gate_silence_removes_low_level_pauses():
+    from src import telephone
+    t = np.arange(4000) / 8000.0
+    speech = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    noise = (0.0005 * np.random.default_rng(0).standard_normal(4000)).astype(np.float32)
+    x = np.concatenate([speech, noise])
+    y = telephone.gate_silence_8k(x)
+    assert float(np.max(np.abs(y[4000:]))) < 1e-4
+    assert float(np.sqrt(np.mean(y[:4000] ** 2))) > 0.05
+
+
+def test_gated_profile_gates_pauses():
+    from src import telephone
+    t = np.arange(8000) / 16000.0
+    speech = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    noise = (0.0005 * np.random.default_rng(0).standard_normal(8000)).astype(np.float32)
+    x = np.concatenate([speech, noise])
+    y = telephone.simulate_gated(x, seed=0, output_sr=8000)
+    # Allow the one 20 ms frame that straddles the speech/noise boundary.
+    assert float(np.max(np.abs(y[4160:]))) <= 8.0 / 32768.0 + 1e-9
