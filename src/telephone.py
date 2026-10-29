@@ -35,6 +35,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, Tuple, Union
 
@@ -75,6 +76,9 @@ PSTN_HUM_PROB = 0.10
 MOBILE_DROPOUT_P = 0.0015
 PSTN_DROPOUT_P = 0.0
 DROPOUT_FLOOR = 0.02
+AMR_NB_BITRATES = ("4.75k", "5.9k", "7.4k", "12.2k")
+_AMR_FALLBACK_WARNED = False
+_AMR_FALLBACK_COUNT = 0
 
 # Level/noise calibration fitted to the real noisy-line vs gated populations.
 MOBILE_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
@@ -95,6 +99,20 @@ MAX_NORMALIZE_GAIN_DB = 18.0
 
 def is_ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def _warn_amr_fallback(exc: BaseException) -> None:
+    """Count an AMR fallback and warn once per process."""
+    global _AMR_FALLBACK_WARNED, _AMR_FALLBACK_COUNT
+    _AMR_FALLBACK_COUNT += 1
+    if not _AMR_FALLBACK_WARNED:
+        _AMR_FALLBACK_WARNED = True
+        warnings.warn(
+            f"AMR-NB unavailable ({exc}); falling back to the A-law lite path. "
+            "Mobile training samples will lack AMR artifacts in this process.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -123,6 +141,8 @@ def _require_scipy() -> None:
 
 def _as_float32_mono(wav: Union[np.ndarray, Sequence[float]]) -> np.ndarray:
     arr = np.asarray(wav, dtype=np.float64).squeeze()
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.float32)
     if arr.ndim != 1:
         # Take first channel if accidentally stereo.
         arr = np.asarray(wav, dtype=np.float64)
@@ -595,8 +615,9 @@ def apply_dropouts(wav: np.ndarray, sr: int, p_frame: float,
 
 def apply_gain_and_clip(wav: np.ndarray, gain_db: float,
                         clip: float = 0.99) -> np.ndarray:
+    """Apply static gain plus soft saturation (not adaptive AGC)."""
     x = np.asarray(wav, dtype=np.float64) * (10.0 ** (gain_db / 20.0))
-    x = np.tanh(x)  # soft saturation like phone AGC
+    x = np.tanh(x)
     return np.clip(x, -clip, clip).astype(np.float32)
 
 
@@ -604,11 +625,12 @@ def apply_gain_and_clip(wav: np.ndarray, gain_db: float,
 # ffmpeg true-codec round-trip
 # ---------------------------------------------------------------------------
 
-def _ffmpeg_roundtrip_8k(wav8k: np.ndarray, mode: str) -> np.ndarray:
+def _ffmpeg_roundtrip_8k(wav8k: np.ndarray, mode: str,
+                         bitrate: str = "7.4k") -> np.ndarray:
     """Encode+decode 8 kHz audio through a real telephony codec.
 
-    mode="amr_nb" -> libopencore_amrnb @ 7.4k (MCI/Irancell cellular)
-    mode="alaw"   -> pcm_alaw (TCI PSTN / E1 A-law)
+    mode="amr_nb" -> libopencore_amrnb at ``bitrate`` (MCI/Irancell).
+    A-law storage is handled exactly in numpy, so it has no ffmpeg path.
     """
     if not _SOUNDFILE_AVAILABLE:
         raise RuntimeError("soundfile is required for ffmpeg codec round-trip.")
@@ -626,12 +648,8 @@ def _ffmpeg_roundtrip_8k(wav8k: np.ndarray, mode: str) -> np.ndarray:
             coded = td / "coded.amr"
             cmd_enc = ["ffmpeg", "-y", "-v", "error",
                        "-i", str(in_wav), "-ar", "8000", "-ac", "1",
-                       "-c:a", "libopencore_amrnb", "-b:a", "7.4k", str(coded)]
-        elif mode == "alaw":
-            coded = td / "coded_alaw.wav"
-            cmd_enc = ["ffmpeg", "-y", "-v", "error",
-                       "-i", str(in_wav), "-ar", "8000", "-ac", "1",
-                       "-c:a", "pcm_alaw", str(coded)]
+                       "-c:a", "libopencore_amrnb", "-b:a", str(bitrate),
+                       str(coded)]
         else:
             raise ValueError(f"Unknown codec mode: {mode}")
 
@@ -704,6 +722,7 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
                     sr: int = TARGET_SR,
                     seed: Optional[int] = None,
                     use_ffmpeg: bool = True,
+                    amr_bitrate: str = "7.4k",
                     snr_db_range: Tuple[float, float] = MOBILE_SNR_DB_RANGE,
                     dropout_p: float = MOBILE_DROPOUT_P,
                     gain_db_range: Tuple[float, float] = (-1.0, 1.0),
@@ -720,13 +739,15 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     acoustic noise and gain are applied *before* the codec (as in a real
     handset), dropouts after it (network loss), a post-codec line-noise bed
     restores the low-frequency rumble, and a final G.711 A-law round-trip
-    matches the recorder's 8-bit storage format.
+    matches the recorder's 8-bit storage format.  The real corpus is stored
+    as A-law, so its AMR mode is not directly observable; ``amr_bitrate``
+    defaults to the conservative 7.4k and can be varied for diversity.
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_mobile expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
-    target_len = len(np.asarray(waveform).reshape(-1))
     x = _as_float32_mono(waveform)
+    target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
     x8 = bandpass_narrowband(x8)
@@ -745,8 +766,9 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
 
     if use_ffmpeg:
         try:
-            x8 = _ffmpeg_roundtrip_8k(x8, "amr_nb")
-        except Exception:
+            x8 = _ffmpeg_roundtrip_8k(x8, "amr_nb", bitrate=amr_bitrate)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            _warn_amr_fallback(exc)
             x8 = alaw_quantize(x8)
     else:
         x8 = alaw_quantize(x8)
@@ -783,12 +805,14 @@ def simulate_pstn(waveform: Union[np.ndarray, Sequence[float]],
     Noise/hum/gain happen before the A-law codec; the final round-trip is the
     recorder's 8-bit storage format.  Hum is now a rare, low-level condition
     (real 50 Hz prominence is ~0.2 dB, not the ~10 dB in the old default).
+    ``use_ffmpeg`` is accepted for API symmetry; A-law storage is exact in
+    numpy and does not need an external codec.
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_pstn expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
-    target_len = len(np.asarray(waveform).reshape(-1))
     x = _as_float32_mono(waveform)
+    target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
     x8 = bandpass_narrowband(x8)
@@ -849,8 +873,8 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
     if sr != TARGET_SR:
         raise ValueError(f"simulate_gated expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
-    target_len = len(np.asarray(waveform).reshape(-1))
     x = _as_float32_mono(waveform)
+    target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
     x8 = bandpass_narrowband(
@@ -879,11 +903,13 @@ def simulate_telephone(waveform: Union[np.ndarray, Sequence[float]],
                        profile: str = "mobile",
                        seed: Optional[int] = None,
                        use_ffmpeg: bool = True,
+                       amr_bitrate: str = "7.4k",
                        output_sr: int = TARGET_SR,
                        normalize_level: bool = True,
                        target_rms_db: Optional[float] = None) -> np.ndarray:
     if profile == "mobile":
         return simulate_mobile(waveform, sr=sr, seed=seed, use_ffmpeg=use_ffmpeg,
+                               amr_bitrate=amr_bitrate,
                                output_sr=output_sr, normalize_level=normalize_level,
                                target_rms_db=target_rms_db)
     if profile == "pstn":

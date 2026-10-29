@@ -127,6 +127,63 @@ def test_pstn_lite_runs_and_differs_from_mobile():
     assert not np.allclose(m, p)
 
 
+def test_as_float32_mono_handles_empty():
+    from src import telephone
+    y = telephone._as_float32_mono(np.array([], dtype=np.float32))
+    assert y.size == 0
+    assert y.dtype == np.float32
+
+
+@requires_scipy
+def test_simulate_profiles_keep_stereo_input_length():
+    from src import telephone
+    t = np.arange(1600, dtype=np.float64) / 16000.0
+    mono = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    stereo = np.stack([mono, mono], axis=1)
+    for fn in (telephone.simulate_gated, telephone.simulate_mobile, telephone.simulate_pstn):
+        y = fn(stereo, seed=0, use_ffmpeg=False)
+        assert len(y) == len(mono), fn.__name__
+
+
+@requires_scipy
+def test_amr_fallback_warns_once_and_counts(monkeypatch):
+    import warnings
+    from src import telephone
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("libopencore_amrnb missing")
+
+    monkeypatch.setattr(telephone, "_ffmpeg_roundtrip_8k", boom)
+    telephone._AMR_FALLBACK_WARNED = False
+    telephone._AMR_FALLBACK_COUNT = 0
+    x = _sine_mix(dur=0.2)
+    with pytest.warns(RuntimeWarning, match="AMR-NB"):
+        telephone.simulate_mobile(x, seed=0, use_ffmpeg=True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        telephone.simulate_mobile(x, seed=1, use_ffmpeg=True)
+    assert not caught
+    assert telephone._AMR_FALLBACK_COUNT == 2
+
+
+@requires_scipy
+def test_simulate_mobile_passes_amr_bitrate(monkeypatch):
+    from src import telephone
+    seen = []
+
+    def fake(wav, mode, bitrate="7.4k"):
+        seen.append((mode, bitrate))
+        return wav
+
+    monkeypatch.setattr(telephone, "_ffmpeg_roundtrip_8k", fake)
+    x = _sine_mix(dur=0.2)
+    telephone.simulate_mobile(
+        x, seed=0, use_ffmpeg=True, amr_bitrate="12.2k"
+    )
+    assert seen
+    assert seen[0] == ("amr_nb", "12.2k")
+
+
 def test_alaw_quantize_bounds():
     rng = np.random.default_rng(0)
     x = (rng.standard_normal(16000) * 0.3).astype(np.float32)
