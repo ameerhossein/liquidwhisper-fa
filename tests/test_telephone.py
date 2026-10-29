@@ -55,6 +55,29 @@ def test_resample_roundtrip_length():
 
 
 @requires_scipy
+def test_low_shelf_boosts_low_frequencies():
+    from src import telephone
+
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (
+        0.1 * np.sin(2 * np.pi * 300.0 * t)
+        + 0.1 * np.sin(2 * np.pi * 2000.0 * t)
+    ).astype(np.float32)
+    y = telephone.apply_low_shelf(x, sr=sr, gain_db=4.0, corner_hz=500.0)
+
+    def tone_amp(wav, f0, bw=20.0):
+        spec = np.abs(np.fft.rfft(wav * np.hanning(len(wav))))
+        freqs = np.fft.rfftfreq(len(wav), 1.0 / sr)
+        m = (freqs >= f0 - bw) & (freqs <= f0 + bw)
+        return float(np.max(spec[m]) + 1e-20)
+
+    before = 20.0 * np.log10(tone_amp(x, 300.0) / tone_amp(x, 2000.0))
+    after = 20.0 * np.log10(tone_amp(y, 300.0) / tone_amp(y, 2000.0))
+    assert after - before > 2.5
+
+
+@requires_scipy
 def test_bandpass_suppresses_high_freq():
     sr = 16000
     dur = 1.5
@@ -365,6 +388,43 @@ def test_gated_level_calibration():
         x, seed=0, normalize_level=True, target_rms_db=-21.2, output_sr=8000
     )
     assert abs(telephone.active_speech_rms_db(y) - (-21.2)) < 1.0
+
+
+@requires_scipy
+def test_gated_profile_preserves_speech_band_highs():
+    """The gated profile must keep the 1-3 kHz plateau, not a 350-900 cliff."""
+    import inspect
+    from src import telephone
+
+    params = inspect.signature(telephone.simulate_gated).parameters
+    assert params["band_low_hz"].default <= 300.0
+    assert params["band_high_hz"].default >= 3400.0
+
+    t = np.arange(16000, dtype=np.float64) / 16000.0
+    x = (
+        0.1 * np.sin(2 * np.pi * 500.0 * t)
+        + 0.1 * np.sin(2 * np.pi * 1500.0 * t)
+        + 0.1 * np.sin(2 * np.pi * 2500.0 * t)
+    ).astype(np.float32)
+    y = telephone.simulate_gated(
+        x,
+        seed=0,
+        use_ffmpeg=False,
+        output_sr=8000,
+        normalize_level=False,
+        gate_silence=False,
+        gain_db_range=(0.0, 0.0),
+    )
+
+    def tone_amp(wav, sr, f0, bw=30.0):
+        spec = np.abs(np.fft.rfft(wav * np.hanning(len(wav))))
+        freqs = np.fft.rfftfreq(len(wav), 1.0 / sr)
+        m = (freqs >= f0 - bw) & (freqs <= f0 + bw)
+        return float(np.max(spec[m]) + 1e-20)
+
+    ref = tone_amp(y, 8000, 500.0)
+    assert tone_amp(y, 8000, 1500.0) / ref > 0.2
+    assert tone_amp(y, 8000, 2500.0) / ref > 0.2
 
 
 def test_gate_silence_removes_low_level_pauses():

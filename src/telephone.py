@@ -160,6 +160,36 @@ def bandpass_narrowband(wav8k: np.ndarray, sr: int = PHONE_SR,
     return _ssignal.sosfilt(sos, np.asarray(wav8k, dtype=np.float32)).astype(np.float32)
 
 
+def apply_low_shelf(wav8k: np.ndarray, sr: int = PHONE_SR,
+                    gain_db: float = 4.0, corner_hz: float = 500.0,
+                    q: float = 0.70710678) -> np.ndarray:
+    """Apply a gentle RBJ low-shelf to restore handset low-frequency weight.
+
+    This is a static equaliser, not an AGC.  A small shelf keeps the gated
+    profile from sounding thin after the 300-3400 Hz band-pass without
+    reproducing the corpus's +20 dB 400-500 Hz resonance.
+    """
+    _require_scipy()
+    x = np.asarray(wav8k, dtype=np.float32)
+    if len(x) == 0 or abs(float(gain_db)) < 1e-9:
+        return x.copy()
+    a = 10.0 ** (float(gain_db) / 40.0)
+    w0 = 2.0 * np.pi * float(np.clip(corner_hz, 1.0, sr * 0.45)) / float(sr)
+    cos_w0 = float(np.cos(w0))
+    sin_w0 = float(np.sin(w0))
+    alpha = sin_w0 / (2.0 * float(q))
+    sqrt_a = float(np.sqrt(a))
+    b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha)
+    b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0)
+    b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha)
+    a0 = (a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha
+    a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0)
+    a2 = (a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha
+    sos = np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]],
+                   dtype=np.float64)
+    return _ssignal.sosfilt(sos, x).astype(np.float32)
+
+
 # --- G.711 A-law lite approximation ----------------------------------------
 
 _A = 87.6
@@ -655,8 +685,10 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
                    seed: Optional[int] = None,
                    use_ffmpeg: bool = True,
                    gain_db_range: Tuple[float, float] = (-1.0, 1.0),
-                   band_low_hz: float = 350.0,
-                   band_high_hz: float = 900.0,
+                   band_low_hz: float = 300.0,
+                   band_high_hz: float = 3400.0,
+                   low_shelf_db: float = 4.0,
+                   low_shelf_hz: float = 500.0,
                    output_sr: int = TARGET_SR,
                    normalize_level: bool = True,
                    target_rms_db: Optional[float] = None,
@@ -665,10 +697,13 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
     """Simulate a clean/gated landline recording.
 
     This is the dominant real-call population: no added line noise or hum,
-    a darker handset response (350-900 Hz), A-law digital silence between
-    utterances, and active speech normalised to the real gated level range.
-    ``use_ffmpeg`` is accepted for API symmetry; A-law storage is exact and
-    does not need an external codec.
+    a standard 300-3400 Hz telephone band with a gentle low-frequency shelf,
+    A-law digital silence between utterances, and active speech normalised
+    to the real gated level range.  The shelf is deliberately modest: the
+    real corpus has a strong 400-500 Hz peak, but that peak is partly
+    source/F0 dependent, so matching it blindly hurts intelligibility and
+    overfits the corpus.  ``use_ffmpeg`` is accepted for API symmetry;
+    A-law storage is exact and does not need an external codec.
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_gated expects {TARGET_SR} Hz input, got {sr}.")
@@ -679,6 +714,9 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
     x8 = resample_16k_to_8k(x)
     x8 = bandpass_narrowband(
         x8, PHONE_SR, low=band_low_hz, high=band_high_hz, order=5
+    )
+    x8 = apply_low_shelf(
+        x8, PHONE_SR, gain_db=low_shelf_db, corner_hz=low_shelf_hz
     )
     x8 = calibrate_active_rms(
         x8, GATED_TARGET_RMS_DB_RANGE, rng,
