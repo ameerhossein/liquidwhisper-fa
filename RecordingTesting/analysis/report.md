@@ -565,5 +565,108 @@ come from one reproducible run.
 - Phone eval now reports per-profile WER (gated / mobile / PSTN) and a
   70/15/15 weighted average alongside the unweighted phone pass.
 
-Full offline suite after the change: **71 passed, 6 skipped** (optional
-torch/fastapi/datasets dependencies absent).
+Full suite in the repo `.venv` (torch/transformers/datasets/fastapi/httpx
+installed): **77 passed, 0 skipped**.
+
+---
+
+## 2026-10-30 follow-up: paired real-vs-simulated WER smoke test
+
+A true **real-gated** WER is not computable from this repo: the 77 real gated
+call-center recordings have no transcripts in the repo and no clean source counterparts.
+The six `FakePhoneCalls` files do support a paired real-channel test for
+mobile and PSTN. Each is a real MCI/Irancell or TCI recording of a known
+Neyshekar **train**-split clip, so the gold text and clean source are both
+available.
+
+Method:
+
+- Three source sentences (3.12 s, 8.70 s, 5.04 s), six real recordings
+  (mobile + PSTN for each sentence).
+- Conditions: clean source, real mobile/PSTN, simulated gated/mobile/PSTN
+  with two seeds per sentence.
+- All ASR inputs are matched to **−26 dBFS active speech**. Without this, one
+  real mobile call was 12 dB above its simulated counterpart and WER measured
+  level as much as channel.
+- `BuzzASR/persian` zero-shot, CPU BF16. WER is reported with the
+  ZWNJ→space diagnostic normalization so orthography does not masquerade as
+  channel error; the repo-standard normalized WER is also saved.
+- The source clips are train-split, so absolute WER is **not** a held-out
+  benchmark. Use the paired real-vs-simulated deltas.
+- n=3 sentences, 6 real recordings, 18 simulated outputs. This is a
+  descriptive smoke test, not a benchmark.
+
+Reproduce:
+
+```bash
+.venv/bin/python RecordingTesting/analysis/smoke_wer.py \
+  --model /home/ameer/Hobbies/livebuzzasr/models/buzzasr-persian \
+  --dtype bfloat16 --threads 8 --seeds 1 2 \
+  --output-dir results/telephone_smoke_wer
+```
+
+On a fresh machine, use `--model BuzzASR/persian`; the weights are about
+3.1 GB. Results are also in `results/telephone_smoke_wer/summary.md` and
+`predictions.csv`.
+
+| condition | n | clips | corpus WER | corpus WER (ZWNJ→space) | clip WER (ZWNJ→space) | corpus CER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| clean | 3 | 3 | 14.29% | 17.65% | 12.11% | 6.75% |
+| real mobile | 3 | 3 | 53.57% | 55.88% | 55.79% | 22.70% |
+| simulated mobile | 6 | 3 | 42.86% | 39.71% | 38.07% | 20.25% |
+| real PSTN | 3 | 3 | 32.14% | 32.35% | 28.77% | 13.50% |
+| simulated PSTN | 6 | 3 | 28.57% | 26.47% | 27.02% | 12.58% |
+| simulated gated | 6 | 3 | 21.43% | 23.53% | 23.68% | 6.13% |
+
+Per-sentence mean clip WER (ZWNJ→space), averaged over seeds:
+
+| condition | `clip0_id1` | `clip0_id7` | `clip0_id0` | mean |
+| --- | ---: | ---: | ---: | ---: |
+| clean | 0.0 | 26.3 | 10.0 | 12.1 |
+| real mobile | 40.0 | 47.4 | 80.0 | 55.8 |
+| simulated mobile | 20.0 | 34.2 | 60.0 | 38.1 |
+| real PSTN | 0.0 | 26.3 | 60.0 | 28.8 |
+| simulated PSTN | 20.0 | 21.1 | 40.0 | 27.0 |
+| simulated gated | 20.0 | 21.1 | 30.0 | 23.7 |
+
+Findings:
+
+- **PSTN is close.** Simulated PSTN is −1.75 pp mean clip WER versus real
+  TCI (−5.88 pp corpus). The per-sentence deltas are mixed (+20.0, −5.3,
+  −20.0 pp), so treat the close mean as encouraging rather than exact.
+- **Mobile is optimistic.** Simulated mobile is easier than the real
+  MCI/Irancell recordings on **all three** sentences (−20.0, −13.2, −20.0 pp;
+  mean −17.7 pp, corpus −16.2 pp). The current 7.4 k AMR + noise + dropout
+  profile does not reproduce the full difficulty of these real calls.
+  Plausible causes include a lower/variable AMR rate, packet loss/tandem
+  codecs, handset/environment noise, and model familiarity with the train
+  clips. Do **not** retune the simulator on three sentences; this is a
+  direction for a larger paired set.
+- **Gated adds about 12 pp** mean clip WER over clean (23.7% vs 12.1%), with
+  mixed per-sentence deltas (+20.0, −5.3, +20.0 pp). There is no real-gated
+  WER counterpart.
+- The clean condition is already at 12.1% mean clip WER (14.3% corpus) on
+  train-split clips, so absolute WER is pessimistic even before telephony.
+  The model is not perfect on these sentences, and the paired deltas are the
+  useful quantity.
+
+### Listening pass
+
+```bash
+.venv/bin/python RecordingTesting/analysis/make_listening_kit.py
+```
+
+Output: `results/telephone_listening_kit/index.html`.
+
+- Three paired same-sentence cards: clean, real mobile/PSTN, simulated
+  mobile/PSTN/gated. All are level-matched to −26 dBFS active speech.
+- Six real gated call-center excerpts and six simulated gated clips from
+  distinct speakers. These are **not paired**; judge gating, noise floor and
+  bandlimit only.
+- The listening pass is subjective and needs a Persian listener; the WER
+  table above is the objective channel check.
+
+The smoke test is deliberately small. A larger real-channel set, or human
+transcripts for the 77 real gated calls, is the right next step before a long
+fine-tune. `smoke_wer.py` accepts `--real-gated-manifest` for a JSON mapping
+of recording path to transcript if those transcripts become available.
