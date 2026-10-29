@@ -34,3 +34,9 @@ hf_cache/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Local telephone-analysis inputs and large generated tables.
+# Raw call recordings are kept out of git; the report and per-file metrics
+# are committed so the comparison can be reviewed without the audio.
+RecordingTesting/telephone_clips/
+RecordingTesting/analysis/features_segments.csv
