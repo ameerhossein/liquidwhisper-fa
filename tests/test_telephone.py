@@ -328,6 +328,109 @@ def test_add_colored_noise_hits_target_snr():
     assert abs(snr - 10.0) < 0.2
 
 
+@requires_scipy
+def test_active_band_rms_rejects_out_of_band():
+    from src import telephone
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (
+        0.1 * np.sin(2 * np.pi * 1000.0 * t)
+        + 0.1 * np.sin(2 * np.pi * 3800.0 * t)
+    ).astype(np.float32)
+    full = telephone.active_speech_rms_db(x)
+    band = telephone.active_band_rms_db(x)
+    assert band < full - 1.5
+
+
+@requires_scipy
+def test_add_colored_noise_uses_active_inband_snr():
+    from src import telephone
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    speech = (0.1 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+
+    def measure(x, y):
+        noise = y.astype(np.float64) - x.astype(np.float64)
+        sp = 10.0 ** (telephone.active_band_rms_db(x) / 10.0)
+        npow = 10.0 ** (telephone.active_band_rms_db(noise) / 10.0)
+        return 10.0 * np.log10(sp / (npow + 1e-20))
+
+    x1 = np.concatenate([speech, np.zeros(sr, dtype=np.float32)])
+    x2 = np.concatenate([speech, np.zeros(3 * sr, dtype=np.float32)])
+    y1 = telephone.add_colored_noise_at_snr(
+        x1, 20.0, np.random.default_rng(0), color="pink",
+        active=True, band_limit=True,
+    )
+    y2 = telephone.add_colored_noise_at_snr(
+        x2, 20.0, np.random.default_rng(0), color="pink",
+        active=True, band_limit=True,
+    )
+    snr1 = measure(x1, y1)
+    snr2 = measure(x2, y2)
+    assert abs(snr1 - 20.0) < 1.5
+    assert abs(snr1 - snr2) < 1.0
+
+
+@requires_scipy
+def test_add_colored_noise_has_slow_level_variation():
+    from src import telephone
+    sr = 8000
+    t = np.arange(4 * sr, dtype=np.float64) / sr
+    x = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    y = telephone.add_colored_noise_at_snr(
+        x, 10.0, np.random.default_rng(1), color="pink",
+        active=True, band_limit=True, modulation_db=3.0,
+    )
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    n = len(noise) // 800
+    frames = noise[:n * 800].reshape(n, 800)
+    levels = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    variation = float(np.percentile(levels, 90) - np.percentile(levels, 10))
+    assert variation > 2.5
+
+
+@requires_scipy
+def test_add_noise_bed_line_shape_matches_real():
+    from src import telephone
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    y = telephone.add_noise_bed(
+        x, 10.0, np.random.default_rng(0), color="line",
+        rumble_mix=0.55, white_mix=0.0, active=True,
+    )
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    spec = np.abs(np.fft.rfft(noise)) ** 2
+    freqs = np.fft.rfftfreq(len(noise), 1.0 / sr)
+    lo = np.sum(spec[freqs < 500.0])
+    hi = np.sum(spec[freqs >= 500.0])
+    ratio = lo / (hi + 1e-20)
+    m = (freqs >= 100.0) & (freqs <= 3500.0)
+    slope = np.polyfit(
+        np.log10(freqs[m] + 1.0), 10.0 * np.log10(spec[m] + 1e-20), 1
+    )[0]
+    assert 3.0 < ratio < 9.0
+    assert -12.0 < slope < -6.0
+
+
+@requires_scipy
+def test_add_noise_bed_has_slow_level_variation():
+    from src import telephone
+    sr = 8000
+    t = np.arange(4 * sr, dtype=np.float64) / sr
+    x = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    y = telephone.add_noise_bed(
+        x, 10.0, np.random.default_rng(1), color="line",
+        rumble_mix=0.55, white_mix=0.0, active=True, modulation_db=3.0,
+    )
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    n = len(noise) // 800
+    frames = noise[:n * 800].reshape(n, 800)
+    levels = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    variation = float(np.percentile(levels, 90) - np.percentile(levels, 10))
+    assert variation > 2.5
+
+
 def test_data_pipeline_default_profiles_include_gated():
     from src.data import PersianASRDataPipeline
     pipe = PersianASRDataPipeline(processor=None)
@@ -427,23 +530,53 @@ def test_gated_profile_preserves_speech_band_highs():
     assert tone_amp(y, 8000, 2500.0) / ref > 0.2
 
 
-def test_gate_silence_removes_low_level_pauses():
+def test_gate_silence_removes_low_level_pauses_without_hangover():
     from src import telephone
     t = np.arange(4000) / 8000.0
     speech = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
     noise = (0.0005 * np.random.default_rng(0).standard_normal(4000)).astype(np.float32)
     x = np.concatenate([speech, noise])
-    y = telephone.gate_silence_8k(x)
+    y = telephone.gate_silence_8k(x, hangover_ms=0.0, fade_ms=0.0)
     assert float(np.max(np.abs(y[4000:]))) < 1e-4
     assert float(np.sqrt(np.mean(y[:4000] ** 2))) > 0.05
 
 
+def test_gate_silence_hangover_preserves_tails_with_fade():
+    from src import telephone
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    speech = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    # -50 dBFS tail, below a -25 dB gate threshold, but still audible as a
+    # word ending.  It must survive the 150 ms hangover and then fade out.
+    tail = np.full(sr // 2, 0.003, dtype=np.float32)
+    y = telephone.gate_silence_8k(
+        np.concatenate([speech, tail]),
+        relative_db=-25.0,
+        hangover_ms=150.0,
+        fade_ms=5.0,
+    )
+    assert float(np.max(np.abs(y[sr:sr + 1100]))) > 1e-4
+    assert float(np.max(np.abs(y[sr + 1300:]))) < 1e-4
+    # The old hard gate jumped from 0.003 to 0 in one sample.  A 5 ms fade
+    # keeps the largest sample-to-sample step well below that.
+    assert float(np.max(np.abs(np.diff(y[sr + 1100:sr + 1300])))) < 1e-3
+
+
 def test_gated_profile_gates_pauses():
     from src import telephone
+    import inspect
+
+    params = inspect.signature(telephone.simulate_gated).parameters
+    assert params["gate_relative_db"].default >= -38.0
+    assert params["gate_hangover_ms"].default >= 100.0
+    assert params["gate_fade_ms"].default > 0.0
+
     t = np.arange(8000) / 16000.0
     speech = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
     noise = (0.0005 * np.random.default_rng(0).standard_normal(8000)).astype(np.float32)
     x = np.concatenate([speech, noise])
     y = telephone.simulate_gated(x, seed=0, output_sr=8000)
-    # Allow the one 20 ms frame that straddles the speech/noise boundary.
-    assert float(np.max(np.abs(y[4160:]))) <= 8.0 / 32768.0 + 1e-9
+    # Speech ends at 4000 samples (8 kHz).  The 150 ms hangover rounds to
+    # 8 frames (160 ms), and the 5 ms fade follows it; require silence after
+    # that boundary.
+    assert float(np.max(np.abs(y[5440:]))) <= 8.0 / 32768.0 + 1e-9

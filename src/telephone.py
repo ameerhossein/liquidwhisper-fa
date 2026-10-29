@@ -68,8 +68,8 @@ DEFAULT_PROFILES = ("gated", "mobile", "pstn")
 DEFAULT_PROFILE_WEIGHTS = {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
 
 # Calibrated against the 2026-10-22 call corpus (see RecordingTesting/analysis).
-MOBILE_SNR_DB_RANGE = (15.0, 30.0)
-PSTN_SNR_DB_RANGE = (20.0, 35.0)
+MOBILE_SNR_DB_RANGE = (18.0, 33.0)
+PSTN_SNR_DB_RANGE = (19.5, 34.5)
 PSTN_HUM_DB_RANGE = (-60.0, -45.0)
 PSTN_HUM_PROB = 0.10
 MOBILE_DROPOUT_P = 0.0015
@@ -80,9 +80,12 @@ DROPOUT_FLOOR = 0.02
 MOBILE_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
 PSTN_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
 GATED_TARGET_RMS_DB_RANGE = (-25.9, -17.8)
-MOBILE_BED_SNR_DB_RANGE = (18.0, 20.0)
-PSTN_BED_SNR_DB_RANGE = (15.0, 17.0)
-NOISE_BED_WHITE_MIX = 0.12
+# Bed ranges are deliberately wider than the fitted median for training
+# diversity; the medians remain the corpus-calibrated 21 / 19 dB.
+MOBILE_BED_SNR_DB_RANGE = (17.0, 25.0)
+PSTN_BED_SNR_DB_RANGE = (15.0, 23.0)
+NOISE_BED_WHITE_MIX = 0.0
+NOISE_BED_RUMBLE_MIX = 0.55
 MAX_NORMALIZE_GAIN_DB = 18.0
 
 
@@ -307,8 +310,14 @@ def colored_noise(n: int, sr: int = PHONE_SR,
         shape = 1.0 / np.sqrt(np.maximum(freqs, 1.0))
     elif color in ("brown", "red"):
         shape = 1.0 / np.maximum(freqs, 1.0)
+    elif color == "line":
+        # Measured real line noise is about -8.6 dB/decade in power, i.e.
+        # amplitude ~ f**-0.43.  Drop the sub-50 Hz rumble here; the bed adds
+        # it back as a separate low-frequency component.
+        shape = (np.maximum(freqs, 1.0) / 100.0) ** -0.43
+        shape[freqs < 50.0] = 0.0
     else:
-        raise ValueError(f"Unknown noise color '{color}' (expected white/pink/brown).")
+        raise ValueError(f"Unknown noise color '{color}' (expected white/pink/brown/line).")
     shape[0] = 0.0  # remove DC
     noise = np.fft.irfft(spec * shape, n=n)
     rms = float(np.sqrt(np.mean(noise ** 2))) + 1e-12
@@ -317,13 +326,40 @@ def colored_noise(n: int, sr: int = PHONE_SR,
 
 def add_colored_noise_at_snr(wav: np.ndarray, snr_db: float,
                              rng: np.random.Generator,
-                             color: str = "pink") -> np.ndarray:
-    """Add unit-RMS coloured noise at a target SNR to 8 kHz audio."""
+                             color: str = "pink",
+                             active: bool = False,
+                             band_limit: bool = False,
+                             band: Tuple[float, float] = (BAND_LOW, BAND_HIGH),
+                             modulation_db: float = 0.0,
+                             modulation_hz_range: Tuple[float, float] = (0.2, 1.5)) -> np.ndarray:
+    """Add coloured noise at a target SNR to 8 kHz audio.
+
+    ``active=True`` measures speech power on active frames instead of the
+    whole clip, so leading/trailing silence no longer changes the effective
+    SNR.  ``band_limit=True`` filters both the reference measurement and the
+    noise to the telephone band, making ``snr_db`` an in-band SNR.
+    """
     x = np.asarray(wav, dtype=np.float64)
-    sig_power = float(np.mean(x ** 2)) + 1e-12
-    noise = colored_noise(len(x), PHONE_SR, rng, color=color).astype(np.float64)
     if not np.isfinite(snr_db):
         return x.astype(np.float32)
+    if active:
+        sig_db = (active_band_rms_db(x, *band) if band_limit
+                  else active_speech_rms_db(x))
+        sig_power = 10.0 ** (sig_db / 10.0)
+    else:
+        sig_power = float(np.mean(x ** 2)) + 1e-12
+    noise = colored_noise(len(x), PHONE_SR, rng, color=color).astype(np.float64)
+    if band_limit:
+        noise = bandpass_narrowband(
+            noise.astype(np.float32), PHONE_SR, low=band[0], high=band[1]
+        ).astype(np.float64)
+    if modulation_db > 0 and len(x) > PHONE_SR:
+        mod_hz = float(rng.uniform(modulation_hz_range[0], modulation_hz_range[1]))
+        phase = float(rng.uniform(0.0, 2.0 * np.pi))
+        t = np.arange(len(x), dtype=np.float64) / float(PHONE_SR)
+        envelope_db = float(modulation_db) * np.sin(2.0 * np.pi * mod_hz * t + phase)
+        noise *= 10.0 ** (envelope_db / 20.0)
+        noise /= np.sqrt(np.mean(noise ** 2)) + 1e-12
     target_power = sig_power / (10.0 ** (snr_db / 10.0))
     noise_power = float(np.mean(noise ** 2)) + 1e-12
     noise *= np.sqrt(target_power / noise_power)
@@ -332,30 +368,68 @@ def add_colored_noise_at_snr(wav: np.ndarray, snr_db: float,
 
 def add_noise_bed(wav: np.ndarray, snr_db: float,
                   rng: np.random.Generator,
-                  color: str = "brown",
-                  white_mix: float = NOISE_BED_WHITE_MIX) -> np.ndarray:
-    """Add a post-codec line-noise bed (brown + a little white).
+                  color: str = "line",
+                  white_mix: float = NOISE_BED_WHITE_MIX,
+                  rumble_mix: float = NOISE_BED_RUMBLE_MIX,
+                  active: bool = True,
+                  modulation_db: float = 3.0,
+                  modulation_hz_range: Tuple[float, float] = (0.2, 1.5)) -> np.ndarray:
+    """Add a post-codec line-noise bed with real-corpus spectral shape.
 
-    The real noisy-line recordings keep substantial <500 Hz rumble that an
-    AMR-NB codec would otherwise remove.  This bed restores that low-frequency
-    balance and a small high-frequency hiss while staying on the A-law grid
-    after the caller applies the final quantizer.
+    The bed is a low-frequency rumble layer, not the primary in-band noise
+    source.  ``snr_db`` is measured against active speech power when
+    ``active=True``; the pre-codec noise stage is what sets the in-band SNR.
+    ``rumble_mix`` blends a 30-120 Hz brown component back in so the bed
+    keeps the real corpus's low-frequency weight without the old 1/f**2
+    cliff.
     """
     x = np.asarray(wav, dtype=np.float64)
     if not np.isfinite(snr_db):
         return x.astype(np.float32)
     noise = colored_noise(len(x), PHONE_SR, rng, color=color).astype(np.float64)
+    rumble_mix = float(np.clip(rumble_mix, 0.0, 1.0))
+    if rumble_mix > 0:
+        rumble = colored_noise(len(x), PHONE_SR, rng, color="brown").astype(np.float64)
+        rumble = bandpass_narrowband(
+            rumble.astype(np.float32), PHONE_SR, low=30.0, high=120.0
+        ).astype(np.float64)
+        rumble /= np.sqrt(np.mean(rumble ** 2)) + 1e-12
+        noise = (1.0 - rumble_mix) * noise + rumble_mix * rumble
+    noise = noise / (np.sqrt(np.mean(noise ** 2)) + 1e-12)
     white_mix = float(np.clip(white_mix, 0.0, 1.0))
     if white_mix > 0:
         white = rng.standard_normal(len(x))
         white /= np.sqrt(np.mean(white ** 2)) + 1e-12
         noise = (1.0 - white_mix) * noise + white_mix * white
         noise /= np.sqrt(np.mean(noise ** 2)) + 1e-12
-    sig_power = float(np.mean(x ** 2)) + 1e-12
+    if modulation_db > 0 and len(x) > PHONE_SR:
+        mod_hz = float(rng.uniform(modulation_hz_range[0], modulation_hz_range[1]))
+        phase = float(rng.uniform(0.0, 2.0 * np.pi))
+        t = np.arange(len(x), dtype=np.float64) / float(PHONE_SR)
+        envelope_db = float(modulation_db) * np.sin(2.0 * np.pi * mod_hz * t + phase)
+        noise *= 10.0 ** (envelope_db / 20.0)
+        noise /= np.sqrt(np.mean(noise ** 2)) + 1e-12
+    if active:
+        sig_power = 10.0 ** (active_speech_rms_db(x) / 10.0)
+    else:
+        sig_power = float(np.mean(x ** 2)) + 1e-12
     target_power = sig_power / (10.0 ** (snr_db / 10.0))
     noise_power = float(np.mean(noise ** 2)) + 1e-12
     noise *= np.sqrt(target_power / noise_power)
     return (x + noise).astype(np.float32)
+
+
+def _active_frame_energy_db(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return 20 ms frame energies and the relative-VAD active mask."""
+    n = len(x) // FRAME_LEN
+    if n == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=bool)
+    frames = x[:n * FRAME_LEN].reshape(n, FRAME_LEN)
+    energy = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    noise_floor = float(np.percentile(energy, 10))
+    speech_level = float(np.percentile(energy, 95))
+    threshold = max(noise_floor + 7.0, speech_level - 30.0)
+    return energy, energy > threshold
 
 
 def active_speech_rms_db(wav8k: Union[np.ndarray, Sequence[float]]) -> float:
@@ -363,16 +437,34 @@ def active_speech_rms_db(wav8k: Union[np.ndarray, Sequence[float]]) -> float:
     x = np.asarray(wav8k, dtype=np.float64).reshape(-1)
     if len(x) < FRAME_LEN:
         return 10.0 * np.log10(float(np.mean(x ** 2)) + 1e-20)
-    n = len(x) // FRAME_LEN
-    frames = x[:n * FRAME_LEN].reshape(n, FRAME_LEN)
-    energy = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
-    noise_floor = float(np.percentile(energy, 10))
-    speech_level = float(np.percentile(energy, 95))
-    threshold = max(noise_floor + 7.0, speech_level - 30.0)
-    active = energy > threshold
+    energy, active = _active_frame_energy_db(x)
     if not np.any(active):
         return 10.0 * np.log10(float(np.mean(x ** 2)) + 1e-20)
     return float(np.median(energy[active]))
+
+
+def active_band_rms_db(wav8k: Union[np.ndarray, Sequence[float]],
+                       low: float = BAND_LOW,
+                       high: float = BAND_HIGH) -> float:
+    """Median active-frame RMS in the telephone speech band (dBFS).
+
+    The VAD mask comes from the full-band signal, so a loud out-of-band
+    component does not make the in-band level look higher than it is.
+    """
+    _require_scipy()
+    x = np.asarray(wav8k, dtype=np.float64).reshape(-1)
+    band = bandpass_narrowband(
+        x.astype(np.float32), PHONE_SR, low=low, high=high
+    ).astype(np.float64)
+    if len(x) < FRAME_LEN:
+        return 10.0 * np.log10(float(np.mean(band ** 2)) + 1e-20)
+    _, active = _active_frame_energy_db(x)
+    n = len(band) // FRAME_LEN
+    frames = band[:n * FRAME_LEN].reshape(n, FRAME_LEN)
+    energy = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    if not np.any(active):
+        return 10.0 * np.log10(float(np.mean(band ** 2)) + 1e-20)
+    return float(np.median(energy[active[:n]]))
 
 
 def calibrate_active_rms(wav8k: Union[np.ndarray, Sequence[float]],
@@ -393,12 +485,15 @@ def calibrate_active_rms(wav8k: Union[np.ndarray, Sequence[float]],
 
 
 def gate_silence_8k(wav8k: Union[np.ndarray, Sequence[float]],
-                    relative_db: float = -38.0) -> np.ndarray:
+                    relative_db: float = -38.0,
+                    hangover_ms: float = 150.0,
+                    fade_ms: float = 5.0) -> np.ndarray:
     """Zero 20 ms frames that sit far below the active speech level.
 
     Real gated recordings replace inter-utterance noise with the A-law zero
-    code.  This gate removes the reference voice's room tone before the final
-    A-law quantizer turns those frames into +/-8.
+    code.  A hard frame gate also cuts weak word endings and clicks, so the
+    gate keeps ``hangover_ms`` of signal after the last speech frame and
+    applies a short raised-cosine fade at each zero boundary.
     """
     x = _as_float32_mono(wav8k)
     if len(x) < FRAME_LEN:
@@ -408,10 +503,42 @@ def gate_silence_8k(wav8k: Union[np.ndarray, Sequence[float]],
     energy = 10.0 * np.log10(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-20)
     speech = active_speech_rms_db(x)
     gate = energy < (speech + float(relative_db))
+
+    hangover_frames = max(0, int(round(float(hangover_ms) / 20.0)))
+    if hangover_frames > 0 and np.any(gate):
+        last_open = -10 ** 9
+        for i in range(n):
+            if not gate[i]:
+                last_open = i
+            elif i - last_open <= hangover_frames:
+                gate[i] = False
+
     out = x.copy()
+    if not np.any(gate):
+        return out
     for i in np.flatnonzero(gate):
         out[i * FRAME_LEN:(i + 1) * FRAME_LEN] = 0.0
-    return out
+
+    fade_samples = max(0, int(round(float(fade_ms) * PHONE_SR / 1000.0)))
+    if fade_samples > 0:
+        zero = np.zeros(len(out), dtype=bool)
+        for i in np.flatnonzero(gate):
+            zero[i * FRAME_LEN:(i + 1) * FRAME_LEN] = True
+        edges = np.diff(zero.astype(np.int8), prepend=0, append=0)
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1)
+        gain = np.ones(len(out), dtype=np.float32)
+        for a, b in zip(starts, ends):
+            if a > 0:
+                lo = max(0, a - fade_samples)
+                ramp = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, a - lo)))
+                gain[lo:a] = np.minimum(gain[lo:a], ramp.astype(np.float32))
+            if b < len(out):
+                hi = min(len(out), b + fade_samples)
+                ramp = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, hi - b)))
+                gain[b:hi] = np.minimum(gain[b:hi], ramp.astype(np.float32))
+        out = out * gain
+    return out.astype(np.float32)
 
 
 def add_mains_hum(wav: np.ndarray, sr: int, hum_db: float,
@@ -609,7 +736,10 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     )
 
     snr = float(rng.uniform(snr_db_range[0], snr_db_range[1]))
-    x8 = add_colored_noise_at_snr(x8, snr, rng, color=noise_color)
+    x8 = add_colored_noise_at_snr(
+        x8, snr, rng, color=noise_color, active=True, band_limit=True,
+        modulation_db=5.0,
+    )
     gain = float(rng.uniform(gain_db_range[0], gain_db_range[1]))
     x8 = apply_gain_and_clip(x8, gain)
 
@@ -624,7 +754,10 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     x8 = apply_dropouts(x8, PHONE_SR, dropout_p, rng)
     if add_line_bed:
         bed_snr = float(rng.uniform(bed_snr_db_range[0], bed_snr_db_range[1]))
-        x8 = add_noise_bed(x8, bed_snr, rng, color="brown", white_mix=bed_white_mix)
+        x8 = add_noise_bed(
+            x8, bed_snr, rng, color="line",
+            white_mix=bed_white_mix, rumble_mix=NOISE_BED_RUMBLE_MIX,
+        )
     x8 = alaw_roundtrip_8k(x8)
     return _format_phone_output(x8, target_len, output_sr)
 
@@ -665,7 +798,10 @@ def simulate_pstn(waveform: Union[np.ndarray, Sequence[float]],
     )
 
     snr = float(rng.uniform(snr_db_range[0], snr_db_range[1]))
-    x8 = add_colored_noise_at_snr(x8, snr, rng, color=noise_color)
+    x8 = add_colored_noise_at_snr(
+        x8, snr, rng, color=noise_color, active=True, band_limit=True,
+        modulation_db=5.0,
+    )
     if hum_prob > 0 and float(rng.uniform()) < hum_prob:
         hum_db = float(rng.uniform(hum_db_range[0], hum_db_range[1]))
         x8 = add_mains_hum(x8, PHONE_SR, hum_db, rng)
@@ -675,7 +811,10 @@ def simulate_pstn(waveform: Union[np.ndarray, Sequence[float]],
     x8 = apply_dropouts(x8, PHONE_SR, dropout_p, rng)
     if add_line_bed:
         bed_snr = float(rng.uniform(bed_snr_db_range[0], bed_snr_db_range[1]))
-        x8 = add_noise_bed(x8, bed_snr, rng, color="brown", white_mix=bed_white_mix)
+        x8 = add_noise_bed(
+            x8, bed_snr, rng, color="line",
+            white_mix=bed_white_mix, rumble_mix=NOISE_BED_RUMBLE_MIX,
+        )
     x8 = alaw_roundtrip_8k(x8)
     return _format_phone_output(x8, target_len, output_sr)
 
@@ -693,7 +832,9 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
                    normalize_level: bool = True,
                    target_rms_db: Optional[float] = None,
                    gate_silence: bool = True,
-                   gate_relative_db: float = -25.0) -> np.ndarray:
+                   gate_relative_db: float = -35.0,
+                   gate_hangover_ms: float = 150.0,
+                   gate_fade_ms: float = 5.0) -> np.ndarray:
     """Simulate a clean/gated landline recording.
 
     This is the dominant real-call population: no added line noise or hum,
@@ -725,7 +866,10 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
     gain = float(rng.uniform(gain_db_range[0], gain_db_range[1]))
     x8 = apply_gain_and_clip(x8, gain)
     if gate_silence:
-        x8 = gate_silence_8k(x8, relative_db=gate_relative_db)
+        x8 = gate_silence_8k(
+            x8, relative_db=gate_relative_db,
+            hangover_ms=gate_hangover_ms, fade_ms=gate_fade_ms,
+        )
     x8 = alaw_roundtrip_8k(x8)
     return _format_phone_output(x8, target_len, output_sr)
 
