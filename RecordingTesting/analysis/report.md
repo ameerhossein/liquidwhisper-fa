@@ -498,3 +498,67 @@ Outputs:
 - `summary.json` — medians/IQRs by group
 - `plots/` — all figures in this report
 - `report.md` — this document
+
+---
+
+## 2026-10-29 follow-up: gated high-band correction
+
+The earlier "no gated change is needed" conclusion was based on
+`hf_1_2k_rel_db` / `hf_2_3k_rel_db`, which normalize to the **sum** of
+0.3–1 kHz. That denominator is dominated by the real corpus's 400–500 Hz
+peak, so it can report a match while the 1 kHz-relative high band is far too
+low. A 1/3-octave loud-frame comparison exposes the problem.
+
+Method: median loud-frame 1/3-octave PSD in dB relative to 1 kHz, using the
+same VAD/PSD code as `compare_telephone.py`. Real gated files: n=76.
+Simulated: 48 clean voices × 5 seeds = 240 outputs.
+
+| Hz | Real gated | Clean source | Old 350–900 | New 300–3400 + 4 dB shelf |
+|---:|---:|---:|---:|---:|
+| 400 | +26.8 | +5.2 | +14.6 | +9.4 |
+| 500 | +25.2 | +6.2 | +15.9 | +9.3 |
+| 630 | +6.6 | +6.8 | +14.9 | +7.8 |
+| 1000 | 0.0 | 0.0 | 0.0 | 0.0 |
+| 1250 | −3.9 | −3.2 | −16.1 | −3.3 |
+| 1600 | −3.3 | −5.4 | −16.8 | −5.2 |
+| 2000 | −10.5 | −11.3 | −18.5 | −10.5 |
+| 2500 | −12.0 | −13.2 | −23.5 | −12.0 |
+| 3150 | −12.2 | −10.7 | −23.4 | −11.0 |
+
+The old 350–900 filter is 8–13.5 dB below the real gated high band; the new
+300–3400 + 4 dB low-shelf filter is within ~1.8 dB from 1.25–3.15 kHz. The
+real 400–500 Hz peak is still 16–17 dB above the new output. That is a
+deliberate **standard-telephony / intelligibility** trade-off: the peak is
+partly source/F0 dependent, and reproducing the full +20 dB resonance made
+the synthetic output boomy and overfit the corpus. The high-band plateau is
+the part that carries the second formant and fricative cues, and it is now
+preserved.
+
+Reproduce the comparison:
+
+```bash
+python RecordingTesting/analysis/gated_spectrum_check.py \
+  --voice-dir /home/ameer/Hobbies/voiceprint/fa_clips \
+  --out-dir /tmp/opencode/gated_spectrum_check
+```
+
+### Noise and gate calibration after the change
+
+- Final active in-band (300–3400 Hz) SNR, same VAD/frame method:
+  real noisy **22.3 dB**, new mobile **22.1 dB**, new PSTN **22.6 dB**.
+- Full-band noise floor: real noisy **−50.6 dBFS**, new mobile **−51.5**,
+  new PSTN **−51.2**.
+- The post-codec bed is now f^-0.43 line noise plus a 30–120 Hz rumble
+  component, with slow level modulation. The old brown 1/f² cliff is gone.
+  `snr_db` on the pre-codec stage is measured on active in-band speech
+  power; the bed remains an explicitly documented low-frequency rumble
+  layer with its own active-speech total-power SNR.
+- The gated silence gate now uses a −35 dB threshold, 150 ms hangover, and
+  5 ms raised-cosine fades. On the source clips this reduced digital-silence
+  frames from 38% to 27%; the remaining gap to the real 14% is mostly source
+  clip silence, not gate chopping.
+- Phone eval now reports per-profile WER (gated / mobile / PSTN) and a
+  70/15/15 weighted average alongside the unweighted phone pass.
+
+Full offline suite after the change: **58 passed, 6 skipped** (optional
+torch/fastapi/datasets dependencies absent).
