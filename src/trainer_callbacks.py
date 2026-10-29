@@ -12,7 +12,7 @@ import os
 import time
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
@@ -317,7 +317,7 @@ class WebTelemetryCallback(TrainerCallback):
 
     def _transcribe_pass(self, eval_ds, model, device, dtype, use_amp,
                          batch_size: int, total_test: int,
-                         degrade_phone: bool = False) -> list:
+                         degrade_phone: bool = False) -> Tuple[list, list]:
         """Single inference pass; degrade_phone=True applies deterministic phone sim."""
         degrade_fn = None
         if degrade_phone:
@@ -446,16 +446,24 @@ class WebTelemetryCallback(TrainerCallback):
                     metrics["phone_metrics"] = phone_metrics
                     metrics["phone_seed"] = self.phone_seed
                     metrics["phone_profiles"] = list(self.telephony_profiles)
-                    if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
-                        from src.metrics import (
-                            evaluate_predictions_by_profile,
-                            profile_weights,
-                            weighted_normalized_wer,
+                    from src.metrics import (
+                        evaluate_predictions_by_profile,
+                        filter_valid_profiles,
+                        profile_weights,
+                        weighted_normalized_wer,
+                    )
+                    from src.telephone import DEFAULT_PROFILE_WEIGHTS
+                    refs_valid, preds_valid, flags_valid, profiles_valid, skipped = (
+                        filter_valid_profiles(
+                            references, phone_preds,
+                            phone_sample_profiles, is_informal,
                         )
-                        from src.telephone import DEFAULT_PROFILE_WEIGHTS
+                    )
+                    metrics["phone_profile_skipped_samples"] = skipped
+                    if profiles_valid:
                         per_profile = evaluate_predictions_by_profile(
-                            self.metrics_calculator, references, phone_preds,
-                            [str(p) for p in phone_sample_profiles], is_informal,
+                            self.metrics_calculator, refs_valid, preds_valid,
+                            profiles_valid, flags_valid,
                         )
                         weights = profile_weights(
                             self.telephony_profiles, DEFAULT_PROFILE_WEIGHTS
@@ -561,6 +569,9 @@ class WebTelemetryCallback(TrainerCallback):
             record["phone_profile_weights"] = results.get("phone_profile_weights", {})
             record["phone_weighted_normalized_wer"] = results.get(
                 "phone_weighted_normalized_wer"
+            )
+            record["phone_profile_skipped_samples"] = results.get(
+                "phone_profile_skipped_samples", 0
             )
 
         # Read existing records

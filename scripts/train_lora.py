@@ -834,6 +834,7 @@ def _run_post_training_evaluation(
         try:
             from src.metrics import (
                 evaluate_predictions_by_profile,
+                filter_valid_profiles,
                 profile_weights,
                 weighted_normalized_wer,
             )
@@ -851,10 +852,15 @@ def _run_post_training_evaluation(
             phone_per_profile = {}
             phone_profile_weights = {}
             phone_weighted_wer = None
-            if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
+            refs_valid, preds_valid, flags_valid, profiles_valid, skipped = (
+                filter_valid_profiles(
+                    references, phone_predictions, phone_sample_profiles, is_informal
+                )
+            )
+            if profiles_valid:
                 phone_per_profile = evaluate_predictions_by_profile(
-                    metrics_calculator, references, phone_predictions,
-                    [str(p) for p in phone_sample_profiles], is_informal,
+                    metrics_calculator, refs_valid, preds_valid,
+                    profiles_valid, flags_valid,
                 )
                 phone_profile_weights = profile_weights(
                     phone_profiles, DEFAULT_PROFILE_WEIGHTS
@@ -878,6 +884,11 @@ def _run_post_training_evaluation(
                     f"  weighted ({weights_label}) WER={phone_weighted_wer:5.2f}%  "
                     f"(unweighted overall {p_overall.get('normalized_wer', 0.0):5.2f}%)\n"
                 )
+                if skipped:
+                    print(
+                        f"Warning: {skipped} phone samples had no profile; "
+                        f"per-profile WER covers {len(profiles_valid)} samples."
+                    )
             phone_block = {
                 "normalized_wer": round(p_overall.get("normalized_wer", 0.0), 2),
                 "normalized_cer": round(p_overall.get("normalized_cer", 0.0), 2),
@@ -896,6 +907,7 @@ def _run_post_training_evaluation(
                 },
                 "weighted_normalized_wer": phone_weighted_wer,
                 "profile_weights": phone_profile_weights,
+                "profile_skipped_samples": skipped,
                 "details": phone_results,
             }
         except Exception as e:

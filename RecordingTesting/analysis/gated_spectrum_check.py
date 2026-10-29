@@ -4,7 +4,8 @@
 The older report used band ratios relative to the 0.3-1 kHz sum.  That
 denominator is dominated by the real corpus's 400-500 Hz peak, so it can
 report a match while the 1 kHz-relative high band is 12 dB low.  This script
-plots the loud-frame spectrum relative to 1 kHz, which exposes that shape.
+plots the loud-frame spectrum relative to 1 kHz, which exposes that shape,
+and optionally reproduces the active in-band noise-SNR table.
 
 Usage:
   python RecordingTesting/analysis/gated_spectrum_check.py \
@@ -61,12 +62,30 @@ def loud_psd_for_audio(x8):
     return spec.get("loud_psd_norm")
 
 
+def read_source(path: Path, target_sr: int) -> np.ndarray:
+    x, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    if sr != target_sr:
+        x = ss.resample_poly(x, target_sr, sr).astype(np.float32)
+    return np.asarray(x, dtype=np.float32)
+
+
 def real_gated_psds(real_dir: Path):
     psds = []
     for path in sorted(real_dir.glob("*.wav")):
         row = ct.analyze_file(path, "real")
         if row and row.get("is_gated") and row.get("_loud_psd_norm") is not None:
             psds.append(row["_loud_psd_norm"])
+    return psds
+
+
+def clean_source_psds(voice_dir: Path, n_sources=48):
+    psds = []
+    for path in sorted(voice_dir.glob("*/*.wav"))[:n_sources]:
+        psd = loud_psd_for_audio(read_source(path, tel.PHONE_SR))
+        if psd is not None:
+            psds.append(psd)
     return psds
 
 
@@ -78,11 +97,7 @@ def synth_gated_psds(voice_dir: Path, seeds, n_sources=48,
     if not sources:
         raise FileNotFoundError(f"no .wav clips under {voice_dir}")
     for path in sources:
-        x, sr = sf.read(str(path), dtype="float32", always_2d=False)
-        if x.ndim > 1:
-            x = x.mean(axis=1)
-        if sr != tel.TARGET_SR:
-            x = ss.resample_poly(x, tel.TARGET_SR, sr).astype(np.float32)
+        x = read_source(path, tel.TARGET_SR)
         for seed in seeds:
             y = tel.simulate_gated(
                 x, sr=tel.TARGET_SR, seed=int(seed), output_sr=tel.PHONE_SR,
@@ -93,6 +108,68 @@ def synth_gated_psds(voice_dir: Path, seeds, n_sources=48,
             if psd is not None:
                 psds.append(psd)
     return psds
+
+
+def band_snr_row(x8):
+    """Median active-vs-noise 300-3400 Hz SNR and levels (dBFS)."""
+    x8 = np.asarray(x8, dtype=np.float64).reshape(-1)
+    speech, energies, _ = ct.energy_vad(x8)
+    n = min(len(speech), len(energies))
+    if n == 0:
+        return None
+    speech = speech[:n]
+    energies = energies[:n]
+    noise_floor = float(np.percentile(energies, 10))
+    speech_level = float(np.percentile(energies, 95))
+    threshold = max(noise_floor + 7.0, speech_level - 30.0)
+    noise_sel = energies < (threshold - 4.0)
+    if np.sum(noise_sel) < 5:
+        noise_sel = energies <= np.percentile(energies, 10)
+    sos = ss.butter(5, [300.0, 3400.0], btype="band", fs=tel.PHONE_SR, output="sos")
+    band = ss.sosfilt(sos, x8)
+    frames = band[:n * 160].reshape(n, 160)
+    band_energy = 10.0 * np.log10(
+        np.mean(frames ** 2, axis=1) + 1e-20
+    )
+    return {
+        "band_snr_db": float(np.median(band_energy[speech])
+                             - np.median(band_energy[noise_sel])),
+        "full_noise_db": float(np.median(energies[noise_sel])),
+        "band_noise_db": float(np.median(band_energy[noise_sel])),
+        "speech_frac": float(np.mean(speech)),
+    }
+
+
+def real_noisy_snr_rows(real_dir: Path):
+    rows = []
+    for path in sorted(real_dir.glob("*.wav")):
+        row = ct.analyze_file(path, "real")
+        if row and not row.get("is_gated"):
+            result = band_snr_row(ct.load_audio(path)[2])
+            if result is not None:
+                rows.append(result)
+    return rows
+
+
+def synth_noise_snr_rows(voice_dir: Path, seeds, profile: str,
+                         n_sources=12):
+    rows = []
+    for path in sorted(voice_dir.glob("*/*.wav"))[:n_sources]:
+        x = read_source(path, tel.TARGET_SR)
+        for seed in seeds:
+            y = tel.simulate_telephone(
+                x, sr=tel.TARGET_SR, profile=profile, seed=int(seed),
+                output_sr=tel.PHONE_SR, use_ffmpeg=False,
+            )
+            result = band_snr_row(y)
+            if result is not None:
+                rows.append(result)
+    return rows
+
+
+def _median_row(rows, key):
+    values = [row[key] for row in rows if row.get(key) is not None]
+    return float(np.median(values)) if values else float("nan")
 
 
 def main():
@@ -112,6 +189,11 @@ def main():
     parser.add_argument("--low-shelf-db", type=float, default=4.0)
     parser.add_argument("--low-shelf-hz", type=float, default=500.0)
     parser.add_argument(
+        "--noise-check", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--noise-sources", type=int, default=12)
+    parser.add_argument("--noise-seeds", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument(
         "--out-dir", type=Path, default=Path("/tmp/opencode/gated_spectrum_check")
     )
     args = parser.parse_args()
@@ -119,24 +201,84 @@ def main():
 
     freqs = ct.frame_psd(np.zeros(1024))[1]
     real = real_gated_psds(args.real_dir)
+    clean = clean_source_psds(args.voice_dir, args.n_sources)
     synth = synth_gated_psds(
         args.voice_dir, args.seeds, args.n_sources,
         args.band_low, args.band_high, args.low_shelf_db, args.low_shelf_hz,
     )
     real_levels = octave_levels(real, freqs)
+    clean_levels = octave_levels(clean, freqs)
     synth_levels = octave_levels(synth, freqs)
 
-    print(f"real gated files: {len(real)}; synth outputs: {len(synth)}")
-    print("Hz   real_dB  synth_dB  diff_dB")
-    for center, real_db, synth_db in zip(CENTERS, real_levels, synth_levels):
-        print(f"{center:5d} {real_db:8.1f} {synth_db:8.1f} {synth_db - real_db:7.1f}")
+    print(f"real gated files: {len(real)}; clean sources: {len(clean)}; "
+          f"synth outputs: {len(synth)}")
+    print("Hz   real_dB  clean_dB  synth_dB  diff_dB")
+    for center, real_db, clean_db, synth_db in zip(
+        CENTERS, real_levels, clean_levels, synth_levels
+    ):
+        print(
+            f"{center:5d} {real_db:8.1f} {clean_db:9.1f} "
+            f"{synth_db:9.1f} {synth_db - real_db:7.1f}"
+        )
 
     with open(args.out_dir / "gated_octave_levels.csv", "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["hz", "real_db_re_1k", "synth_db_re_1k", "diff_db"])
-        for center, real_db, synth_db in zip(CENTERS, real_levels, synth_levels):
-            writer.writerow([center, round(real_db, 2), round(synth_db, 2),
-                             round(synth_db - real_db, 2)])
+        writer.writerow([
+            "hz", "real_db_re_1k", "clean_db_re_1k",
+            "synth_db_re_1k", "diff_db",
+        ])
+        for center, real_db, clean_db, synth_db in zip(
+            CENTERS, real_levels, clean_levels, synth_levels
+        ):
+            writer.writerow([
+                center, round(real_db, 2), round(clean_db, 2),
+                round(synth_db, 2), round(synth_db - real_db, 2),
+            ])
+
+    if args.noise_check:
+        real_noise = real_noisy_snr_rows(args.real_dir)
+        groups = [
+            ("real_noisy", real_noise),
+            ("synth_mobile", synth_noise_snr_rows(
+                args.voice_dir, args.noise_seeds, "mobile", args.noise_sources
+            )),
+            ("synth_pstn", synth_noise_snr_rows(
+                args.voice_dir, args.noise_seeds, "pstn", args.noise_sources
+            )),
+        ]
+        print("\nNoise check (median active-vs-noise, 300-3400 Hz):")
+        print("group          n   band_snr  full_noise  band_noise  speech_frac")
+        noise_rows = []
+        for name, rows in groups:
+            summary = {
+                "group": name,
+                "n": len(rows),
+                "band_snr_db": _median_row(rows, "band_snr_db"),
+                "full_noise_db": _median_row(rows, "full_noise_db"),
+                "band_noise_db": _median_row(rows, "band_noise_db"),
+                "speech_frac": _median_row(rows, "speech_frac"),
+            }
+            noise_rows.append(summary)
+            print(
+                f"{name:<14} {summary['n']:3d} "
+                f"{summary['band_snr_db']:9.1f} "
+                f"{summary['full_noise_db']:10.1f} "
+                f"{summary['band_noise_db']:10.1f} "
+                f"{summary['speech_frac']:10.2f}"
+            )
+        with open(args.out_dir / "noise_snr.csv", "w", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=[
+                    "group", "n", "band_snr_db", "full_noise_db",
+                    "band_noise_db", "speech_frac",
+                ],
+            )
+            writer.writeheader()
+            for row in noise_rows:
+                writer.writerow({
+                    key: (round(value, 2) if isinstance(value, float) else value)
+                    for key, value in row.items()
+                })
 
     import matplotlib
     matplotlib.use("Agg")
@@ -145,6 +287,7 @@ def main():
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(CENTERS))
     ax.plot(x, real_levels, "o-", label="Real gated calls")
+    ax.plot(x, clean_levels, "--", label="Clean source")
     ax.plot(x, synth_levels, "s-", label="Simulated gated")
     ax.set_xticks(x)
     ax.set_xticklabels([str(c) for c in CENTERS], rotation=45)
@@ -157,6 +300,8 @@ def main():
     fig.savefig(args.out_dir / "gated_octave_levels.png", dpi=140)
     print(f"\nWrote {args.out_dir / 'gated_octave_levels.csv'}")
     print(f"Wrote {args.out_dir / 'gated_octave_levels.png'}")
+    if args.noise_check:
+        print(f"Wrote {args.out_dir / 'noise_snr.csv'}")
 
 
 if __name__ == "__main__":

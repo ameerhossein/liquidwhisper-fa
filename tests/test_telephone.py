@@ -76,6 +76,14 @@ def test_low_shelf_boosts_low_frequencies():
     after = 20.0 * np.log10(tone_amp(y, 300.0) / tone_amp(y, 2000.0))
     assert after - before > 2.5
 
+    x50 = (0.1 * np.sin(2 * np.pi * 50.0 * t)).astype(np.float32)
+    y50 = telephone.apply_low_shelf(x50, sr=sr, gain_db=4.0, corner_hz=500.0)
+    gain50 = 20.0 * np.log10(tone_amp(y50, 50.0) / tone_amp(x50, 50.0))
+    assert 3.0 < gain50 < 5.0
+
+    gain2k = 20.0 * np.log10(tone_amp(y, 2000.0) / tone_amp(x, 2000.0))
+    assert abs(gain2k) < 0.5
+
 
 @requires_scipy
 def test_bandpass_suppresses_high_freq():
@@ -209,10 +217,12 @@ def test_simulate_profiles_keep_stereo_input_length():
     from src import telephone
     t = np.arange(1600, dtype=np.float64) / 16000.0
     mono = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
-    stereo = np.stack([mono, mono], axis=1)
+    stereo = np.stack([mono, 0.5 * mono], axis=1)
     for fn in (telephone.simulate_gated, telephone.simulate_mobile, telephone.simulate_pstn):
         y = fn(stereo, seed=0, use_ffmpeg=False)
+        y_mono = fn(mono, seed=0, use_ffmpeg=False)
         assert len(y) == len(mono), fn.__name__
+        np.testing.assert_allclose(y, y_mono, atol=1e-6)
 
 
 @requires_scipy
@@ -224,8 +234,8 @@ def test_amr_fallback_warns_once_and_counts(monkeypatch):
         raise RuntimeError("libopencore_amrnb missing")
 
     monkeypatch.setattr(telephone, "_ffmpeg_roundtrip_8k", boom)
-    telephone._AMR_FALLBACK_WARNED = False
-    telephone._AMR_FALLBACK_COUNT = 0
+    monkeypatch.setattr(telephone, "_AMR_FALLBACK_WARNED", False)
+    monkeypatch.setattr(telephone, "_AMR_FALLBACK_COUNT", 0)
     x = _sine_mix(dur=0.2)
     with pytest.warns(RuntimeWarning, match="AMR-NB"):
         telephone.simulate_mobile(x, seed=0, use_ffmpeg=True)
@@ -234,6 +244,30 @@ def test_amr_fallback_warns_once_and_counts(monkeypatch):
         telephone.simulate_mobile(x, seed=1, use_ffmpeg=True)
     assert not caught
     assert telephone._AMR_FALLBACK_COUNT == 2
+
+
+@requires_scipy
+def test_amr_fallback_handles_unexpected_codec_error(monkeypatch):
+    from src import telephone
+
+    def boom(*args, **kwargs):
+        raise ValueError("unexpected codec path")
+
+    monkeypatch.setattr(telephone, "_ffmpeg_roundtrip_8k", boom)
+    monkeypatch.setattr(telephone, "_AMR_FALLBACK_WARNED", False)
+    monkeypatch.setattr(telephone, "_AMR_FALLBACK_COUNT", 0)
+    with pytest.warns(RuntimeWarning, match="AMR-NB"):
+        telephone.simulate_mobile(_sine_mix(dur=0.2), seed=0, use_ffmpeg=True)
+    assert telephone._AMR_FALLBACK_COUNT == 1
+
+
+@requires_scipy
+def test_simulate_mobile_rejects_invalid_amr_bitrate():
+    from src import telephone
+    with pytest.raises(ValueError, match="amr_bitrate"):
+        telephone.simulate_mobile(
+            _sine_mix(dur=0.2), seed=0, use_ffmpeg=False, amr_bitrate="9.9k"
+        )
 
 
 @requires_scipy
@@ -432,23 +466,25 @@ def test_gated_silence_has_no_added_noise():
     assert len(np.unique(yi)) <= 2
 
 
-def test_gated_profile_is_darker_than_mobile():
+@requires_scipy
+def test_gated_profile_keeps_2_5k_energy():
     from src import telephone
-    rng = np.random.default_rng(0)
-    x = (rng.standard_normal(16000) * 0.2).astype(np.float32)
-
-    def hf_ratio(y):
-        spec = np.abs(np.fft.rfft(y * np.hanning(len(y)))) ** 2
-        freqs = np.fft.rfftfreq(len(y), 1.0 / 8000)
-        lo = np.sum(spec[(freqs >= 300) & (freqs < 1000)])
-        hi = np.sum(spec[(freqs >= 2000) & (freqs < 3400)])
-        return float(hi / (lo + 1e-20))
-
-    gated = telephone.simulate_gated(x, seed=1, use_ffmpeg=False, output_sr=8000)
-    mobile = telephone.simulate_mobile(
-        x, seed=1, use_ffmpeg=False, output_sr=8000, dropout_p=0.0
+    sr = 16000
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (0.1 * np.sin(2 * np.pi * 2500.0 * t)).astype(np.float32)
+    x8 = telephone.resample_16k_to_8k(x)
+    y = telephone.simulate_gated(
+        x, seed=1, use_ffmpeg=False, output_sr=8000,
+        normalize_level=False, gate_silence=False, gain_db_range=(0.0, 0.0),
     )
-    assert hf_ratio(gated) < hf_ratio(mobile)
+
+    def tone_amp(wav, f0, bw=30.0):
+        spec = np.abs(np.fft.rfft(wav * np.hanning(len(wav))))
+        freqs = np.fft.rfftfreq(len(wav), 1.0 / 8000)
+        m = (freqs >= f0 - bw) & (freqs <= f0 + bw)
+        return float(np.max(spec[m]) + 1e-20)
+
+    assert tone_amp(y, 2500.0) / tone_amp(x8, 2500.0) > 0.5
 
 
 def test_colored_noise_is_low_frequency_heavy():
@@ -673,8 +709,8 @@ def test_gated_profile_preserves_speech_band_highs():
         return float(np.max(spec[m]) + 1e-20)
 
     ref = tone_amp(y, 8000, 500.0)
-    assert tone_amp(y, 8000, 1500.0) / ref > 0.2
-    assert tone_amp(y, 8000, 2500.0) / ref > 0.2
+    assert tone_amp(y, 8000, 1500.0) / ref > 0.5
+    assert tone_amp(y, 8000, 2500.0) / ref > 0.5
 
 
 def test_gate_silence_removes_low_level_pauses_without_hangover():
@@ -686,6 +722,27 @@ def test_gate_silence_removes_low_level_pauses_without_hangover():
     y = telephone.gate_silence_8k(x, hangover_ms=0.0, fade_ms=0.0)
     assert float(np.max(np.abs(y[4000:]))) < 1e-4
     assert float(np.sqrt(np.mean(y[:4000] ** 2))) > 0.05
+
+
+def test_gate_silence_gates_trailing_partial_frame():
+    from src import telephone
+    sr = 8000
+    t = np.arange(4000, dtype=np.float64) / sr
+    speech = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    tail = np.full(100, 0.003, dtype=np.float32)  # < one 20 ms frame
+    y = telephone.gate_silence_8k(
+        np.concatenate([speech, tail]),
+        relative_db=-25.0, hangover_ms=0.0, fade_ms=0.0,
+    )
+    assert float(np.max(np.abs(y[4000:]))) < 1e-4
+
+
+def test_gate_default_matches_simulate_gated():
+    import inspect
+    from src import telephone
+    helper = inspect.signature(telephone.gate_silence_8k).parameters["relative_db"].default
+    profile = inspect.signature(telephone.simulate_gated).parameters["gate_relative_db"].default
+    assert helper == profile
 
 
 def test_gate_silence_hangover_preserves_tails_with_fade():

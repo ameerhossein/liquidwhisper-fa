@@ -104,6 +104,20 @@ def test_profile_subsets_canonicalizes_clean_alias():
     assert subsets["gated"][0] == ["a"]
 
 
+def test_filter_valid_profiles_keeps_successful_rows_and_counts_skipped():
+    from src.metrics import filter_valid_profiles
+
+    refs, preds, flags, profiles, skipped = filter_valid_profiles(
+        ["a", "b", "c"], ["a", "x", "c"],
+        ["gated", None, "mobile"], [False, True, False],
+    )
+    assert refs == ["a", "c"]
+    assert preds == ["a", "c"]
+    assert flags == [False, False]
+    assert profiles == ["gated", "mobile"]
+    assert skipped == 1
+
+
 def test_profile_weights_for_subsets_and_aliases():
     from src.metrics import profile_weights
 

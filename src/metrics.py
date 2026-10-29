@@ -75,6 +75,31 @@ def profile_subsets(
     return out
 
 
+def filter_valid_profiles(
+    references: Sequence[str],
+    predictions: Sequence[str],
+    profiles: Sequence[Optional[str]],
+    is_informal_flags: Optional[Sequence[bool]] = None,
+) -> Tuple[List[str], List[str], Optional[List[bool]], List[str], int]:
+    """Drop rows whose degradation profile is missing; return skipped count."""
+    if not (len(references) == len(predictions) == len(profiles)):
+        raise ValueError("references, predictions and profiles must have equal length.")
+    if is_informal_flags is not None and len(is_informal_flags) != len(references):
+        raise ValueError("is_informal_flags must match references length.")
+    indices = [
+        i for i, profile in enumerate(profiles)
+        if profile is not None and str(profile).strip()
+    ]
+    return (
+        [references[i] for i in indices],
+        [predictions[i] for i in indices],
+        ([bool(is_informal_flags[i]) for i in indices]
+         if is_informal_flags is not None else None),
+        [str(profiles[i]) for i in indices],
+        len(profiles) - len(indices),
+    )
+
+
 def profile_weights(
     profiles: Sequence[str],
     defaults: Optional[Mapping[str, float]] = None,

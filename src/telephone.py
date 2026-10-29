@@ -412,14 +412,15 @@ def add_noise_bed(wav: np.ndarray, snr_db: float,
                   active: bool = True,
                   modulation_db: float = 3.0,
                   modulation_hz_range: Tuple[float, float] = (0.2, 1.5)) -> np.ndarray:
-    """Add a post-codec line-noise bed with real-corpus spectral shape.
+    """Add a line-noise bed with real-corpus spectral shape.
 
-    The bed is a low-frequency rumble layer, not the primary in-band noise
-    source.  ``snr_db`` is measured against active speech power when
-    ``active=True``; the pre-codec noise stage is what sets the in-band SNR.
-    ``rumble_mix`` blends a 30-120 Hz brown component back in so the bed
-    keeps the real corpus's low-frequency weight without the old 1/f**2
-    cliff.
+    For mobile this runs after AMR-NB; for PSTN it runs before the final
+    A-law storage round-trip.  The bed is a low-frequency rumble layer, not
+    the primary in-band noise source.  ``snr_db`` is measured against active
+    speech power when ``active=True``; the pre-codec noise stage is what sets
+    the in-band SNR.  ``rumble_mix`` blends a 30-120 Hz brown component back
+    in so the bed keeps the real corpus's low-frequency weight without the
+    old 1/f**2 cliff.
     """
     x = np.asarray(wav, dtype=np.float64)
     if not np.isfinite(snr_db):
@@ -529,7 +530,7 @@ def calibrate_active_rms(wav8k: Union[np.ndarray, Sequence[float]],
 
 
 def gate_silence_8k(wav8k: Union[np.ndarray, Sequence[float]],
-                    relative_db: float = -38.0,
+                    relative_db: float = -35.0,
                     hangover_ms: float = 150.0,
                     fade_ms: float = 5.0) -> np.ndarray:
     """Zero 20 ms frames that sit far below the active speech level.
@@ -542,9 +543,19 @@ def gate_silence_8k(wav8k: Union[np.ndarray, Sequence[float]],
     x = _as_float32_mono(wav8k)
     if len(x) < FRAME_LEN:
         return x
-    n = len(x) // FRAME_LEN
-    frames = x[:n * FRAME_LEN].reshape(n, FRAME_LEN)
-    energy = 10.0 * np.log10(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-20)
+    n_full = len(x) // FRAME_LEN
+    n = n_full + (1 if len(x) % FRAME_LEN else 0)
+    energy = np.empty(n, dtype=np.float64)
+    if n_full:
+        frames = x[:n_full * FRAME_LEN].reshape(n_full, FRAME_LEN)
+        energy[:n_full] = 10.0 * np.log10(
+            np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-20
+        )
+    if n > n_full:
+        tail = x[n_full * FRAME_LEN:]
+        energy[n_full] = 10.0 * np.log10(
+            float(np.mean(tail.astype(np.float64) ** 2)) + 1e-20
+        )
     speech = active_speech_rms_db(x)
     gate = energy < (speech + float(relative_db))
 
@@ -772,6 +783,11 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_mobile expects {TARGET_SR} Hz input, got {sr}.")
+    amr_bitrate = str(amr_bitrate).strip().lower()
+    if amr_bitrate not in AMR_NB_BITRATES:
+        raise ValueError(
+            f"amr_bitrate must be one of {AMR_NB_BITRATES}, got {amr_bitrate!r}."
+        )
     rng = np.random.default_rng(seed)
     x = _as_float32_mono(waveform)
     if x.size == 0:
@@ -796,7 +812,7 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     if use_ffmpeg:
         try:
             x8 = _ffmpeg_roundtrip_8k(x8, "amr_nb", bitrate=amr_bitrate)
-        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             _warn_amr_fallback(exc)
             x8 = alaw_quantize(x8)
     else:

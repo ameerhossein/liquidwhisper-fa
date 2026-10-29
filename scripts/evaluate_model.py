@@ -31,6 +31,7 @@ from src.normalizer import PersianTextNormalizer
 from src.metrics import (
     ASRMetricsCalculator,
     evaluate_predictions_by_profile,
+    filter_valid_profiles,
     profile_weights,
     weighted_normalized_wer,
 )
@@ -196,6 +197,7 @@ def main():
     phone_per_profile: Dict[str, Dict[str, Any]] = {}
     phone_weighted_wer: Optional[float] = None
     phone_profile_weights: Dict[str, float] = {}
+    phone_profile_skipped = 0
     phone_sample_profiles: List[Optional[str]] = []
     if args.phone_eval:
         print(f"Transcribing {total_samples} samples (phone-simulated, seed={args.phone_seed})...")
@@ -213,10 +215,16 @@ def main():
         )
         print("\n" + metrics_calc.format_results_table(f"{eval_label} [phone]", phone_results) + "\n")
 
-        if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
+        refs_valid, preds_valid, flags_valid, profiles_valid, skipped = (
+            filter_valid_profiles(
+                references, phone_predictions, phone_sample_profiles, is_informal
+            )
+        )
+        phone_profile_skipped = skipped
+        if profiles_valid:
             phone_per_profile = evaluate_predictions_by_profile(
-                metrics_calc, references, phone_predictions,
-                [str(p) for p in phone_sample_profiles], is_informal,
+                metrics_calc, refs_valid, preds_valid,
+                profiles_valid, flags_valid,
             )
             from src.telephone import DEFAULT_PROFILE_WEIGHTS
             phone_profile_weights = profile_weights(profiles, DEFAULT_PROFILE_WEIGHTS)
@@ -239,6 +247,11 @@ def main():
                 f"  weighted ({weights_label}) WER={phone_weighted_wer:5.2f}%  "
                 f"(unweighted overall {phone_results.get('overall', {}).get('normalized_wer', 0.0):5.2f}%)\n"
             )
+            if skipped:
+                print(
+                    f"Warning: {skipped} phone samples had no profile; "
+                    f"per-profile WER covers {len(profiles_valid)} samples."
+                )
 
         try:
             clean_wer = results.get("overall", {}).get("normalized_wer", 0.0)
@@ -271,6 +284,7 @@ def main():
         payload["phone_profiles"] = profiles
         payload["phone_predictions"] = phone_predictions
         payload["phone_sample_profiles"] = phone_sample_profiles
+        payload["phone_profile_skipped"] = phone_profile_skipped
         payload["phone_per_profile"] = {
             profile: {
                 "count": result.get("total_samples", 0),

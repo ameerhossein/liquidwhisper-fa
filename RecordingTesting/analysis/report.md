@@ -542,12 +542,17 @@ python RecordingTesting/analysis/gated_spectrum_check.py \
   --out-dir /tmp/opencode/gated_spectrum_check
 ```
 
+The same command emits the clean-source column and the active in-band
+noise-SNR table (`noise_snr.csv`), so the spectral and noise numbers below
+come from one reproducible run.
+
 ### Noise and gate calibration after the change
 
-- Final active in-band (300–3400 Hz) SNR, same VAD/frame method:
-  real noisy **22.3 dB**, new mobile **22.1 dB**, new PSTN **22.6 dB**.
-- Full-band noise floor: real noisy **−50.6 dBFS**, new mobile **−51.5**,
-  new PSTN **−51.2**.
+- Final active in-band (300–3400 Hz) SNR, same VAD/frame method
+  (reproduced by `gated_spectrum_check.py`'s noise table):
+  real noisy **22.3 dB**, new mobile **22.9 dB**, new PSTN **23.1 dB**.
+- Full-band noise floor: real noisy **−50.6 dBFS**, new mobile **−51.9**,
+  new PSTN **−51.4**.
 - The post-codec bed is now f^-0.43 line noise plus a 30–120 Hz rumble
   component, with slow level modulation. The old brown 1/f² cliff is gone.
   `snr_db` on the pre-codec stage is measured on active in-band speech
@@ -560,5 +565,5 @@ python RecordingTesting/analysis/gated_spectrum_check.py \
 - Phone eval now reports per-profile WER (gated / mobile / PSTN) and a
   70/15/15 weighted average alongside the unweighted phone pass.
 
-Full offline suite after the change: **58 passed, 6 skipped** (optional
+Full offline suite after the change: **71 passed, 6 skipped** (optional
 torch/fastapi/datasets dependencies absent).
