@@ -70,6 +70,47 @@ def test_ezafe_preservation():
     print("✓ Ezafe preservation passed.")
 
 
+def test_profile_subsets_and_weighted_wer():
+    from src.metrics import profile_subsets, weighted_normalized_wer
+
+    refs = ["a", "b", "c", "d"]
+    preds = ["a", "x", "c", "y"]
+    profiles = ["gated", "gated", "mobile", "pstn"]
+    subsets = profile_subsets(
+        refs, preds, profiles, is_informal_flags=[False, False, True, False]
+    )
+    assert subsets["gated"][0] == ["a", "b"]
+    assert subsets["gated"][1] == ["a", "x"]
+    assert subsets["gated"][2] == [False, False]
+    assert subsets["mobile"][0] == ["c"]
+    assert subsets["pstn"][0] == ["d"]
+
+    results = {
+        "gated": {"overall": {"normalized_wer": 10.0}},
+        "mobile": {"overall": {"normalized_wer": 20.0}},
+        "pstn": {"overall": {"normalized_wer": 30.0}},
+    }
+    weighted = weighted_normalized_wer(
+        results, {"gated": 0.7, "mobile": 0.15, "pstn": 0.15}
+    )
+    assert abs(weighted - 14.5) < 1e-9
+
+
+def test_evaluate_predictions_by_profile_counts():
+    from src.metrics import evaluate_predictions_by_profile
+
+    calc = ASRMetricsCalculator(normalizer=PersianTextNormalizer(use_hazm=False))
+    results = evaluate_predictions_by_profile(
+        calc,
+        ["سلام", "سلام"],
+        ["سلام", "خداحافظ"],
+        ["gated", "mobile"],
+    )
+    assert results["gated"]["total_samples"] == 1
+    assert results["mobile"]["total_samples"] == 1
+    assert results["gated"]["overall"]["normalized_wer"] == 0.0
+
+
 def test_metrics_empty_and_single():
     norm = PersianTextNormalizer(use_hazm=False)
     calc = ASRMetricsCalculator(normalizer=norm)

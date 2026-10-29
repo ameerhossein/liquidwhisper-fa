@@ -932,14 +932,27 @@ def apply_random_telephone(
     return degraded, str(profile)
 
 
+def degrade_for_eval_profiled(waveform: Union[np.ndarray, Sequence[float]],
+                              index: int,
+                              seed_base: int = 1234,
+                              profiles: Sequence[str] = DEFAULT_PROFILES,
+                              use_ffmpeg: bool = True) -> Tuple[np.ndarray, str]:
+    """Deterministic per-sample degradation returning the applied profile."""
+    profs = list(profiles) or list(DEFAULT_PROFILES)
+    profile = profs[index % len(profs)]
+    degraded = simulate_telephone(waveform, sr=TARGET_SR, profile=profile,
+                                  seed=int(seed_base) + int(index),
+                                  use_ffmpeg=use_ffmpeg)
+    return degraded, str(profile)
+
+
 def degrade_for_eval(waveform: Union[np.ndarray, Sequence[float]],
                      index: int,
                      seed_base: int = 1234,
                      profiles: Sequence[str] = DEFAULT_PROFILES,
                      use_ffmpeg: bool = True) -> np.ndarray:
     """Deterministic per-sample degradation for eval (round-robin profiles)."""
-    profs = list(profiles) or list(DEFAULT_PROFILES)
-    profile = profs[index % len(profs)]
-    return simulate_telephone(waveform, sr=TARGET_SR, profile=profile,
-                              seed=int(seed_base) + int(index),
-                              use_ffmpeg=use_ffmpeg)
+    return degrade_for_eval_profiled(
+        waveform, index=index, seed_base=seed_base,
+        profiles=profiles, use_ffmpeg=use_ffmpeg,
+    )[0]

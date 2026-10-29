@@ -147,6 +147,22 @@ def test_apply_random_prob_edges():
 
 
 @requires_scipy
+def test_degrade_for_eval_profiled_returns_profiles_and_matches_audio():
+    from src import telephone
+    x = _sine_mix(dur=0.5)
+    profiles = ["gated", "mobile", "pstn"]
+    for idx, expected in enumerate(profiles):
+        y, prof = telephone.degrade_for_eval_profiled(
+            x, index=idx, seed_base=1234, profiles=profiles, use_ffmpeg=False
+        )
+        z = telephone.degrade_for_eval(
+            x, index=idx, seed_base=1234, profiles=profiles, use_ffmpeg=False
+        )
+        assert prof == expected
+        np.testing.assert_allclose(y, z, atol=1e-6)
+
+
+@requires_scipy
 def test_degrade_for_eval_deterministic_profiles():
     x = _sine_mix(dur=0.5)
     a = degrade_for_eval(x, index=0, seed_base=1234, profiles=["mobile", "pstn"], use_ffmpeg=False)

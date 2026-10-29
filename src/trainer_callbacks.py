@@ -322,27 +322,30 @@ class WebTelemetryCallback(TrainerCallback):
         degrade_fn = None
         if degrade_phone:
             try:
-                from src.telephone import degrade_for_eval as _degrade
+                from src.telephone import degrade_for_eval_profiled as _degrade
                 degrade_fn = _degrade
             except ImportError:
                 print("[TelemetryCallback] src.telephone missing; phone pass uses clean audio.")
                 degrade_fn = None
         predictions: list = []
+        profiles_used: list = []
         for i in range(0, total_test, batch_size):
             batch = eval_ds[i: i + batch_size]
             audios = batch["audio"] if isinstance(batch["audio"], list) else [batch["audio"]]
             waveforms = []
             for j, a in enumerate(audios):
                 wav = a["array"]
+                used_profile = None
                 if degrade_phone and degrade_fn is not None:
                     try:
-                        wav = degrade_fn(
+                        wav, used_profile = degrade_fn(
                             wav, index=i + j, seed_base=self.phone_seed,
                             profiles=self.telephony_profiles,
                             use_ffmpeg=self.telephony_use_ffmpeg,
                         )
                     except Exception as e:
                         print(f"[TelemetryCallback] phone degrade failed (idx={i + j}): {e}")
+                profiles_used.append(used_profile)
                 waveforms.append(wav)
 
             feats = self.processor(
@@ -360,7 +363,7 @@ class WebTelemetryCallback(TrainerCallback):
 
             batch_preds = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
             predictions.extend(batch_preds)
-        return predictions
+        return predictions, profiles_used
 
     def _evaluate_benchmark(self, model, epoch_num: int) -> Dict[str, Any]:
         """Runs inference over the test split; dual clean + phone when enabled."""
@@ -415,7 +418,7 @@ class WebTelemetryCallback(TrainerCallback):
                     is_informal.append(False)
 
             print("[TelemetryCallback] Clean benchmark pass...")
-            predictions = self._transcribe_pass(
+            predictions, _ = self._transcribe_pass(
                 eval_ds, model, device, dtype, use_amp,
                 batch_size, total_test, degrade_phone=False,
             )
@@ -431,7 +434,7 @@ class WebTelemetryCallback(TrainerCallback):
             if self.phone_benchmark:
                 print("[TelemetryCallback] Phone-simulated benchmark pass...")
                 try:
-                    phone_preds = self._transcribe_pass(
+                    phone_preds, phone_sample_profiles = self._transcribe_pass(
                         eval_ds, model, device, dtype, use_amp,
                         batch_size, total_test, degrade_phone=True,
                     )
@@ -443,6 +446,21 @@ class WebTelemetryCallback(TrainerCallback):
                     metrics["phone_metrics"] = phone_metrics
                     metrics["phone_seed"] = self.phone_seed
                     metrics["phone_profiles"] = list(self.telephony_profiles)
+                    if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
+                        from src.metrics import (
+                            evaluate_predictions_by_profile,
+                            weighted_normalized_wer,
+                        )
+                        from src.telephone import DEFAULT_PROFILE_WEIGHTS
+                        per_profile = evaluate_predictions_by_profile(
+                            self.metrics_calculator, references, phone_preds,
+                            [str(p) for p in phone_sample_profiles], is_informal,
+                        )
+                        metrics["phone_per_profile"] = per_profile
+                        metrics["phone_profile_weights"] = dict(DEFAULT_PROFILE_WEIGHTS)
+                        metrics["phone_weighted_normalized_wer"] = weighted_normalized_wer(
+                            per_profile, DEFAULT_PROFILE_WEIGHTS
+                        )
                 except Exception as e:
                     print(f"[TelemetryCallback] Phone benchmark failed ({e}); keeping clean only.")
 
@@ -535,6 +553,11 @@ class WebTelemetryCallback(TrainerCallback):
             record["phone_informal_wer"] = round(p_informal.get("normalized_wer", 0.0), 2)
             record["phone_seed"] = results.get("phone_seed", self.phone_seed)
             record["phone_profiles"] = results.get("phone_profiles", list(self.telephony_profiles))
+            record["phone_per_profile"] = results.get("phone_per_profile", {})
+            record["phone_profile_weights"] = results.get("phone_profile_weights", {})
+            record["phone_weighted_normalized_wer"] = results.get(
+                "phone_weighted_normalized_wer"
+            )
 
         # Read existing records
         records = []

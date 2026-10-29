@@ -780,6 +780,7 @@ def _run_post_training_evaluation(
     def _transcribe(label: str, degrade_fn=None):
         preds = []
         audio_seconds = 0.0
+        profiles_used = []
         print(f"Transcribing {total_samples} samples ({label}, batch size = {eval_batch_size})...")
         for i in range(0, total_samples, eval_batch_size):
             batch = test_ds[i : i + eval_batch_size]
@@ -790,9 +791,17 @@ def _run_post_training_evaluation(
                 sr = a.get("sampling_rate", 16000)
                 if arr is not None and len(arr) > 0:
                     audio_seconds += len(arr) / float(sr)
+                used_profile = None
                 if degrade_fn is not None:
-                    arr = degrade_fn(arr, index=i + j, seed_base=phone_seed,
-                                     profiles=phone_profiles, use_ffmpeg=telephony_use_ffmpeg)
+                    degraded = degrade_fn(
+                        arr, index=i + j, seed_base=phone_seed,
+                        profiles=phone_profiles, use_ffmpeg=telephony_use_ffmpeg,
+                    )
+                    if isinstance(degraded, tuple):
+                        arr, used_profile = degraded
+                    else:
+                        arr = degraded
+                profiles_used.append(used_profile)
                 waveforms.append(arr)
 
             feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
@@ -804,11 +813,11 @@ def _run_post_training_evaluation(
                     pred_ids = model.generate(input_features=feats, max_new_tokens=225)
 
             preds.extend(processor.batch_decode(pred_ids, skip_special_tokens=True))
-        return preds, audio_seconds
+        return preds, audio_seconds, profiles_used
 
     model.eval()
     start_eval_time = time.time()
-    predictions, total_audio_seconds = _transcribe("clean")
+    predictions, total_audio_seconds, _ = _transcribe("clean")
     elapsed_eval_time = max(0.001, time.time() - start_eval_time)
     rtfx = round(total_audio_seconds / elapsed_eval_time, 2) if total_audio_seconds > 0 else 0.0
 
@@ -823,8 +832,14 @@ def _run_post_training_evaluation(
     phone_block = None
     if phone_benchmark:
         try:
-            from src.telephone import degrade_for_eval
-            phone_predictions, _ = _transcribe("phone-simulated", degrade_fn=degrade_for_eval)
+            from src.metrics import (
+                evaluate_predictions_by_profile,
+                weighted_normalized_wer,
+            )
+            from src.telephone import DEFAULT_PROFILE_WEIGHTS, degrade_for_eval_profiled
+            phone_predictions, _, phone_sample_profiles = _transcribe(
+                "phone-simulated", degrade_fn=degrade_for_eval_profiled
+            )
             phone_results = metrics_calculator.evaluate_predictions(
                 references=references,
                 predictions=phone_predictions,
@@ -832,6 +847,28 @@ def _run_post_training_evaluation(
             )
             print(metrics_calculator.format_results_table("BuzzASR + LoRA (Final Full Test, phone)", phone_results))
             p_overall = phone_results.get("overall", {})
+            phone_per_profile = {}
+            phone_weighted_wer = None
+            if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
+                phone_per_profile = evaluate_predictions_by_profile(
+                    metrics_calculator, references, phone_predictions,
+                    [str(p) for p in phone_sample_profiles], is_informal,
+                )
+                phone_weighted_wer = weighted_normalized_wer(
+                    phone_per_profile, DEFAULT_PROFILE_WEIGHTS
+                )
+                print("Phone WER by profile:")
+                for profile, result in phone_per_profile.items():
+                    overall = result.get("overall", {})
+                    print(
+                        f"  {profile:<8} n={result.get('total_samples', 0):<5} "
+                        f"WER={overall.get('normalized_wer', 0.0):5.2f}%  "
+                        f"CER={overall.get('normalized_cer', 0.0):5.2f}%"
+                    )
+                print(
+                    f"  weighted (70/15/15) WER={phone_weighted_wer:5.2f}%  "
+                    f"(unweighted overall {p_overall.get('normalized_wer', 0.0):5.2f}%)\n"
+                )
             phone_block = {
                 "normalized_wer": round(p_overall.get("normalized_wer", 0.0), 2),
                 "normalized_cer": round(p_overall.get("normalized_cer", 0.0), 2),
@@ -840,6 +877,16 @@ def _run_post_training_evaluation(
                 "gap_vs_clean_pp": round(p_overall.get("normalized_wer", 0.0) - eval_results.get("overall", {}).get("normalized_wer", 0.0), 2),
                 "seed": phone_seed,
                 "profiles": phone_profiles,
+                "per_profile": {
+                    profile: {
+                        "count": result.get("total_samples", 0),
+                        "normalized_wer": result.get("overall", {}).get("normalized_wer", 0.0),
+                        "normalized_cer": result.get("overall", {}).get("normalized_cer", 0.0),
+                    }
+                    for profile, result in phone_per_profile.items()
+                },
+                "weighted_normalized_wer": phone_weighted_wer,
+                "profile_weights": dict(DEFAULT_PROFILE_WEIGHTS),
                 "details": phone_results,
             }
         except Exception as e:

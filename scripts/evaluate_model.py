@@ -11,7 +11,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -28,7 +28,11 @@ except Exception:
     pass
 
 from src.normalizer import PersianTextNormalizer
-from src.metrics import ASRMetricsCalculator
+from src.metrics import (
+    ASRMetricsCalculator,
+    evaluate_predictions_by_profile,
+    weighted_normalized_wer,
+)
 from src.data import PersianASRDataPipeline
 
 
@@ -57,18 +61,23 @@ def _parse_profiles(value: str):
 def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
                      use_amp, dtype, degrade_phone: bool = False,
                      phone_seed: int = 1234, profiles=None,
-                     use_ffmpeg: bool = True) -> List[str]:
-    """Transcribe a split; degrade_phone=True applies deterministic phone sim."""
+                     use_ffmpeg: bool = True) -> Tuple[List[str], List[Optional[str]]]:
+    """Transcribe a split; degrade_phone=True applies deterministic phone sim.
+
+    Returns predictions and the profile actually applied to each sample
+    (None for the clean pass).
+    """
     from tqdm import tqdm as _tqdm
     degrade_fn = None
     if degrade_phone:
         try:
-            from src.telephone import degrade_for_eval as _degrade
+            from src.telephone import degrade_for_eval_profiled as _degrade
             degrade_fn = _degrade
         except ImportError:
             print("Warning: src.telephone missing; phone eval falls back to clean.")
             degrade_fn = None
     predictions: List[str] = []
+    profiles_used: List[Optional[str]] = []
     total = len(test_ds)
     for i in _tqdm(range(0, total, batch_size), desc="Evaluating (phone)" if degrade_phone else "Evaluating (clean)"):
         batch_slice = test_ds[i: i + batch_size]
@@ -76,10 +85,14 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
         waveforms = []
         for j, a in enumerate(batch_audios):
             wav = a["array"]
+            used_profile: Optional[str] = None
             if degrade_phone and degrade_fn is not None:
-                wav = degrade_fn(wav, index=i + j, seed_base=phone_seed,
-                                 profiles=profiles or ["gated", "mobile", "pstn"],
-                                 use_ffmpeg=use_ffmpeg)
+                wav, used_profile = degrade_fn(
+                    wav, index=i + j, seed_base=phone_seed,
+                    profiles=profiles or ["gated", "mobile", "pstn"],
+                    use_ffmpeg=use_ffmpeg,
+                )
+            profiles_used.append(used_profile)
             waveforms.append(wav)
 
         feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
@@ -93,7 +106,7 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
 
         batch_preds = processor.batch_decode(predicted_ids, skip_special_tokens=True)
         predictions.extend(batch_preds)
-    return predictions
+    return predictions, profiles_used
 
 
 def main():
@@ -161,7 +174,7 @@ def main():
 
     # 4. Run Batch Inference (clean pass)
     print(f"Transcribing {total_samples} samples (clean)...")
-    predictions = transcribe_split(
+    predictions, _ = transcribe_split(
         model, processor, test_ds, args.batch_size, args.device,
         use_amp, dtype, degrade_phone=False,
     )
@@ -179,10 +192,14 @@ def main():
     # 5b. Optional phone-simulated second pass (deterministic, same subset)
     phone_results = None
     phone_predictions: List[str] = []
+    phone_per_profile: Dict[str, Dict[str, Any]] = {}
+    phone_weighted_wer: Optional[float] = None
+    phone_profile_weights: Dict[str, float] = {}
+    phone_sample_profiles: List[Optional[str]] = []
     if args.phone_eval:
         print(f"Transcribing {total_samples} samples (phone-simulated, seed={args.phone_seed})...")
         # Honor --telephony_use_ffmpeg if telephone module supports the flag.
-        phone_predictions = transcribe_split(
+        phone_predictions, phone_sample_profiles = transcribe_split(
             model, processor, test_ds, args.batch_size, args.device,
             use_amp, dtype, degrade_phone=True,
             phone_seed=args.phone_seed, profiles=profiles,
@@ -194,6 +211,31 @@ def main():
             is_informal_flags=is_informal,
         )
         print("\n" + metrics_calc.format_results_table(f"{eval_label} [phone]", phone_results) + "\n")
+
+        if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
+            phone_per_profile = evaluate_predictions_by_profile(
+                metrics_calc, references, phone_predictions,
+                [str(p) for p in phone_sample_profiles], is_informal,
+            )
+            phone_profile_weights = {
+                "gated": 0.70, "mobile": 0.15, "pstn": 0.15,
+            }
+            phone_weighted_wer = weighted_normalized_wer(
+                phone_per_profile, phone_profile_weights
+            )
+            print("Phone WER by profile:")
+            for profile, profile_result in phone_per_profile.items():
+                overall = profile_result.get("overall", {})
+                print(
+                    f"  {profile:<8} n={profile_result.get('total_samples', 0):<5} "
+                    f"WER={overall.get('normalized_wer', 0.0):5.2f}%  "
+                    f"CER={overall.get('normalized_cer', 0.0):5.2f}%"
+                )
+            print(
+                f"  weighted (70/15/15) WER={phone_weighted_wer:5.2f}%  "
+                f"(unweighted overall {phone_results.get('overall', {}).get('normalized_wer', 0.0):5.2f}%)\n"
+            )
+
         try:
             clean_wer = results.get("overall", {}).get("normalized_wer", 0.0)
             phone_wer = phone_results.get("overall", {}).get("normalized_wer", 0.0)
@@ -224,6 +266,17 @@ def main():
         payload["phone_seed"] = args.phone_seed
         payload["phone_profiles"] = profiles
         payload["phone_predictions"] = phone_predictions
+        payload["phone_sample_profiles"] = phone_sample_profiles
+        payload["phone_per_profile"] = {
+            profile: {
+                "count": result.get("total_samples", 0),
+                "normalized_wer": result.get("overall", {}).get("normalized_wer", 0.0),
+                "normalized_cer": result.get("overall", {}).get("normalized_cer", 0.0),
+            }
+            for profile, result in phone_per_profile.items()
+        }
+        payload["phone_weighted_normalized_wer"] = phone_weighted_wer
+        payload["phone_profile_weights"] = phone_profile_weights
     with open(eval_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 

@@ -7,7 +7,7 @@ Calculates WER (Word Error Rate) and CER (Character Error Rate) with:
 - Formal vs. Informal utterance breakdown
 """
 
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from src.normalizer import PersianTextNormalizer
 
 try:
@@ -42,6 +42,55 @@ def _levenshtein_distance(ref_tokens: List[str], hyp_tokens: List[str]) -> int:
                 dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
 
     return dp[r_len][h_len]
+
+
+def profile_subsets(
+    references: Sequence[str],
+    predictions: Sequence[str],
+    profiles: Sequence[str],
+    is_informal_flags: Optional[Sequence[bool]] = None,
+) -> Dict[str, Tuple[List[str], List[str], Optional[List[bool]]]]:
+    """Group references/predictions by phone profile, preserving order."""
+    if not (len(references) == len(predictions) == len(profiles)):
+        raise ValueError("references, predictions and profiles must have equal length.")
+    if is_informal_flags is not None and len(is_informal_flags) != len(references):
+        raise ValueError("is_informal_flags must match references length.")
+    groups: Dict[str, List[int]] = {}
+    for i, profile in enumerate(profiles):
+        groups.setdefault(str(profile), []).append(i)
+    out: Dict[str, Tuple[List[str], List[str], Optional[List[bool]]]] = {}
+    for profile, indices in groups.items():
+        out[profile] = (
+            [references[i] for i in indices],
+            [predictions[i] for i in indices],
+            ([bool(is_informal_flags[i]) for i in indices]
+             if is_informal_flags is not None else None),
+        )
+    return out
+
+
+def weighted_normalized_wer(
+    per_profile_results: Mapping[str, Dict[str, Any]],
+    weights: Mapping[str, float],
+) -> float:
+    """Weighted average of per-profile normalized WER (percent).
+
+    Weights are renormalized over the profiles actually present, so a
+    missing profile does not silently shrink the result.
+    """
+    present = {
+        str(profile): result
+        for profile, result in per_profile_results.items()
+        if float(weights.get(profile, 0.0)) > 0.0
+    }
+    total_weight = sum(float(weights[profile]) for profile in present)
+    if total_weight <= 0.0:
+        return 0.0
+    return sum(
+        float(weights[profile])
+        * float(result.get("overall", {}).get("normalized_wer", 0.0))
+        for profile, result in present.items()
+    ) / total_weight
 
 
 class ASRMetricsCalculator:
@@ -197,3 +246,19 @@ class ASRMetricsCalculator:
             for row in table_data:
                 lines.append(f"{row[0]:<35} | {row[1]}")
             return "\n".join(lines)
+
+
+def evaluate_predictions_by_profile(
+    calculator: ASRMetricsCalculator,
+    references: Sequence[str],
+    predictions: Sequence[str],
+    profiles: Sequence[str],
+    is_informal_flags: Optional[Sequence[bool]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Run ``evaluate_predictions`` separately for each phone profile."""
+    return {
+        profile: calculator.evaluate_predictions(refs, preds, flags)
+        for profile, (refs, preds, flags) in profile_subsets(
+            references, predictions, profiles, is_informal_flags
+        ).items()
+    }
