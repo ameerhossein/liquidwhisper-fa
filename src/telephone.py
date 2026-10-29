@@ -166,12 +166,18 @@ def _fix_length(wav: np.ndarray, target_len: int) -> np.ndarray:
 
 def resample_16k_to_8k(wav16k: np.ndarray) -> np.ndarray:
     _require_scipy()
-    return _ssignal.resample_poly(np.asarray(wav16k, dtype=np.float32), up=1, down=2).astype(np.float32)
+    x = np.asarray(wav16k, dtype=np.float32)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    return _ssignal.resample_poly(x, up=1, down=2).astype(np.float32)
 
 
 def resample_8k_to_16k(wav8k: np.ndarray) -> np.ndarray:
     _require_scipy()
-    return _ssignal.resample_poly(np.asarray(wav8k, dtype=np.float32), up=2, down=1).astype(np.float32)
+    x = np.asarray(wav8k, dtype=np.float32)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    return _ssignal.resample_poly(x, up=2, down=1).astype(np.float32)
 
 
 def bandpass_narrowband(wav8k: np.ndarray, sr: int = PHONE_SR,
@@ -179,8 +185,11 @@ def bandpass_narrowband(wav8k: np.ndarray, sr: int = PHONE_SR,
                         order: int = 5) -> np.ndarray:
     """Causal Butterworth bandpass mimicking the IRS/G.712 phone filter."""
     _require_scipy()
+    x = np.asarray(wav8k, dtype=np.float32)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
     sos = _ssignal.butter(order, [low, high], btype="band", fs=sr, output="sos")
-    return _ssignal.sosfilt(sos, np.asarray(wav8k, dtype=np.float32)).astype(np.float32)
+    return _ssignal.sosfilt(sos, x).astype(np.float32)
 
 
 def apply_low_shelf(wav8k: np.ndarray, sr: int = PHONE_SR,
@@ -356,16 +365,25 @@ def add_colored_noise_at_snr(wav: np.ndarray, snr_db: float,
 
     ``active=True`` measures speech power on active frames instead of the
     whole clip, so leading/trailing silence no longer changes the effective
-    SNR.  ``band_limit=True`` filters both the reference measurement and the
-    noise to the telephone band, making ``snr_db`` an in-band SNR.
+    SNR.  ``band_limit=True`` filters the noise and, when ``active=False``,
+    the whole-clip reference power to the telephone band, making ``snr_db``
+    an in-band SNR in both modes.
     """
     x = np.asarray(wav, dtype=np.float64)
     if not np.isfinite(snr_db):
         return x.astype(np.float32)
-    if active:
-        sig_db = (active_band_rms_db(x, *band) if band_limit
-                  else active_speech_rms_db(x))
-        sig_power = 10.0 ** (sig_db / 10.0)
+    if x.size == 0:
+        return x.astype(np.float32)
+    if band_limit:
+        if active:
+            sig_power = 10.0 ** (active_band_rms_db(x, *band) / 10.0)
+        else:
+            band_x = bandpass_narrowband(
+                x.astype(np.float32), PHONE_SR, low=band[0], high=band[1]
+            ).astype(np.float64)
+            sig_power = float(np.mean(band_x ** 2)) + 1e-12
+    elif active:
+        sig_power = 10.0 ** (active_speech_rms_db(x) / 10.0)
     else:
         sig_power = float(np.mean(x ** 2)) + 1e-12
     noise = colored_noise(len(x), PHONE_SR, rng, color=color).astype(np.float64)
@@ -405,6 +423,8 @@ def add_noise_bed(wav: np.ndarray, snr_db: float,
     """
     x = np.asarray(wav, dtype=np.float64)
     if not np.isfinite(snr_db):
+        return x.astype(np.float32)
+    if x.size == 0:
         return x.astype(np.float32)
     noise = colored_noise(len(x), PHONE_SR, rng, color=color).astype(np.float64)
     rumble_mix = float(np.clip(rumble_mix, 0.0, 1.0))
@@ -455,6 +475,8 @@ def _active_frame_energy_db(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def active_speech_rms_db(wav8k: Union[np.ndarray, Sequence[float]]) -> float:
     """Median active-frame RMS (dBFS) using the same relative VAD as the report."""
     x = np.asarray(wav8k, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return -200.0
     if len(x) < FRAME_LEN:
         return 10.0 * np.log10(float(np.mean(x ** 2)) + 1e-20)
     energy, active = _active_frame_energy_db(x)
@@ -471,8 +493,10 @@ def active_band_rms_db(wav8k: Union[np.ndarray, Sequence[float]],
     The VAD mask comes from the full-band signal, so a loud out-of-band
     component does not make the in-band level look higher than it is.
     """
-    _require_scipy()
     x = np.asarray(wav8k, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return -200.0
+    _require_scipy()
     band = bandpass_narrowband(
         x.astype(np.float32), PHONE_SR, low=low, high=high
     ).astype(np.float64)
@@ -674,8 +698,11 @@ def _format_phone_output(x8: np.ndarray, target_len: int,
                          output_sr: int) -> np.ndarray:
     """Return A-law-grid audio at 8 kHz or upsampled 16 kHz input rate."""
     x8 = np.asarray(x8, dtype=np.float32).reshape(-1)
+    target_len = int(target_len)
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
     if output_sr == PHONE_SR:
-        return _fix_length(x8, max(1, target_len // 2))
+        return _fix_length(x8, target_len // 2)
     if output_sr != TARGET_SR:
         raise ValueError(
             f"output_sr must be {PHONE_SR} or {TARGET_SR}, got {output_sr}."
@@ -722,7 +749,6 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
                     sr: int = TARGET_SR,
                     seed: Optional[int] = None,
                     use_ffmpeg: bool = True,
-                    amr_bitrate: str = "7.4k",
                     snr_db_range: Tuple[float, float] = MOBILE_SNR_DB_RANGE,
                     dropout_p: float = MOBILE_DROPOUT_P,
                     gain_db_range: Tuple[float, float] = (-1.0, 1.0),
@@ -732,7 +758,8 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
                     target_rms_db: Optional[float] = None,
                     add_line_bed: bool = True,
                     bed_snr_db_range: Tuple[float, float] = MOBILE_BED_SNR_DB_RANGE,
-                    bed_white_mix: float = NOISE_BED_WHITE_MIX) -> np.ndarray:
+                    bed_white_mix: float = NOISE_BED_WHITE_MIX,
+                    amr_bitrate: str = "7.4k") -> np.ndarray:
     """Simulate MCI/Irancell cellular: AMR-NB + coloured noise + fading.
 
     Active speech is normalised to the real noisy-line level distribution,
@@ -747,6 +774,8 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
         raise ValueError(f"simulate_mobile expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
     x = _as_float32_mono(waveform)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
     target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
@@ -812,6 +841,8 @@ def simulate_pstn(waveform: Union[np.ndarray, Sequence[float]],
         raise ValueError(f"simulate_pstn expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
     x = _as_float32_mono(waveform)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
     target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
@@ -850,15 +881,15 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
                    gain_db_range: Tuple[float, float] = (-1.0, 1.0),
                    band_low_hz: float = 300.0,
                    band_high_hz: float = 3400.0,
-                   low_shelf_db: float = 4.0,
-                   low_shelf_hz: float = 500.0,
                    output_sr: int = TARGET_SR,
                    normalize_level: bool = True,
                    target_rms_db: Optional[float] = None,
                    gate_silence: bool = True,
                    gate_relative_db: float = -35.0,
                    gate_hangover_ms: float = 150.0,
-                   gate_fade_ms: float = 5.0) -> np.ndarray:
+                   gate_fade_ms: float = 5.0,
+                   low_shelf_db: float = 4.0,
+                   low_shelf_hz: float = 500.0) -> np.ndarray:
     """Simulate a clean/gated landline recording.
 
     This is the dominant real-call population: no added line noise or hum,
@@ -874,6 +905,8 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
         raise ValueError(f"simulate_gated expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
     x = _as_float32_mono(waveform)
+    if x.size == 0:
+        return np.zeros(0, dtype=np.float32)
     target_len = len(x)
 
     x8 = resample_16k_to_8k(x)
@@ -903,10 +936,10 @@ def simulate_telephone(waveform: Union[np.ndarray, Sequence[float]],
                        profile: str = "mobile",
                        seed: Optional[int] = None,
                        use_ffmpeg: bool = True,
-                       amr_bitrate: str = "7.4k",
                        output_sr: int = TARGET_SR,
                        normalize_level: bool = True,
-                       target_rms_db: Optional[float] = None) -> np.ndarray:
+                       target_rms_db: Optional[float] = None,
+                       amr_bitrate: str = "7.4k") -> np.ndarray:
     if profile == "mobile":
         return simulate_mobile(waveform, sr=sr, seed=seed, use_ffmpeg=use_ffmpeg,
                                amr_bitrate=amr_bitrate,
@@ -965,11 +998,13 @@ def degrade_for_eval_profiled(waveform: Union[np.ndarray, Sequence[float]],
                               use_ffmpeg: bool = True) -> Tuple[np.ndarray, str]:
     """Deterministic per-sample degradation returning the applied profile."""
     profs = list(profiles) or list(DEFAULT_PROFILES)
-    profile = profs[index % len(profs)]
+    profile = str(profs[index % len(profs)])
+    if profile.lower() == "clean":
+        profile = "gated"
     degraded = simulate_telephone(waveform, sr=TARGET_SR, profile=profile,
                                   seed=int(seed_base) + int(index),
                                   use_ffmpeg=use_ffmpeg)
-    return degraded, str(profile)
+    return degraded, profile
 
 
 def degrade_for_eval(waveform: Union[np.ndarray, Sequence[float]],

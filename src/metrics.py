@@ -44,6 +44,12 @@ def _levenshtein_distance(ref_tokens: List[str], hyp_tokens: List[str]) -> int:
     return dp[r_len][h_len]
 
 
+def _canonical_profile_name(profile: Any) -> str:
+    """Normalize profile aliases used by the simulator and eval scripts."""
+    name = str(profile).strip().lower()
+    return "gated" if name == "clean" else name
+
+
 def profile_subsets(
     references: Sequence[str],
     predictions: Sequence[str],
@@ -57,7 +63,7 @@ def profile_subsets(
         raise ValueError("is_informal_flags must match references length.")
     groups: Dict[str, List[int]] = {}
     for i, profile in enumerate(profiles):
-        groups.setdefault(str(profile), []).append(i)
+        groups.setdefault(_canonical_profile_name(profile), []).append(i)
     out: Dict[str, Tuple[List[str], List[str], Optional[List[bool]]]] = {}
     for profile, indices in groups.items():
         out[profile] = (
@@ -69,27 +75,56 @@ def profile_subsets(
     return out
 
 
+def profile_weights(
+    profiles: Sequence[str],
+    defaults: Optional[Mapping[str, float]] = None,
+) -> Dict[str, float]:
+    """Return normalized weights for the configured profile names.
+
+    Known default profiles keep their corpus weights (renormalized over the
+    configured subset); custom profiles fall back to uniform weights.
+    """
+    names = list(dict.fromkeys(_canonical_profile_name(p) for p in profiles))
+    if not names:
+        raise ValueError("profiles must not be empty.")
+    if defaults and all(
+        name in defaults and float(defaults[name]) > 0.0 for name in names
+    ):
+        raw = {name: float(defaults[name]) for name in names}
+    else:
+        raw = {name: 1.0 for name in names}
+    total = sum(raw.values())
+    if total <= 0.0:
+        raise ValueError("profile weights must have a positive total.")
+    return {name: weight / total for name, weight in raw.items()}
+
+
 def weighted_normalized_wer(
     per_profile_results: Mapping[str, Dict[str, Any]],
     weights: Mapping[str, float],
 ) -> float:
     """Weighted average of per-profile normalized WER (percent).
 
-    Weights are renormalized over the profiles actually present, so a
-    missing profile does not silently shrink the result.
+    Weights are renormalized over the profiles actually present.  If no
+    result key has a matching weight, raise instead of silently reporting a
+    perfect 0.00% WER.
     """
-    present = {
-        str(profile): result
-        for profile, result in per_profile_results.items()
-        if float(weights.get(profile, 0.0)) > 0.0
-    }
-    total_weight = sum(float(weights[profile]) for profile in present)
-    if total_weight <= 0.0:
-        return 0.0
+    present: Dict[str, Dict[str, Any]] = {}
+    for profile, result in per_profile_results.items():
+        name = _canonical_profile_name(profile)
+        if float(weights.get(name, 0.0)) > 0.0:
+            present[name] = result
+    if not present:
+        raise ValueError(
+            "No profile weights match the per-profile results: "
+            f"results={sorted(str(p) for p in per_profile_results)}, "
+            f"weights={sorted(str(p) for p in weights)}."
+        )
+    total_weight = sum(float(weights[name]) for name in present)
     return sum(
-        float(weights[profile])
+        float(weights[name])
         * float(result.get("overall", {}).get("normalized_wer", 0.0))
-        for profile, result in present.items()
+        for name, result in present.items()
     ) / total_weight
 
 

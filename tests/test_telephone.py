@@ -135,6 +135,76 @@ def test_as_float32_mono_handles_empty():
 
 
 @requires_scipy
+def test_public_simulators_handle_empty_input():
+    from src import telephone
+    empty = np.zeros(0, dtype=np.float32)
+    for fn in (telephone.simulate_gated, telephone.simulate_mobile, telephone.simulate_pstn):
+        y = fn(empty, seed=0, use_ffmpeg=False)
+        assert y.size == 0, fn.__name__
+    assert telephone.resample_16k_to_8k(empty).size == 0
+    assert telephone.resample_8k_to_16k(empty).size == 0
+    assert telephone.bandpass_narrowband(empty).size == 0
+    assert telephone.active_speech_rms_db(empty) == -200.0
+    assert telephone.active_band_rms_db(empty) == -200.0
+    assert telephone.add_colored_noise_at_snr(
+        empty, 10.0, np.random.default_rng(0)
+    ).size == 0
+    assert telephone.add_noise_bed(
+        empty, 10.0, np.random.default_rng(0)
+    ).size == 0
+
+
+@requires_scipy
+def test_simulate_gated_old_positional_signature_still_works():
+    from src import telephone
+    x = _sine_mix(dur=0.2)
+    y = telephone.simulate_gated(
+        x, 16000, 0, False, (-1.0, 1.0), 300.0, 3400.0, 8000
+    )
+    assert len(y) == len(x) // 2
+
+
+@requires_scipy
+def test_simulate_mobile_old_positional_signature_still_works():
+    from src import telephone
+    x = _sine_mix(dur=0.2)
+    y = telephone.simulate_mobile(
+        x, 16000, 0, False, (18.0, 33.0), 0.0015, (-1.0, 1.0), "pink", 8000
+    )
+    assert len(y) == len(x) // 2
+
+
+@requires_scipy
+def test_simulate_telephone_old_positional_signature_still_works():
+    from src import telephone
+    x = _sine_mix(dur=0.2)
+    y = telephone.simulate_telephone(x, 16000, "mobile", 0, False, 8000)
+    assert len(y) == len(x) // 2
+
+
+@requires_scipy
+def test_add_colored_noise_band_limit_without_active_is_inband():
+    from src import telephone
+    sr = 8000
+    t = np.arange(sr, dtype=np.float64) / sr
+    x = (
+        0.1 * np.sin(2 * np.pi * 1000.0 * t)
+        + 0.1 * np.sin(2 * np.pi * 3800.0 * t)
+    ).astype(np.float32)
+    y = telephone.add_colored_noise_at_snr(
+        x, 10.0, np.random.default_rng(0), color="pink",
+        active=False, band_limit=True,
+    )
+    noise = y.astype(np.float64) - x.astype(np.float64)
+    from scipy import signal as ss
+    sos = ss.butter(5, [300.0, 3400.0], btype="band", fs=sr, output="sos")
+    xb = ss.sosfilt(sos, x.astype(np.float64))
+    nb = ss.sosfilt(sos, noise)
+    snr = 10.0 * np.log10(np.mean(xb ** 2) / (np.mean(nb ** 2) + 1e-20))
+    assert abs(snr - 10.0) < 1.5
+
+
+@requires_scipy
 def test_simulate_profiles_keep_stereo_input_length():
     from src import telephone
     t = np.arange(1600, dtype=np.float64) / 16000.0
@@ -217,6 +287,10 @@ def test_degrade_for_eval_profiled_returns_profiles_and_matches_audio():
         )
         assert prof == expected
         np.testing.assert_allclose(y, z, atol=1e-6)
+    _, alias = telephone.degrade_for_eval_profiled(
+        x, index=0, seed_base=1234, profiles=["clean"], use_ffmpeg=False
+    )
+    assert alias == "gated"
 
 
 @requires_scipy

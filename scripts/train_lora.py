@@ -834,6 +834,7 @@ def _run_post_training_evaluation(
         try:
             from src.metrics import (
                 evaluate_predictions_by_profile,
+                profile_weights,
                 weighted_normalized_wer,
             )
             from src.telephone import DEFAULT_PROFILE_WEIGHTS, degrade_for_eval_profiled
@@ -848,14 +849,22 @@ def _run_post_training_evaluation(
             print(metrics_calculator.format_results_table("BuzzASR + LoRA (Final Full Test, phone)", phone_results))
             p_overall = phone_results.get("overall", {})
             phone_per_profile = {}
+            phone_profile_weights = {}
             phone_weighted_wer = None
             if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
                 phone_per_profile = evaluate_predictions_by_profile(
                     metrics_calculator, references, phone_predictions,
                     [str(p) for p in phone_sample_profiles], is_informal,
                 )
+                phone_profile_weights = profile_weights(
+                    phone_profiles, DEFAULT_PROFILE_WEIGHTS
+                )
                 phone_weighted_wer = weighted_normalized_wer(
-                    phone_per_profile, DEFAULT_PROFILE_WEIGHTS
+                    phone_per_profile, phone_profile_weights
+                )
+                weights_label = ", ".join(
+                    f"{name}:{weight:.2f}"
+                    for name, weight in phone_profile_weights.items()
                 )
                 print("Phone WER by profile:")
                 for profile, result in phone_per_profile.items():
@@ -866,7 +875,7 @@ def _run_post_training_evaluation(
                         f"CER={overall.get('normalized_cer', 0.0):5.2f}%"
                     )
                 print(
-                    f"  weighted (70/15/15) WER={phone_weighted_wer:5.2f}%  "
+                    f"  weighted ({weights_label}) WER={phone_weighted_wer:5.2f}%  "
                     f"(unweighted overall {p_overall.get('normalized_wer', 0.0):5.2f}%)\n"
                 )
             phone_block = {
@@ -886,7 +895,7 @@ def _run_post_training_evaluation(
                     for profile, result in phone_per_profile.items()
                 },
                 "weighted_normalized_wer": phone_weighted_wer,
-                "profile_weights": dict(DEFAULT_PROFILE_WEIGHTS),
+                "profile_weights": phone_profile_weights,
                 "details": phone_results,
             }
         except Exception as e:

@@ -449,6 +449,7 @@ class WebTelemetryCallback(TrainerCallback):
                     if phone_sample_profiles and all(p is not None for p in phone_sample_profiles):
                         from src.metrics import (
                             evaluate_predictions_by_profile,
+                            profile_weights,
                             weighted_normalized_wer,
                         )
                         from src.telephone import DEFAULT_PROFILE_WEIGHTS
@@ -456,10 +457,13 @@ class WebTelemetryCallback(TrainerCallback):
                             self.metrics_calculator, references, phone_preds,
                             [str(p) for p in phone_sample_profiles], is_informal,
                         )
+                        weights = profile_weights(
+                            self.telephony_profiles, DEFAULT_PROFILE_WEIGHTS
+                        )
                         metrics["phone_per_profile"] = per_profile
-                        metrics["phone_profile_weights"] = dict(DEFAULT_PROFILE_WEIGHTS)
+                        metrics["phone_profile_weights"] = weights
                         metrics["phone_weighted_normalized_wer"] = weighted_normalized_wer(
-                            per_profile, DEFAULT_PROFILE_WEIGHTS
+                            per_profile, weights
                         )
                 except Exception as e:
                     print(f"[TelemetryCallback] Phone benchmark failed ({e}); keeping clean only.")

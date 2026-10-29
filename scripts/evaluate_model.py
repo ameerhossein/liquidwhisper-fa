@@ -31,6 +31,7 @@ from src.normalizer import PersianTextNormalizer
 from src.metrics import (
     ASRMetricsCalculator,
     evaluate_predictions_by_profile,
+    profile_weights,
     weighted_normalized_wer,
 )
 from src.data import PersianASRDataPipeline
@@ -217,11 +218,14 @@ def main():
                 metrics_calc, references, phone_predictions,
                 [str(p) for p in phone_sample_profiles], is_informal,
             )
-            phone_profile_weights = {
-                "gated": 0.70, "mobile": 0.15, "pstn": 0.15,
-            }
+            from src.telephone import DEFAULT_PROFILE_WEIGHTS
+            phone_profile_weights = profile_weights(profiles, DEFAULT_PROFILE_WEIGHTS)
             phone_weighted_wer = weighted_normalized_wer(
                 phone_per_profile, phone_profile_weights
+            )
+            weights_label = ", ".join(
+                f"{name}:{weight:.2f}"
+                for name, weight in phone_profile_weights.items()
             )
             print("Phone WER by profile:")
             for profile, profile_result in phone_per_profile.items():
@@ -232,7 +236,7 @@ def main():
                     f"CER={overall.get('normalized_cer', 0.0):5.2f}%"
                 )
             print(
-                f"  weighted (70/15/15) WER={phone_weighted_wer:5.2f}%  "
+                f"  weighted ({weights_label}) WER={phone_weighted_wer:5.2f}%  "
                 f"(unweighted overall {phone_results.get('overall', {}).get('normalized_wer', 0.0):5.2f}%)\n"
             )
 

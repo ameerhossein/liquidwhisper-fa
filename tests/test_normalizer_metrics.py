@@ -96,6 +96,35 @@ def test_profile_subsets_and_weighted_wer():
     assert abs(weighted - 14.5) < 1e-9
 
 
+def test_profile_subsets_canonicalizes_clean_alias():
+    from src.metrics import profile_subsets
+
+    subsets = profile_subsets(["a", "b"], ["a", "b"], ["clean", "mobile"])
+    assert set(subsets) == {"gated", "mobile"}
+    assert subsets["gated"][0] == ["a"]
+
+
+def test_profile_weights_for_subsets_and_aliases():
+    from src.metrics import profile_weights
+
+    weights = profile_weights(
+        ["clean", "mobile"], {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
+    )
+    assert abs(weights["gated"] - 0.70 / 0.85) < 1e-9
+    assert abs(weights["mobile"] - 0.15 / 0.85) < 1e-9
+
+
+def test_weighted_normalized_wer_raises_without_matching_weights():
+    import pytest
+    from src.metrics import weighted_normalized_wer
+
+    with pytest.raises(ValueError):
+        weighted_normalized_wer(
+            {"unknown": {"overall": {"normalized_wer": 42.0}}},
+            {"gated": 0.70, "mobile": 0.15, "pstn": 0.15},
+        )
+
+
 def test_evaluate_predictions_by_profile_counts():
     from src.metrics import evaluate_predictions_by_profile
 
