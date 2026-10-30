@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import run_state
+from src import paths, run_state
 
 RUN_A = "20261030-194700-aaaaaa"
 RUN_B = "20261031-194700-bbbbbb"
@@ -90,6 +90,12 @@ def test_create_run_writes_manifest_and_pending_stages(tmp_path):
 def test_create_run_rejects_unsafe_run_id(tmp_path):
     with pytest.raises(ValueError):
         _create(tmp_path, run_id="../escape")
+
+
+def test_create_run_rejects_duplicate_run_id(tmp_path):
+    _create(tmp_path)
+    with pytest.raises(FileExistsError):
+        _create(tmp_path)
 
 
 def test_list_runs_is_newest_first(tmp_path):
@@ -238,6 +244,14 @@ def test_set_progress_updates_run_manifest(tmp_path):
     assert run_state.load_run(run_dir)["step_count"] == 1230
 
 
+def test_read_steps_missing_file_is_empty(tmp_path):
+    run = _create(tmp_path)
+    run_dir = run["paths"]["run_dir"]
+
+    assert run_state.read_steps(run_dir) == []
+    assert run_state.step_count(run_dir) == 0
+
+
 def test_append_step_reads_tail_and_skips_bad_trailing_line(tmp_path):
     run = _create(tmp_path)
     run_dir = Path(run["paths"]["run_dir"])
@@ -292,7 +306,9 @@ def test_attempt_lifecycle_and_reconcile_stopped(tmp_path):
     run_state.update_run(
         run_dir, lambda current: {**current, "stop_requested_at": time.time()}
     )
-    stopped = run_state.reconcile(run_dir, pid_alive=False, exit_code=None)
+    stopped = run_state.reconcile(
+        run_dir, pid_alive=False, exit_code=None, reason="process_exit"
+    )
 
     assert stopped["status"] == "stopped"
     stages = _stages_by_name(stopped)
@@ -301,6 +317,32 @@ def test_attempt_lifecycle_and_reconcile_stopped(tmp_path):
     assert stages["merge"]["status"] == "skipped"
     assert stopped["current_pid"] is None
     assert stopped["attempts"][-1]["ended_at"] is not None
+    assert stopped["attempts"][-1]["reason"] == "halted"
+
+
+def test_reconcile_stopped_without_running_stage_skips_later_stages(tmp_path):
+    run = _create(tmp_path)
+    run_dir = run["paths"]["run_dir"]
+    run_state.set_stage(run_dir, "preflight", "completed")
+    run_state.update_run(
+        run_dir, lambda current: {**current, "current_stage": "training"}
+    )
+    run_state.set_status(run_dir, "running")
+    run_state.start_attempt(run_dir, 4243)
+    run_state.update_run(
+        run_dir, lambda current: {**current, "stop_requested_at": time.time()}
+    )
+
+    stopped = run_state.reconcile(
+        run_dir, pid_alive=False, exit_code=None, reason="process_exit"
+    )
+
+    assert stopped["status"] == "stopped"
+    stages = _stages_by_name(stopped)
+    assert stages["preflight"]["status"] == "completed"
+    assert stages["training"]["status"] == "pending"
+    assert stages["post_eval"]["status"] == "skipped"
+    assert stages["merge"]["status"] == "skipped"
     assert stopped["attempts"][-1]["reason"] == "halted"
 
 
@@ -430,6 +472,41 @@ def test_reconcile_all_finds_older_live_run(tmp_path):
     assert by_id[RUN_B]["status"] == "interrupted"
 
 
+def test_reconcile_all_treats_is_alive_errors_as_alive(tmp_path):
+    root = tmp_path / "runs"
+    run = _create(root, RUN_A)
+    run_dir = run["paths"]["run_dir"]
+    run_state.start_attempt(run_dir, 4040)
+    run_state.set_status(run_dir, "running")
+
+    def probe(pid):
+        raise OSError("process probe unavailable")
+
+    summary = run_state.reconcile_all(root, is_alive=probe)
+
+    assert summary["active_run"]["run_id"] == RUN_A
+    assert summary["latest_run"]["status"] == "running"
+    assert summary["runs"][0]["current_pid"] == 4040
+
+
+def test_reconcile_all_reconciles_scanned_directory(tmp_path):
+    root = tmp_path / "runs"
+    run = _create(root, RUN_A)
+    run_dir = Path(run["paths"]["run_dir"])
+    # Simulate a manifest whose id no longer matches its directory name. The
+    # scanner must reconcile the directory it actually read, not a synthetic
+    # runs_root / manifest["run_id"] path.
+    run_state.update_run(run_dir, lambda current: {**current, "run_id": RUN_B})
+    run_state.start_attempt(run_dir, 5050)
+    run_state.set_status(run_dir, "running")
+
+    summary = run_state.reconcile_all(root, is_alive=lambda pid: False)
+
+    assert summary["latest_run"]["run_id"] == RUN_B
+    assert run_state.load_run(run_dir)["status"] == "interrupted"
+    assert not (root / RUN_B).exists()
+
+
 def test_reconcile_all_reports_live_merge_run(tmp_path):
     root = tmp_path / "runs"
     run = _create(root, RUN_C)
@@ -446,9 +523,9 @@ def test_reconcile_all_reports_live_merge_run(tmp_path):
 
 
 def test_storage_info_marks_workspace_persistent(tmp_path, monkeypatch):
-    workspace = run_state.storage_info("/workspace/stt-outputs/results/runs")
+    workspace = run_state.storage_info(paths.RUNS_DIR_PERSISTENT)
     assert workspace["persistent"] is True
-    assert workspace["runs_dir"] == "/workspace/stt-outputs/results/runs"
+    assert workspace["runs_dir"] == paths.RUNS_DIR_PERSISTENT
 
     local = run_state.storage_info(tmp_path / "runs")
     assert local["persistent"] is False

@@ -4,9 +4,9 @@ One directory per run, rooted at the managed runs directory:
 
     <runs_root>/<run_id>/run.json      atomic manifest
     <runs_root>/<run_id>/steps.jsonl   append-only per-step records
-    <runs_root>/<run_id>/events.jsonl  append-only stage/attempt events
-    <runs_root>/<run_id>/output/       checkpoints and adapter
-    <runs_root>/<run_id>/merged/       merge output
+    <runs_root>/<run_id>/events.jsonl  append-only stage/status events
+    <runs_root>/<run_id>/output/       checkpoints and adapter (created here)
+    <runs_root>/<run_id>/merged/       merge output (created by the merge step)
 
 The module is intentionally stdlib-only: the FastAPI server, the trainer, and
 tests on a CPU-only machine can all share it without importing torch.
@@ -250,25 +250,33 @@ def load_run(run_dir: str | Path) -> dict | None:
     return _read_json(_manifest_path(run_dir))
 
 
-def _load_all_runs(runs_root: str | Path) -> list[dict]:
+def _load_run_entries(runs_root: str | Path) -> list[tuple[Path, dict]]:
+    """Return ``(scanned_directory, manifest)`` pairs newest first."""
     root = Path(runs_root)
     try:
         entries = sorted(root.iterdir(), key=lambda entry: entry.name, reverse=True)
     except OSError:
         return []
 
-    runs: list[dict] = []
+    runs: list[tuple[Path, dict]] = []
     for entry in entries:
         if not entry.is_dir() or not run_id_valid(entry.name):
             continue
         run = load_run(entry)
         if run is not None:
-            runs.append(run)
+            runs.append((entry, run))
     runs.sort(
-        key=lambda run: (_as_float(run.get("created_at")), str(run.get("run_id") or "")),
+        key=lambda pair: (
+            _as_float(pair[1].get("created_at")),
+            str(pair[1].get("run_id") or ""),
+        ),
         reverse=True,
     )
     return runs
+
+
+def _load_all_runs(runs_root: str | Path) -> list[dict]:
+    return [run for _run_dir, run in _load_run_entries(runs_root)]
 
 
 def list_runs(runs_root: str | Path, limit: int = 50) -> list[dict]:
@@ -584,7 +592,8 @@ def _reconcile_run(
     post_eval_status = post_eval.get("status") if post_eval else "pending"
 
     failed_stage: str | None = None
-    if run.get("stop_requested_at"):
+    stop_requested = bool(run.get("stop_requested_at"))
+    if stop_requested:
         new_status = "stopped"
         attempt_reason = "halted"
         if running_stage is not None:
@@ -625,7 +634,8 @@ def _reconcile_run(
     run["failed_stage"] = failed_stage
     run["ended_at"] = now
     run["current_pid"] = None
-    _finish_open_attempt(run, exit_code, reason or attempt_reason)
+    final_reason = "halted" if stop_requested else (reason or attempt_reason)
+    _finish_open_attempt(run, exit_code, final_reason)
     return run
 
 
@@ -666,7 +676,7 @@ def reconcile_all(
     is_alive: Callable[[int], bool],
 ) -> dict:
     """Scan every run for live trainer/merge PIDs and reconcile dead runs."""
-    runs = _load_all_runs(runs_root)
+    entries = _load_run_entries(runs_root)
     alive_cache: dict[int, bool] = {}
 
     def alive(pid: int) -> bool:
@@ -674,41 +684,38 @@ def reconcile_all(
             try:
                 alive_cache[pid] = bool(is_alive(pid))
             except Exception:
-                alive_cache[pid] = False
+                # An unavailable process probe is unknown, not proof of death.
+                # Treat the PID as alive so a probe failure never terminalizes
+                # a run whose process may still be working.
+                alive_cache[pid] = True
         return alive_cache[pid]
 
-    active_run: dict | None = None
-    merge_run: dict | None = None
-    for run in runs:
+    active_index: int | None = None
+    merge_index: int | None = None
+    for index, (_run_dir, run) in enumerate(entries):
         pid = _as_pid(run.get("current_pid"))
-        if active_run is None and pid is not None and alive(pid):
-            active_run = run
+        if active_index is None and pid is not None and alive(pid):
+            active_index = index
         merge_pid = _as_pid(run.get("merge_pid"))
-        if merge_run is None and merge_pid is not None and alive(merge_pid):
-            merge_run = run
+        if merge_index is None and merge_pid is not None and alive(merge_pid):
+            merge_index = index
 
     refreshed: list[dict] = []
-    for run in runs:
+    for run_dir, run in entries:
         if run.get("status") in _ACTIVE_RUN_STATUSES:
             pid = _as_pid(run.get("current_pid"))
             if pid is None or not alive(pid):
-                run_dir = Path(runs_root) / str(run.get("run_id") or "")
                 try:
                     run = reconcile(run_dir, pid_alive=False, exit_code=None)
                 except FileNotFoundError:
                     pass
         refreshed.append(run)
 
-    by_id = {run.get("run_id"): run for run in refreshed}
-    if active_run is not None:
-        active_run = by_id.get(active_run.get("run_id"), active_run)
-    if merge_run is not None:
-        merge_run = by_id.get(merge_run.get("run_id"), merge_run)
     latest_run = refreshed[0] if refreshed else None
     return {
-        "active_run": active_run,
+        "active_run": refreshed[active_index] if active_index is not None else None,
         "latest_run": latest_run,
-        "merge_run": merge_run,
+        "merge_run": refreshed[merge_index] if merge_index is not None else None,
         "runs": refreshed,
     }
 
