@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Multi-voice validation for the telephone profiles.
 
-Runs the gated/mobile/PSTN profiles on independent Persian speaker clips and
-compares the speech-band metrics with the real gated/noisy corpora.  This is
-the check that separates source-voice colour from channel colour: if the
-mobile/PSTN output tracks the source HF content, a fixed high shelf is not
-justified.
+Runs the customer profile (and any explicit legacy profiles) on independent
+Persian speaker clips and compares the speech-band metrics with the answered
+customer target. This separates source-voice colour from channel colour.
 
 Example:
     python RecordingTesting/analysis/multi_voice_check.py \
@@ -28,7 +26,8 @@ sys.path.insert(0, str(ROOT / "RecordingTesting" / "analysis"))
 import compare_telephone as C  # noqa: E402
 from src.telephone import simulate_telephone  # noqa: E402
 
-PROFILES = ("gated", "mobile", "pstn")
+PROFILES = ("customer",)
+PROFILE_CHOICES = ("customer", "gated", "mobile", "pstn")
 FIELDS = [
     "speech_rms_db", "noise_rms_db", "line_noise_db", "line_snr_db",
     "spec_centroid", "spec_roll95", "hf_1_2k_rel_db", "hf_2_3k_rel_db",
@@ -44,6 +43,12 @@ def parse_args():
                    default=Path("/tmp/opencode/voicecheck"))
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2])
     p.add_argument("--min-duration", type=float, default=2.0)
+    p.add_argument("--profiles", nargs="+", default=list(PROFILES),
+                   choices=list(PROFILE_CHOICES))
+    p.add_argument(
+        "--content-manifest", type=Path,
+        default=ROOT / "RecordingTesting" / "analysis" / "answered_customer_manifest.csv",
+    )
     return p.parse_args()
 
 
@@ -63,19 +68,37 @@ def med_iqr(values):
             float(np.percentile(vals, 75))]
 
 
-def load_real_targets():
-    summary = json.loads(
-        (ROOT / "RecordingTesting" / "analysis" / "summary.json").read_text()
-    )
+def load_real_targets(manifest_path: Path):
     out = {}
-    for key in ("real_gated", "real_noisy"):
-        out[key] = {}
-        for name, vals in summary[key]["metrics"].items():
-            if name in FIELDS:
-                out[key][name] = {
-                    "median": float(vals[0]),
-                    "iqr": [float(vals[1]), float(vals[2])],
+    if manifest_path.is_file():
+        with open(manifest_path, newline="", encoding="utf-8") as fh:
+            rows = [
+                r for r in csv.DictReader(fh)
+                if str(r.get("calibration", "")).lower() == "true"
+            ]
+        out["real_customer"] = {}
+        for name in FIELDS:
+            vals = [float(r[name]) for r in rows
+                    if r.get(name) not in (None, "", "nan", "NaN")]
+            if vals:
+                out["real_customer"][name] = {
+                    "median": float(np.median(vals)),
+                    "iqr": [float(np.percentile(vals, 25)),
+                            float(np.percentile(vals, 75))],
                 }
+    summary_path = ROOT / "RecordingTesting" / "analysis" / "summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text())
+        for key in ("real_gated", "real_noisy"):
+            if key not in summary:
+                continue
+            out[key] = {}
+            for name, vals in summary[key]["metrics"].items():
+                if name in FIELDS:
+                    out[key][name] = {
+                        "median": float(vals[0]),
+                        "iqr": [float(vals[1]), float(vals[2])],
+                    }
     return out
 
 
@@ -101,7 +124,7 @@ def main():
             if x.ndim > 1:
                 x = x[:, 0]
             src = scalar_row(C.analyze_file(path, speaker))
-            for profile in PROFILES:
+            for profile in args.profiles:
                 y = simulate_telephone(
                     x, sr=16000, profile=profile, seed=seed,
                     use_ffmpeg=True, output_sr=16000,
@@ -128,9 +151,10 @@ def main():
         writer.writerows(rows)
     print(f"\nwrote {files_csv} ({len(rows)} synth rows)")
 
-    real = load_real_targets()
-    summary = {"n_sources": len(sources), "seeds": args.seeds, "profiles": {}}
-    for profile in PROFILES:
+    real = load_real_targets(args.content_manifest)
+    summary = {"n_sources": len(sources), "seeds": args.seeds,
+               "profiles": {}, "real_customer": real.get("real_customer")}
+    for profile in args.profiles:
         pr = [r for r in rows if r["profile"] == profile]
         summary["profiles"][profile] = {
             name: med_iqr([r[f"out_{name}"] for r in pr])
@@ -140,10 +164,10 @@ def main():
     summary["speakers"] = {}
     for speaker in sorted({r["speaker"] for r in rows}):
         summary["speakers"][speaker] = {}
-        for profile in ("source",) + PROFILES:
+        for profile in ("source",) + tuple(args.profiles):
             if profile == "source":
                 pr = [r for r in rows if r["speaker"] == speaker
-                      and r["profile"] == "gated"]
+                      and r["profile"] == args.profiles[0]]
                 prefix = "src_"
             else:
                 pr = [r for r in rows if r["speaker"] == speaker
@@ -157,7 +181,7 @@ def main():
             }
 
     summary["channel_delta"] = {}
-    for profile in PROFILES:
+    for profile in args.profiles:
         pr = [r for r in rows if r["profile"] == profile]
         summary["channel_delta"][profile] = {}
         for name in ("hf_1_2k_rel_db", "hf_2_3k_rel_db", "hf_3_4k_rel_db"):
@@ -172,7 +196,7 @@ def main():
             }
 
     summary["overlap_real_noisy"] = {}
-    for profile in PROFILES:
+    for profile in args.profiles:
         pr = [r for r in rows if r["profile"] == profile]
         summary["overlap_real_noisy"][profile] = {}
         for name in ("hf_1_2k_rel_db", "hf_2_3k_rel_db", "hf_3_4k_rel_db"):
@@ -188,7 +212,7 @@ def main():
     print(f"wrote {summary_path}")
 
     print("\nprofile medians (real noisy in brackets)")
-    for profile in PROFILES:
+    for profile in args.profiles:
         m = summary["profiles"][profile]
         print(f"\n{profile}")
         for name in ("spec_centroid", "spec_roll95", "hf_1_2k_rel_db",
@@ -203,7 +227,7 @@ def main():
                   f"inside={inside*100:5.1f}%")
 
     print("\nchannel delta (output - source)")
-    for profile in PROFILES:
+    for profile in args.profiles:
         for name, v in summary["channel_delta"][profile].items():
             print(f"  {profile:6} {name:20} "
                   f"median={v['median_delta_db']:7.2f} dB  r={v['corr']: .3f}")

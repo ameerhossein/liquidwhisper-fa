@@ -494,8 +494,8 @@ def main() -> None:
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument(
-        "--profiles", nargs="+", default=["gated", "mobile", "pstn"],
-        choices=["gated", "mobile", "pstn"],
+        "--profiles", nargs="+", default=["customer"],
+        choices=["customer", "gated", "mobile", "pstn"],
     )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--threads", type=int, default=0)

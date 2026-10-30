@@ -239,7 +239,7 @@ def render_html(cards: Sequence[Dict[str, object]],
         "gated calls have no transcripts and no clean counterparts. Judge the "
         "noise floor, bandlimit and gating character only, not word accuracy "
         "on identical content.</p>",
-        '<section class="card"><h3>Real gated calls (call-center recordings, mostly mobile-originated)</h3>',
+        '<section class="card"><h3>Real answered customer calls (call-center recordings, mostly mobile-originated)</h3>',
     ]
     for entry in gated_real:
         parts.append(audio_row(
@@ -248,7 +248,7 @@ def render_html(cards: Sequence[Dict[str, object]],
         ))
     parts += [
         "</section>",
-        '<section class="card"><h3>Simulated gated profile</h3>',
+        '<section class="card"><h3>Simulated customer profile</h3>',
     ]
     for entry in gated_sim:
         parts.append(audio_row(
@@ -369,7 +369,7 @@ def main() -> None:
                 f"Legacy synth {profile.upper()}", legacy, legacy_sr,
                 f"legacy_{profile}", "older synth output", str(legacy_path),
             ))
-        for profile in ("mobile", "pstn", "gated"):
+        for profile in ("customer",):
             sim = simulate_telephone(
                 clean, sr=16000, profile=profile, seed=args.seed,
                 use_ffmpeg=args.use_ffmpeg, output_sr=8000,
@@ -437,14 +437,14 @@ def main() -> None:
     for index, path in enumerate(selected[: args.n_gated], 1):
         audio, sr = read_audio(path)
         sim = simulate_telephone(
-            audio, sr=sr, profile="gated", seed=args.seed,
+            audio, sr=sr, profile="customer", seed=args.seed,
             use_ffmpeg=args.use_ffmpeg, output_sr=8000,
         )
         sim, gain_db = level_match(sim, 8000)
         out = out_dir / "gated_sim" / f"sim_gated_{index:02d}.wav"
         write_wav(out, sim, 8000)
         entry = {
-            "label": f"Simulated gated {index:02d}",
+            "label": f"Simulated customer {index:02d}",
             "path": str(out),
             "sr": 8000,
             "duration_s": round(len(sim) / 8000, 3),

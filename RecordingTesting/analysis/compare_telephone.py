@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Compare synthetic telephone-simulated speech against real recorded phone calls.
+Historical legacy report: synthetic telephone-simulated speech vs real calls.
+
+This predates the single `customer` profile. It uses the old `gated`,
+`mobile`, and `pstn` labels and the `FakePhoneCalls` legacy synth files; the
+current customer validation lives in `gated_spectrum_check.py` and
+`multi_voice_check.py`.
 
 Produces:
   features_files.csv      one row per recording

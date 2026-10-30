@@ -71,11 +71,25 @@ def read_source(path: Path, target_sr: int) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
-def real_gated_psds(real_dir: Path):
+def real_gated_psds(real_dir: Path, manifest: Path | None = None,
+                    outside_dir: Path | None = None):
+    paths = []
+    if manifest is not None and manifest.is_file():
+        with open(manifest, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                if str(row.get("calibration", "")).lower() != "true":
+                    continue
+                if row.get("source") == "outside":
+                    if outside_dir is not None:
+                        paths.append(outside_dir / row["path"])
+                else:
+                    paths.append(real_dir / row["file"])
+    else:
+        paths = sorted(real_dir.glob("*.wav"))
     psds = []
-    for path in sorted(real_dir.glob("*.wav")):
+    for path in paths:
         row = ct.analyze_file(path, "real")
-        if row and row.get("is_gated") and row.get("_loud_psd_norm") is not None:
+        if row and row.get("_loud_psd_norm") is not None:
             psds.append(row["_loud_psd_norm"])
     return psds
 
@@ -89,9 +103,10 @@ def clean_source_psds(voice_dir: Path, n_sources=48):
     return psds
 
 
-def synth_gated_psds(voice_dir: Path, seeds, n_sources=48,
-                     band_low=300.0, band_high=3400.0,
-                     low_shelf_db=4.0, low_shelf_hz=500.0):
+def synth_customer_psds(voice_dir: Path, seeds, n_sources=48,
+                        band_low=300.0, band_high=3400.0,
+                        low_shelf_db=4.0, low_shelf_hz=500.0,
+                        eq: bool = True):
     psds = []
     sources = sorted(voice_dir.glob("*/*.wav"))[:n_sources]
     if not sources:
@@ -99,10 +114,11 @@ def synth_gated_psds(voice_dir: Path, seeds, n_sources=48,
     for path in sources:
         x = read_source(path, tel.TARGET_SR)
         for seed in seeds:
-            y = tel.simulate_gated(
+            y = tel.simulate_customer(
                 x, sr=tel.TARGET_SR, seed=int(seed), output_sr=tel.PHONE_SR,
                 band_low_hz=band_low, band_high_hz=band_high,
                 low_shelf_db=low_shelf_db, low_shelf_hz=low_shelf_hz,
+                eq_gains_db=None if eq else {},
             )
             psd = loud_psd_for_audio(y)
             if psd is not None:
@@ -179,8 +195,24 @@ def main():
         default=ROOT / "RecordingTesting" / "telephone_clips" / "RealRecordedPhoneCalls",
     )
     parser.add_argument(
+        "--outside-dir", type=Path,
+        default=Path("/home/ameer/TerasVoice/Outside"),
+    )
+    parser.add_argument(
+        "--content-manifest", type=Path,
+        default=HERE / "answered_customer_manifest.csv",
+    )
+    parser.add_argument(
         "--voice-dir", type=Path,
         default=Path("/home/ameer/Hobbies/voiceprint/fa_clips"),
+    )
+    parser.add_argument(
+        "--eq", action=argparse.BooleanOptionalAction, default=True,
+        help="Apply the measured customer 1/3-octave EQ (default: on).",
+    )
+    parser.add_argument(
+        "--legacy-gated", action="store_true",
+        help="Reproduce the old all-gated, no-EQ comparison.",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     parser.add_argument("--n-sources", type=int, default=48)
@@ -200,17 +232,26 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     freqs = ct.frame_psd(np.zeros(1024))[1]
-    real = real_gated_psds(args.real_dir)
+    if args.legacy_gated:
+        real = real_gated_psds(args.real_dir)
+        synth = synth_customer_psds(
+            args.voice_dir, args.seeds, args.n_sources,
+            args.band_low, args.band_high, args.low_shelf_db, args.low_shelf_hz,
+            eq=False,
+        )
+    else:
+        real = real_gated_psds(args.real_dir, args.content_manifest, args.outside_dir)
+        synth = synth_customer_psds(
+            args.voice_dir, args.seeds, args.n_sources,
+            args.band_low, args.band_high, args.low_shelf_db, args.low_shelf_hz,
+            eq=args.eq,
+        )
     clean = clean_source_psds(args.voice_dir, args.n_sources)
-    synth = synth_gated_psds(
-        args.voice_dir, args.seeds, args.n_sources,
-        args.band_low, args.band_high, args.low_shelf_db, args.low_shelf_hz,
-    )
     real_levels = octave_levels(real, freqs)
     clean_levels = octave_levels(clean, freqs)
     synth_levels = octave_levels(synth, freqs)
 
-    print(f"real gated files: {len(real)}; clean sources: {len(clean)}; "
+    print(f"real customer files: {len(real)}; clean sources: {len(clean)}; "
           f"synth outputs: {len(synth)}")
     print("Hz   real_dB  clean_dB  synth_dB  diff_dB")
     for center, real_db, clean_db, synth_db in zip(
@@ -286,14 +327,14 @@ def main():
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(CENTERS))
-    ax.plot(x, real_levels, "o-", label="Real gated calls")
+    ax.plot(x, real_levels, "o-", label="Real answered customer")
     ax.plot(x, clean_levels, "--", label="Clean source")
-    ax.plot(x, synth_levels, "s-", label="Simulated gated")
+    ax.plot(x, synth_levels, "s-", label="Simulated customer")
     ax.set_xticks(x)
     ax.set_xticklabels([str(c) for c in CENTERS], rotation=45)
     ax.set_xlabel("1/3-octave center (Hz)")
     ax.set_ylabel("Loud-frame PSD (dB re 1 kHz)")
-    ax.set_title("Gated channel: real vs simulated")
+    ax.set_title("Customer channel: real vs simulated")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()

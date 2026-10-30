@@ -133,7 +133,7 @@ def main() -> None:
         summarize_real(features, "extension"),
         summarize_real(features, "landline"),
         summarize_real(features, "other"),
-        summarize_synth(multi_voice, "gated"),
+        summarize_synth(multi_voice, "customer"),
         summarize_synth(multi_voice, "mobile"),
         summarize_synth(multi_voice, "pstn"),
     ]

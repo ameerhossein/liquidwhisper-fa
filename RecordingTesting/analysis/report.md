@@ -717,3 +717,58 @@ real recordings with transcripts of the same content, or human transcripts
 for the 77 real gated calls. `smoke_wer.py` accepts `--real-gated-manifest`
 for a JSON mapping of recording path to transcript if those transcripts
 become available.
+
+---
+
+## 2026-10-30 correction: ringback music and the customer profile
+
+The earlier gated-vs-noisy split was acoustic, not content-aware. An AudioSet
+classifier (`MIT/ast-finetuned-audioset-10-10-0.4593`, 10 s windows) shows
+that a large share of the recordings are **ringback/hold music before
+pickup**, not customer speech.
+
+`RealRecordedPhoneCalls` (107 files): 62 speech-only, 38 music-only, 4
+music-then-speech, 1 mixed, 2 empty. Of the 77 gated files, **42 are answered
+speech and 35 are music-only**. The old gated profile was therefore fitted to
+an approximately 45%-music mixture. The outside 213-file sample shows the
+same pattern: the 52 clearly noisy calls are 42 music-only, while the 111
+quiet-noisy calls are 107 answered speech.
+
+The customer profile is now calibrated on **67 answered gated mobile-customer
+files** (36 in-repo + 31 outside; `speech_only`, `is_gated=True`,
+`caller_class=mobile`). The target is:
+
+| Metric | Median | IQR |
+|---|---:|---:|
+| Active speech RMS | −25.6 dBFS | −28.5 … −19.5 |
+| Noise floor | −71.3 dBFS | −72.0 … −69.0 |
+| HF 1–2 kHz rel. 0.3–1 kHz | −15.1 dB | −24.3 … −9.2 |
+| HF 2–3.4 kHz rel. 0.3–1 kHz | −27.5 dB | −33.8 … −20.8 |
+| Speech centroid | 459 Hz | 450 … 545 |
+| 95% rolloff | 688 Hz | 563 … 1,094 |
+| Speech fraction | 0.70 | 0.70 … 0.70 |
+
+The broadband HF figures are dominated by the 0.3–1 kHz denominator, so the
+EQ was fitted on answered-only loud-frame 1/3-octave bands. The measured
+in-band correction is a 315 Hz cut, a 400–500 Hz boost, a 3150 Hz cut, and a
+nearly flat 630–2500 Hz region. Final 46-voice × 3-seed fit:
+
+| Hz | Target | Before (`gated`) | After (`customer`) |
+|---:|---:|---:|---:|
+| 315 | +4.5 | +9.3 | +4.5 |
+| 400 | +13.0 | +8.7 | +12.4 |
+| 500 | +13.0 | +9.0 | +12.2 |
+| 630 | +9.4 | +7.5 | +8.8 |
+| 800 | +3.8 | +3.2 | +3.4 |
+| 1250 | −1.7 | −3.6 | −2.1 |
+| 1600 | −3.7 | −5.0 | −4.0 |
+| 2000 | −12.3 | −10.7 | −12.7 |
+| 2500 | −13.8 | −12.0 | −14.6 |
+| 3150 | −19.8 | −11.2 | −18.6 |
+
+All 315–3150 Hz residuals are within ±2 dB. The 3150 Hz band needs a wider
+(Q≈3) peaking filter because it sits against the 3400 Hz band edge. The
+customer chain has no line-noise bed, dropouts, or AMR; `mobile` and `pstn`
+remain explicit legacy profiles only. Reproduce the fit with
+`RecordingTesting/analysis/fit_customer_eq.py` and the target with
+`answered_customer_bands.csv` / `answered_customer_manifest.csv`.
