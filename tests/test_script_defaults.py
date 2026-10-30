@@ -51,6 +51,18 @@ def test_train_lora_parser_matches_fast_l40s_defaults(monkeypatch):
     assert args.max_benchmark_samples == 1000
     assert args.preflight_samples is None
     assert args.telephony_prob == 0.5
+    assert args.lr_scheduler_type == "cosine"
+
+
+def test_train_lora_parser_accepts_scheduler_override(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import parse_args
+
+    monkeypatch.setattr(
+        sys, "argv", ["train_lora.py", "--lr_scheduler_type", "linear"]
+    )
+    assert parse_args().lr_scheduler_type == "linear"
 
 
 @pytest.mark.parametrize("value", ["-1", "10001"])
@@ -90,6 +102,7 @@ def test_l40s_config_matches_fast_defaults():
     assert training["gradient_checkpointing"] is False
     assert training["max_benchmark_samples"] == 1000
     assert training["preflight_samples"] == 1000
+    assert training["lr_scheduler_type"] == "cosine"
     assert cfg["telephony"]["prob"] == 0.5
 
 

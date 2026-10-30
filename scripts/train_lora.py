@@ -104,6 +104,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate for LoRA")
     parser.add_argument("--epochs", type=int, default=4, help="Total training epochs")
     parser.add_argument("--warmup_steps", type=int, default=500, help="Linear warmup steps")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="Learning-rate schedule (e.g. cosine, linear)")
     parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate every N steps")
     parser.add_argument("--save_steps", type=int, default=1000, help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
@@ -184,6 +185,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "batch_size": "batch_size", "grad_accum": "grad_accum",
         "learning_rate": "learning_rate", "epochs": "epochs",
         "num_train_epochs": "epochs", "warmup_steps": "warmup_steps",
+        "lr_scheduler_type": "lr_scheduler_type",
         "eval_steps": "eval_steps", "save_steps": "save_steps",
         "save_total_limit": "save_total_limit", "num_workers": "num_proc",
         "num_proc": "num_proc", "eval_batch_size": "eval_batch_size",
@@ -680,6 +682,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
         num_train_epochs=args.epochs,
         gradient_checkpointing=args.gradient_checkpointing,
         fp16=not use_bf16 and torch.cuda.is_available(),
