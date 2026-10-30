@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Fit the customer 1/3-octave EQ to the answered-speech target.
 
-The script measures the baseline customer chain (no EQ) on clean voices,
-compares it with the committed answered-customer band table, and iteratively
-updates the peaking gains. It is an offline analysis tool; the runtime
-simulator uses the constants pasted into ``src/telephone.py``.
+The script measures the customer chain on clean voices, compares per-file
+normalized 1/3-octave shapes with the committed answered-customer band table,
+and iteratively updates the peaking gains. It is an offline analysis tool; the
+runtime simulator uses the constants pasted into ``src/telephone.py``.
 
 By default the fit starts from ``CUSTOMER_EQ_INITIAL_GAINS_DB`` (the measured
-target-minus-gated delta), so the JSON history shows the actual fit. Use
-``--initial-gains final`` only to inspect the shipped constants. Use
-``--holdout-speakers`` to fit on the remaining speakers and report a true
-speaker-held-out residual table.
+target-minus-gated delta) and uses the documented 8 iterations / 0.5 damping,
+so the JSON history is reproducible. Use ``--initial-gains final`` only to
+inspect the shipped constants. Use ``--holdout-speakers`` to fit on the
+remaining speakers and report a true speaker-held-out residual table.
 """
 
 from __future__ import annotations
@@ -39,12 +39,17 @@ PRIMARY = [315.0, 400.0, 500.0, 630.0, 800.0, 1250.0, 1600.0, 2000.0, 2500.0, 31
 def read_bands(path: Path) -> dict[float, float]:
     with open(path, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
-    med = {
-        center: float(np.median([float(r[f"hz_{center}"]) for r in rows]))
-        for center in gs.CENTERS
-    }
-    ref = med[1000]
-    return {center: med[center] - ref for center in gs.CENTERS}
+    # Normalize each file to its own 1 kHz band before taking the median.
+    # The old difference-of-medians method was biased by between-file level
+    # correlation and over-cut the high bands.
+    shapes = []
+    for row in rows:
+        ref = float(row["hz_1000"])
+        shapes.append([
+            float(row[f"hz_{center}"]) - ref for center in gs.CENTERS
+        ])
+    med = np.median(np.asarray(shapes, dtype=np.float64), axis=0)
+    return {center: float(value) for center, value in zip(gs.CENTERS, med)}
 
 
 def synth_levels(voice_dir: Path, seeds, n_sources: int,
@@ -68,7 +73,7 @@ def synth_levels(voice_dir: Path, seeds, n_sources: int,
             if psd is not None:
                 psds.append(psd)
     freqs = ct.frame_psd(np.zeros(1024))[1]
-    levels = gs.octave_levels(psds, freqs)
+    levels = gs.octave_shape(psds, freqs)
     return dict(zip(gs.CENTERS, map(float, levels)))
 
 
@@ -98,8 +103,8 @@ def main() -> None:
     )
     parser.add_argument("--n-sources", type=int, default=46)
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
-    parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--damping", type=float, default=0.7)
+    parser.add_argument("--iterations", type=int, default=8)
+    parser.add_argument("--damping", type=float, default=0.5)
     parser.add_argument(
         "--initial-gains", choices=["initial", "final"], default="initial",
         help="Start from the measured delta (default) or the shipped constants.",

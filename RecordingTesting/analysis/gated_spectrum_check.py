@@ -36,20 +36,49 @@ CENTERS = [125, 160, 200, 250, 315, 400, 500, 630, 800,
            1000, 1250, 1600, 2000, 2500, 3150, 4000]
 
 
-def octave_levels(psds, freqs, centers=CENTERS, ref_hz=1000.0):
-    """Median 1/3-octave band levels in dB, normalized at ``ref_hz``."""
-    if not psds:
-        raise ValueError("no spectra to summarize")
+def _octave_levels_abs(psd, freqs, centers=CENTERS):
+    """Absolute 1/3-octave band levels for one spectrum."""
     levels = []
     for center in centers:
         lo = center / 2.0 ** (1.0 / 6.0)
         hi = center * 2.0 ** (1.0 / 6.0)
         mask = (freqs >= lo) & (freqs < hi)
-        levels.append(float(np.median([
-            10.0 * np.log10(float(np.sum(psd[mask])) + 1e-30) for psd in psds
-        ])))
-    levels = np.asarray(levels, dtype=np.float64)
-    return levels - levels[int(np.argmin(np.abs(np.asarray(centers) - ref_hz)))]
+        levels.append(10.0 * np.log10(float(np.sum(psd[mask])) + 1e-30))
+    return np.asarray(levels, dtype=np.float64)
+
+
+def octave_levels(psds, freqs, centers=CENTERS, ref_hz=1000.0):
+    """Median 1/3-octave band levels in dB, normalized at ``ref_hz``.
+
+    This is the pooled-spectrum statistic: median each band across files,
+    then normalize. Use :func:`octave_shape` for the typical per-file shape.
+    """
+    if not psds:
+        raise ValueError("no spectra to summarize")
+    levels = np.median(
+        np.asarray([_octave_levels_abs(psd, freqs, centers) for psd in psds]),
+        axis=0,
+    )
+    ref_idx = int(np.argmin(np.abs(np.asarray(centers) - ref_hz)))
+    return levels - levels[ref_idx]
+
+
+def octave_shape(psds, freqs, centers=CENTERS, ref_hz=1000.0):
+    """Median per-file 1/3-octave shape, normalized at ``ref_hz``.
+
+    Each spectrum is normalized by its own ``ref_hz`` band before the median.
+    This is the appropriate statistic for a typical call's channel shape; it
+    avoids the between-file level correlation that biases the pooled
+    difference-of-medians.
+    """
+    if not psds:
+        raise ValueError("no spectra to summarize")
+    ref_idx = int(np.argmin(np.abs(np.asarray(centers) - ref_hz)))
+    shapes = []
+    for psd in psds:
+        levels = _octave_levels_abs(psd, freqs, centers)
+        shapes.append(levels - levels[ref_idx])
+    return np.median(np.asarray(shapes), axis=0)
 
 
 def loud_psd_for_audio(x8):
@@ -247,9 +276,9 @@ def main():
             eq=args.eq,
         )
     clean = clean_source_psds(args.voice_dir, args.n_sources)
-    real_levels = octave_levels(real, freqs)
-    clean_levels = octave_levels(clean, freqs)
-    synth_levels = octave_levels(synth, freqs)
+    real_levels = octave_shape(real, freqs)
+    clean_levels = octave_shape(clean, freqs)
+    synth_levels = octave_shape(synth, freqs)
 
     print(f"real customer files: {len(real)}; clean sources: {len(clean)}; "
           f"synth outputs: {len(synth)}")

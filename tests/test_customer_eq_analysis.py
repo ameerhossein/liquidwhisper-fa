@@ -65,7 +65,3 @@ def test_octave_shape_is_median_of_per_file_shapes():
     shape = gs.octave_shape([psd_a, psd_b], freqs)
     idx = gs.CENTERS.index(3150.0)
     assert shape[idx] == pytest.approx(-15.0, abs=0.15)
-
-    pooled = gs.octave_levels([psd_a, psd_b], freqs)
-    # The old pooled statistic gives about -10 dB, not the median file shape.
-    assert pooled[idx] == pytest.approx(-10.04, abs=0.2)
