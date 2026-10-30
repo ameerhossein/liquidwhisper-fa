@@ -127,8 +127,10 @@ source .venv/bin/activate
 | **Precision** | Native Bfloat16 (`bf16`) |
 | **LoRA Configuration** | $r=64$, $\alpha=128$, target: `q_proj, v_proj, k_proj, out_proj, fc1, fc2` |
 | **Batch Size** | 8 per device $\times$ 4 gradient accumulation = **32 effective batch size**, gradient checkpointing off |
+| **Telephony Mix** | 50% clean / 50% customer-channel simulation (`--telephony_prob 0.5`) |
 | **Optimizer** | `adamw_torch_fused` |
 | **Duration** | **~10 hours** for 4 epochs (estimated from benchmark step time; not yet measured end to end) |
+| **Validation / Checkpoint** | Every 1,000 optimizer steps (`--eval_steps 1000 --save_steps 1000`) |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
 | **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |
 | **Epoch Benchmark** | 300-sample subset by default (`--max_benchmark_samples 0` = full 2,149) |

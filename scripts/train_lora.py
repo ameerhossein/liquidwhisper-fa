@@ -98,24 +98,24 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
 
     # Training Hyperparameters (L40S tuned)
-    parser.add_argument("--batch_size", type=int, default=16, help="Per-device train batch size")
-    parser.add_argument("--grad_accum", type=int, default=2, help="Gradient accumulation steps (effective batch: batch_size * grad_accum)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Per-device train batch size")
+    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective batch: batch_size * grad_accum)")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate for LoRA")
     parser.add_argument("--epochs", type=int, default=4, help="Total training epochs")
     parser.add_argument("--warmup_steps", type=int, default=500, help="Linear warmup steps")
-    parser.add_argument("--eval_steps", type=int, default=500, help="Evaluate every N steps")
-    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
+    parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate every N steps")
+    parser.add_argument("--save_steps", type=int, default=1000, help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Explicit checkpoint to resume from: path, or 'last' for latest in output_dir. Overrides --auto_resume.")
     parser.add_argument("--auto_resume", "--auto-resume", action=argparse.BooleanOptionalAction, default=True, help="Automatically resume from latest checkpoint in output_dir (for pod restarts). Use --no-auto_resume for a fresh run.")
     parser.add_argument("--fresh_start", "--fresh-start", action=argparse.BooleanOptionalAction, default=False, help="Start fresh: delete prior checkpoint-*, best_adapter, reports and telemetry history in output_dir/results before training.")
     parser.add_argument("--num_proc", type=int, default=4, help="Number of preprocessing workers")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Per-device eval + benchmark batch size")
-    parser.add_argument("--max_benchmark_samples", type=int, default=500, help="Test subset for end-of-epoch benchmark, decoded twice (500 clean + same 500 phone). 0/None = full set (2149).")
+    parser.add_argument("--max_benchmark_samples", type=int, default=300, help="Test subset for end-of-epoch benchmark, decoded twice (300 clean + same 300 phone). 0/None = full set (2149).")
     parser.add_argument("--run_post_test_eval", "--run-post-test-eval", action=argparse.BooleanOptionalAction, default=True, help="Run full test evaluation on best model post-training and save report")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
-    parser.add_argument("--telephony_prob", type=float, default=0.4, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.4=mixed default, 0.5=L40S YAML).")
+    parser.add_argument("--telephony_prob", type=float, default=0.5, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed default).")
     parser.add_argument("--telephony_profiles", type=str, default="customer", help="Comma-separated phone profiles: customer (default); legacy gated,mobile,pstn also accepted")
     parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
     parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB codec when available; G.711 A-law storage is always exact")
@@ -126,7 +126,7 @@ def parse_args():
     parser.add_argument("--prep_cache_dir", type=str, default=None, help="Dir for prepared train/eval Arrow cache (default: big disk via src/cache.py; --prep_cache_dir <output_dir>/prep_cache restores persistent-volume caching). Env ASR_PREP_CACHE_DIR also works.")
     parser.add_argument("--reuse_prep", "--reuse-prep", action=argparse.BooleanOptionalAction, default=True, help="Load prepared datasets from prep_cache_dir when fingerprint matches (skips re-prep).")
     parser.add_argument("--overwrite_prep_cache", "--overwrite-prep-cache", action=argparse.BooleanOptionalAction, default=False, help="Force re-prep even if cache hits (use after data/code/telephone-seed changes).")
-    parser.add_argument("--gradient_checkpointing", "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Recompute activations in the backward pass to save VRAM. Off is ~35%% faster but needs batch_size 8 (16 runs out of memory on a 48 GB L40S).")
+    parser.add_argument("--gradient_checkpointing", "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False, help="Recompute activations in the backward pass to save VRAM. Off is the fast L40S default; enable it only if a larger micro-batch requires it.")
     args = parser.parse_args()
     # YAML config overlay: file provides defaults, CLI wins only if explicitly passed.
     if args.config:
@@ -469,7 +469,7 @@ def main():
     # 2. Prepare Data BEFORE any CUDA init / model load.
     # datasets.map(num_proc>1) forks workers. Forking after CUDA init or with
     # the multi-GB model resident deadlocks/bloats workers (observed: 4 forked
-    # workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58243).
+    # workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58244).
     # Feature extraction + tokenization need only the processor, so prep runs
     # first (train gets phone augmentation, eval stays clean).
     label_prefix_ids, label_eos_id = _label_format(args.base_model)

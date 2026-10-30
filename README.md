@@ -139,9 +139,10 @@ tmux new -s train_asr
 ### Key Training Flags:
 * `--base_model`: Base Hugging Face model (`BuzzASR/persian` by default).
 * `--dataset_name`: Hugging Face dataset (`shekar-ai/Neyshekar`).
-* `--batch_size 8 --grad_accum 4`: Effective batch size of 32.
-* `--gradient_checkpointing` / `--no-gradient_checkpointing`: on by default. Off is about 35% faster but needs batch 8; batch 16 runs out of memory on a 48 GB GPU.
-* `--eval_steps 1500 --save_steps 1500`: evaluation and checkpoint interval. `save_steps` must be a multiple of `eval_steps`.
+* `--batch_size 8 --grad_accum 4`: Effective batch size of 32; the measured fast L40S configuration.
+* `--gradient_checkpointing` / `--no-gradient_checkpointing`: **off by default**. Off is about 35% faster; enable it only if a larger micro-batch requires the VRAM savings.
+* `--eval_steps 1000 --save_steps 1000`: evaluation and checkpoint interval. `save_steps` must be a multiple of `eval_steps`.
+* `--telephony_prob 0.5`: half clean, half customer-channel training audio.
 * `--learning_rate 1e-4`: Optimal for LoRA.
 * `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).

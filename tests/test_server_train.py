@@ -57,8 +57,10 @@ def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
     flags = _flags(client.launched[0])
     assert flags["--batch_size"] == "8"
     assert flags["--grad_accum"] == "4"
-    assert flags["--eval_steps"] == "1500"
-    assert flags["--save_steps"] == "1500"
+    assert flags["--eval_steps"] == "1000"
+    assert flags["--save_steps"] == "1000"
+    assert flags["--max_benchmark_samples"] == "300"
+    assert flags["--telephony_prob"] == "0.5"
     assert "--no-gradient_checkpointing" in client.launched[0]
 
 

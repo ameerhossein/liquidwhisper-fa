@@ -16,7 +16,7 @@ fi
 
 echo "=========================================================="
 echo " Launching Persian ASR LoRA Fine-Tuning (BuzzASR + Neyshekar)"
-echo " Tuned for NVIDIA L40S (BF16, batch 16, grad accum 2)"
+echo " Tuned for NVIDIA L40S (BF16, batch 8, grad accum 4, no gradient checkpointing)"
 echo " Default output: /workspace/stt-outputs/... on RunPod, else outputs/..."
 echo " Override: ASR_OUTPUT_DIR=/path/to/dir ./run_train.sh ..."
 echo "   or: ./run_train.sh --output_dir /path/to/dir"
@@ -43,12 +43,15 @@ python scripts/train_lora.py \
     --output_dir "${DEFAULT_OUTPUT_DIR}" \
     --lora_r 64 \
     --lora_alpha 128 \
-    --batch_size 16 \
-    --grad_accum 2 \
+    --batch_size 8 \
+    --grad_accum 4 \
     --learning_rate 1e-4 \
     --epochs 4 \
     --warmup_steps 500 \
-    --eval_steps 500 \
-    --save_steps 500 \
+    --eval_steps 1000 \
+    --save_steps 1000 \
+    --max_benchmark_samples 300 \
+    --telephony_prob 0.5 \
+    --no-gradient_checkpointing \
     --num_proc 4 \
     "$@"

@@ -4,7 +4,7 @@
 
 | Artifact | How created | Contents | Use for |
 |---|---|---|---|
-| `checkpoint-*/` | Auto-saved every `--save_steps 500` during training (`scripts/train_lora.py`). Only last 2 kept (`--save_total_limit 2`). | LoRA weights + optimizer + scheduler + `trainer_state.json` | Crash / pod-restart resume only. Not for inference. |
+| `checkpoint-*/` | Auto-saved every `--save_steps 1000` during training (`scripts/train_lora.py`). Only last 2 kept (`--save_total_limit 2`). | LoRA weights + optimizer + scheduler + `trainer_state.json` | Crash / pod-restart resume only. Not for inference. |
 | `best_adapter/` | Auto-saved once at end: `trainer.model.save_pretrained(best_adapter)` (`scripts/train_lora.py`). Selected by `load_best_model_at_end=True, metric_for_best_model="wer"`. | `adapter_model.safetensors` + `adapter_config.json` + processor. No optimizer. | `evaluate_model.py`, `transcribe.py --adapter_path`, `merge_lora.py --adapter_path`. Requires base `BuzzASR/persian` + `peft`. |
 | Merged model | **Manual only**: `scripts/merge_lora.py` (`merge_and_unload()`). Nothing auto-runs it. | Full Whisper weights (`W0 + BA`) + processor. No `peft` needed. | Production inference. |
 

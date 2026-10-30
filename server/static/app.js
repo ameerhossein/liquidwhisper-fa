@@ -471,7 +471,7 @@ async function startRun(freshStart) {
         batch_size: parseInt(el.inputBatchSize.value, 10) || 8,
         grad_accum: parseInt(el.inputGradAccum.value, 10) || 4,
         gradient_checkpointing: el.inputGradCheckpoint.value === "on",
-        eval_steps: parseInt(el.inputEvalSteps.value, 10) || 1500,
+        eval_steps: parseInt(el.inputEvalSteps.value, 10) || 1000,
         learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
         fresh_start: freshStart,
       }),

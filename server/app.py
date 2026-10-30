@@ -503,7 +503,7 @@ async def start_training(config: Dict[str, Any] = None):
         epochs_i = int(config.get("epochs", 4))
         batch_i = int(config.get("batch_size", 8))
         accum_i = int(config.get("grad_accum", 4))
-        eval_steps_i = int(config.get("eval_steps", 1500))
+        eval_steps_i = int(config.get("eval_steps", 1000))
         lr_f = float(config.get("learning_rate", 1e-4))
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 300)
@@ -513,7 +513,7 @@ async def start_training(config: Dict[str, Any] = None):
         # the ffmpeg probe is cached, so workers scale. Override via POST
         # {"num_proc": N} with N in 1..16.
         num_proc_i = int(config.get("num_proc", 8))
-        tele_f = float(config.get("telephony_prob", 0.4))
+        tele_f = float(config.get("telephony_prob", 0.5))
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate/telephone_prob numeric.")
     if not (1 <= epochs_i <= 20):
