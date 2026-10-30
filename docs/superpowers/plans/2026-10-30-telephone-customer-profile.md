@@ -288,6 +288,14 @@ def test_profile_subsets_maps_gated_and_clean_to_customer():
 
 Update `test_profile_weights_for_subsets_and_aliases` to use `{"customer": 0.70, "mobile": 0.15, "pstn": 0.15}` and assert `weights["customer"]`.
 
+Update the existing tests that assume the old defaults:
+
+- Replace `test_default_profiles_include_gated` with `test_default_profiles_is_customer_only`.
+- Replace `test_data_pipeline_default_profiles_include_gated` with `test_data_pipeline_default_profiles_include_customer`.
+- Update `test_choose_telephone_profile_is_weighted` to use an explicit `["customer", "mobile"]` list; the default is no longer a weighted multi-profile set.
+- Update `test_degrade_for_eval_profiled_returns_profiles_and_matches_audio` so `gated`/`clean` expect `"customer"`.
+- Update the existing `test_profile_subsets...` and `test_profile_weights...` assertions in `tests/test_normalizer_metrics.py` to expect `"customer"` for `gated`/`clean`.
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest tests/test_telephone.py tests/test_normalizer_metrics.py -v`  
@@ -405,6 +413,20 @@ def test_customer_eq_gains_cover_primary_bands():
         set(telephone.CUSTOMER_EQ_GAINS_DB)
     )
     assert all(-15.0 <= v <= 15.0 for v in telephone.CUSTOMER_EQ_GAINS_DB.values())
+
+
+@requires_scipy
+def test_customer_profile_active_rms_and_noise_floor():
+    from src.telephone import simulate_customer, active_speech_rms_db
+    speech = _tone(440, dur=1.0)
+    x = np.concatenate([speech, np.zeros(8000, dtype=np.float32)])
+    y = simulate_customer(x, seed=11, output_sr=8000, use_ffmpeg=False,
+                          target_rms_db=-25.6)
+    assert abs(active_speech_rms_db(y) - (-25.6)) <= 1.0
+    frames = y[: len(y) // 160 * 160].reshape(-1, 160).astype(np.float64)
+    energy = 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    noise_floor = float(np.median(np.sort(energy)[: max(1, len(energy) // 10)]))
+    assert -75.0 <= noise_floor <= -69.0
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**

@@ -1,7 +1,7 @@
 # Telephone customer profile — design
 
 **Date:** 2026-10-30  
-**Status:** Draft for approval  
+**Status:** Approved (2026-10-30)  
 **Scope:** Replace the three-profile telephony default with one `customer` profile, renamed/recalibrated from `gated`.
 
 ---
@@ -40,7 +40,7 @@ The AST model (`MIT/ast-finetuned-audioset-10-10-0.4593`) was run on 10-second w
 | mixed | 1 |
 | empty | 2 |
 
-Of the 77 `gated` files, **42 are answered speech and 35 are music only**. The current `gated` profile was therefore calibrated against an approximately 45%-music mixture. Music-only gated files are very dark (HF 1–2 kHz ≈ −39 dB) while answered gated speech is much brighter (≈ −15 dB), which explains the profile's 12–13 dB high-band deficit.
+Of the 77 `gated` files, **42 are answered speech and 35 are music only**. The current `gated` profile was therefore calibrated against an approximately 45%-music mixture. Music-only gated files are very dark (HF 1–2 kHz ≈ −39 dB) while answered gated speech is much brighter (≈ −15 dB). This makes the broadband high-band metric misleading; the 1/3-octave loud-frame fit below is the authoritative target.
 
 ### Answered customer target
 
