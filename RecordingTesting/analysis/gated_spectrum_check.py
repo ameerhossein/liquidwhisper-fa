@@ -36,7 +36,7 @@ CENTERS = [125, 160, 200, 250, 315, 400, 500, 630, 800,
            1000, 1250, 1600, 2000, 2500, 3150, 4000]
 
 
-def _octave_levels_abs(psd, freqs, centers=CENTERS):
+def octave_abs(psd, freqs, centers=CENTERS):
     """Absolute 1/3-octave band levels for one spectrum."""
     levels = []
     for center in centers:
@@ -50,13 +50,14 @@ def _octave_levels_abs(psd, freqs, centers=CENTERS):
 def octave_levels(psds, freqs, centers=CENTERS, ref_hz=1000.0):
     """Median 1/3-octave band levels in dB, normalized at ``ref_hz``.
 
-    This is the pooled-spectrum statistic: median each band across files,
-    then normalize. Use :func:`octave_shape` for the typical per-file shape.
+    This is the old difference-of-medians statistic: median each band across
+    files, then normalize. It is retained for historical comparisons and is
+    deprecated for calibration; use :func:`octave_shape` instead.
     """
     if not psds:
         raise ValueError("no spectra to summarize")
     levels = np.median(
-        np.asarray([_octave_levels_abs(psd, freqs, centers) for psd in psds]),
+        np.asarray([octave_abs(psd, freqs, centers) for psd in psds]),
         axis=0,
     )
     ref_idx = int(np.argmin(np.abs(np.asarray(centers) - ref_hz)))
@@ -76,7 +77,7 @@ def octave_shape(psds, freqs, centers=CENTERS, ref_hz=1000.0):
     ref_idx = int(np.argmin(np.abs(np.asarray(centers) - ref_hz)))
     shapes = []
     for psd in psds:
-        levels = _octave_levels_abs(psd, freqs, centers)
+        levels = octave_abs(psd, freqs, centers)
         shapes.append(levels - levels[ref_idx])
     return np.median(np.asarray(shapes), axis=0)
 

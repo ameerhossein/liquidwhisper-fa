@@ -96,8 +96,8 @@ CUSTOMER_TARGET_RMS_DB_RANGE = (-29.5, -22.5)
 GATED_TARGET_RMS_DB_RANGE = CUSTOMER_TARGET_RMS_DB_RANGE
 
 # Measured 1/3-octave correction for the answered mobile-customer channel.
-# Values are the target-minus-current gated delta; the fit script refines them.
-# Starting point for a fresh fit: the measured target-minus-gated delta.
+# This is the legacy difference-of-medians starting point, kept for
+# reproducibility; the fit script refines it on per-file normalized targets.
 CUSTOMER_EQ_INITIAL_GAINS_DB = {
     315.0: -4.8,
     400.0: 4.3,
@@ -110,8 +110,8 @@ CUSTOMER_EQ_INITIAL_GAINS_DB = {
     2500.0: -1.8,
     3150.0: -8.6,
 }
-# Final fitted gains (per-file normalized 1/3-octave target, 46 voices,
-# seeds 1-3, eight iterations at 0.5 damping from the initial delta; see
+# Final fitted gains (per-file normalized 1/3-octave target, 46 clips from
+# 6 speakers, seeds 1-3, eight iterations at 0.5 damping from the initial delta; see
 # customer_eq_gains.json for the full history).
 CUSTOMER_EQ_GAINS_DB = {
     315.0: -2.99,

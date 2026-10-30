@@ -33,17 +33,6 @@ def resolve(manifest_row: dict[str, str], real_dir: Path, outside_dir: Path) -> 
     return outside_dir / manifest_row["path"]
 
 
-def octave_abs(psd: np.ndarray, freqs: np.ndarray) -> np.ndarray:
-    """Absolute 1/3-octave band levels (dB); caller normalizes to 1 kHz."""
-    levels = []
-    for center in gs.CENTERS:
-        lo = center / 2.0 ** (1.0 / 6.0)
-        hi = center * 2.0 ** (1.0 / 6.0)
-        mask = (freqs >= lo) & (freqs < hi)
-        levels.append(10.0 * np.log10(float(np.sum(psd[mask])) + 1e-30))
-    return np.asarray(levels, dtype=np.float64)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -80,7 +69,7 @@ def main() -> None:
         if psd is None:
             continue
         psds.append(psd)
-        levels = octave_abs(psd, freqs)
+        levels = gs.octave_abs(psd, freqs)
         record: dict[str, object] = {
             "file": row["file"],
             "source": row["source"],
@@ -95,14 +84,15 @@ def main() -> None:
         writer.writerows(out_rows)
 
     print(f"Wrote {args.out} ({len(out_rows)} rows)")
-    band_medians = {
-        center: float(np.median([float(r[f"hz_{center}"]) for r in out_rows]))
-        for center in gs.CENTERS
-    }
-    ref = band_medians[1000]
+    shapes = np.asarray([
+        [float(r[f"hz_{center}"]) - float(r["hz_1000"]) for center in gs.CENTERS]
+        for r in out_rows
+    ])
+    med = np.median(shapes, axis=0)
     for center in [315, 400, 500, 3150]:
+        idx = gs.CENTERS.index(center)
         print(
-            f"  hz_{center}: median {band_medians[center] - ref:.2f} dB re 1 kHz"
+            f"  hz_{center}: median per-file shape {med[idx]:.2f} dB re 1 kHz"
         )
 
 

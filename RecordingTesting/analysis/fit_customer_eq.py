@@ -6,9 +6,9 @@ normalized 1/3-octave shapes with the committed answered-customer band table,
 and iteratively updates the peaking gains. It is an offline analysis tool; the
 runtime simulator uses the constants pasted into ``src/telephone.py``.
 
-By default the fit starts from ``CUSTOMER_EQ_INITIAL_GAINS_DB`` (the measured
-target-minus-gated delta) and uses the documented 8 iterations / 0.5 damping,
-so the JSON history is reproducible. Use ``--initial-gains final`` only to
+By default the fit starts from ``CUSTOMER_EQ_INITIAL_GAINS_DB`` (the legacy
+difference-of-medians starting point) and uses the documented 8 iterations /
+0.5 damping, so the JSON history is reproducible. Use ``--initial-gains final`` only to
 inspect the shipped constants. Use ``--holdout-speakers`` to fit on the
 remaining speakers and report a true speaker-held-out residual table.
 """

@@ -193,7 +193,7 @@ The existing `RecordingTesting/analysis/gated_spectrum_check.py` is the starting
 
 ### Gating / speech fraction
 
-Keep the current gate settings. Validate the customer profile's speech fraction in **0.60–0.75**; the 0.70 target is content-dependent and the current gated chain already measures 0.62 [0.53–0.68] on the 46-voice set. Do not retune the gate in this change; revisit only if gate clicks or a clear speech-fraction failure appear.
+Keep the current gate settings. Validate the customer profile's speech fraction in **0.60–0.75**; the 0.70 target is content-dependent and the current gated chain already measures 0.62 [0.53–0.68] on the 46-clip reference set. Do not retune the gate in this change; revisit only if gate clicks or a clear speech-fraction failure appear.
 
 ---
 
@@ -309,7 +309,7 @@ Do not add `transformers`/AST to `requirements.txt`; this is offline analysis on
    - Centroid/roll95 inside the target IQR (450–545 Hz, 563–1,094 Hz). Do not chase the medians.
 2. **Spectral fit (authoritative):** Re-run the 1/3-octave loud-frame comparison on answered-only files; every band **315–3150 Hz** within ±2 dB. The 125–250 Hz and 4000 Hz bands are secondary.
 3. **Format:** A-law grid fraction 1.00, 8 kHz native levels ≤256, 16 kHz output length preserved.
-4. **Gating:** Speech fraction **0.60–0.75** on the reference set. The 0.70 target is content-dependent (the real files' IQR is 0.70–0.70, not a typo); the current gated chain is 0.62 [0.53–0.68] on 46 voices, and retuning the gate is **not** part of this change. No gate clicks (boundary discontinuity no worse than the real answered files).
+4. **Gating:** Speech fraction **0.60–0.75** on the reference set. The 0.70 target is content-dependent (the real files' IQR is 0.70–0.70, not a typo); the current gated chain is 0.62 [0.53–0.68] on 46 clips, and retuning the gate is **not** part of this change. No gate clicks (boundary discontinuity no worse than the real answered files).
 5. **Determinism:** Same seed → identical output; different seeds → expected variation.
 6. **Backward compatibility:** `profile="gated"` and `profile="clean"` produce the customer chain; `profile="mobile"`/`"pstn"` still work explicitly.
 7. **Integration:** `PersianASRDataPipeline.prepare_sample` with `telephony_prob=0.5` draws only `customer` by default; length preserved.
@@ -362,14 +362,16 @@ damping. The per-file normalized 1/3-octave target is +4.6/+14.0/+13.1/+8.3/
 2500/3150 Hz. The old difference-of-medians target over-cut 1600–3150 Hz;
 the corrected fit moves the 3150 Hz gain from −19.77 to −7.17 dB.
 
-Final 46-voice × 5-seed medians: active speech **−25.5 dBFS**, noise floor
+Final 46-clip (6 speakers) × 5-seed medians: active speech **−25.5 dBFS**, noise floor
 **−72.8 dBFS**, centroid **490 Hz**, roll95 **672 Hz**, HF 1–2k **−13.6 dB**,
-HF 2–3.4k **−27.4 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
+HF 2–3.4k **−27.4 dB**, speech fraction **0.65**. The full 46-clip (6 speakers) × 5-seed
 1/3-octave check is within 0.9 dB at every band 315–3150 Hz against the
 corrected target. On the 31 Outside gated mobile speech-only files, the old
 high-band deficit (−3.8/−5.1/−4.1/−5.4 dB at 1600/2000/2500/3150 Hz) is gone;
 the remaining low-mid difference is +1.8…+3.0 dB at 315–500 Hz because the
-67-file target is brighter there than the Outside subset. A true
+67-file target is brighter there than the Outside subset. The 500 Hz Outside
+residual (+3.0 dB) is an accepted corpus-spread tradeoff: the all-67 residual
+is +0.7 dB and the all-67 target is 2.33 dB brighter at 500 Hz. A true
 speaker-held-out fit (five speakers train, `spk_91858` held out) leaves
 +2.0/+4.5/+1.7/+6.8 dB residuals at 1600/2000/2500/3150 Hz; that is
 source-voice spread, not a channel-fit failure, and the shipped gains remain

@@ -19,7 +19,8 @@ runtime simulator.
 - The 67-row calibration subset is `calibration=true`:
   `content_class=speech_only`, `is_gated=true`, `caller_class=mobile`.
 - `answered_customer_bands.csv` stores absolute 1/3-octave loud-frame levels
-  for those 67 files; the fit normalizes each band to the pooled 1 kHz median.
+  for those 67 files; the fit normalizes each file's bands to its own 1 kHz
+  band before taking the median (the typical per-file channel shape).
 - `outside_spectral_features.csv` supplies the HF/centroid metrics for the
   Outside sample; the original AST labels only carried basic level/SNR fields.
 - Rebuild with `build_answered_manifest.py` and `build_answered_bands.py`.

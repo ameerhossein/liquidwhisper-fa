@@ -48,34 +48,47 @@ def test_read_bands_uses_median_per_file_shape(tmp_path):
 
 def test_octave_shape_is_median_of_per_file_shapes():
     freqs = ct.frame_psd(np.zeros(1024))[1]
-    idx_1k = int(np.argmin(np.abs(freqs - 1000.0)))
-    idx_3150 = int(np.argmin(np.abs(freqs - 3150.0)))
 
-    def make_psd(level_1k, level_3150):
+    def make_psd(level_1k_db, level_3150_db):
         psd = np.full(len(freqs), 1e-12, dtype=np.float64)
-        for center, level in ((1000.0, level_1k), (3150.0, level_3150)):
+        for center, level_db in ((1000.0, level_1k_db), (3150.0, level_3150_db)):
             lo = center / 2.0 ** (1.0 / 6.0)
             hi = center * 2.0 ** (1.0 / 6.0)
             mask = (freqs >= lo) & (freqs < hi)
-            psd[mask] = level / max(1, int(np.sum(mask)))
-        return psd, idx_1k, idx_3150
+            psd[mask] = (10.0 ** (level_db / 10.0)) / max(1, int(np.sum(mask)))
+        return psd
 
-    psd_a, _, _ = make_psd(1.0, 0.01)      # -20 dB shape
-    psd_b, _, _ = make_psd(100.0, 10.0)    # -10 dB shape
-    shape = gs.octave_shape([psd_a, psd_b], freqs)
+    # Per-file 3150/1k shapes are -30, -10, -50 dB; median -30 dB.
+    # Difference-of-medians gives -10 dB, so this fixture distinguishes them.
+    psd_a = make_psd(0.0, -30.0)
+    psd_b = make_psd(0.0, -10.0)
+    psd_c = make_psd(100.0, 50.0)
+    shape = gs.octave_shape([psd_a, psd_b, psd_c], freqs)
     idx = gs.CENTERS.index(3150.0)
-    assert shape[idx] == pytest.approx(-15.0, abs=0.15)
+    assert shape[idx] == pytest.approx(-30.0, abs=0.1)
+
+    pooled = gs.octave_levels([psd_a, psd_b, psd_c], freqs)
+    assert pooled[idx] == pytest.approx(-10.0, abs=0.1)
 
 
 def test_outside_high_band_residuals_are_not_dark():
-    path = ANALYSIS / "outside_customer_check.csv"
-    with open(path, newline="", encoding="utf-8") as fh:
-        rows = list(csv.DictReader(fh))
-    high = {
-        int(row["hz"]): float(row["diff_db"])
-        for row in rows
-        if 1600 <= int(row["hz"]) <= 3150
-    }
-    assert high
-    assert all(abs(value) <= 2.5 for value in high.values()), high
-    assert high[3150] > -2.0
+    from statistics import median
+
+    with open(ANALYSIS / "answered_customer_bands.csv", newline="", encoding="utf-8") as fh:
+        bands = [
+            row for row in csv.DictReader(fh) if row["source"] == "outside"
+        ]
+    with open(ANALYSIS / "customer_octave_levels.csv", newline="", encoding="utf-8") as fh:
+        synth = {
+            row["hz"]: float(row["synth_db_re_1k"])
+            for row in csv.DictReader(fh)
+        }
+    assert bands and synth
+    for hz in ("1600", "2000", "2500", "3150"):
+        real = median(
+            float(row[f"hz_{hz}"]) - float(row["hz_1000"]) for row in bands
+        )
+        diff = synth[hz] - real
+        assert abs(diff) <= 2.5, (hz, diff)
+        if hz == "3150":
+            assert diff > -2.0

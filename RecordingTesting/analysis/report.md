@@ -755,7 +755,7 @@ target is the **median per-file shape**: each file is normalized to its own
 overstated the high-band deficit because 1 kHz and 3150 Hz levels correlate
 across files.
 
-Corrected target and final synth (46 voices × 5 seeds, per-file shape):
+Corrected target and final synth (46 clips from 6 speakers × 5 seeds, per-file shape):
 
 | Hz | Target | Final `customer` | Residual |
 |---:|---:|---:|---:|
@@ -779,7 +779,7 @@ explicit legacy profiles only. Reproduce the fit with
 starting from `CUSTOMER_EQ_INITIAL_GAINS_DB`) and the target with
 `answered_customer_bands.csv` / `answered_customer_manifest.csv`.
 
-Final multi-voice medians (46 voices × seeds 1–5): active speech **−25.5
+Final multi-voice medians (46 clips from 6 speakers × seeds 1–5): active speech **−25.5
 dBFS**, noise floor **−72.8 dBFS**, centroid **490 Hz**, roll95 **672 Hz**,
 HF 1–2k **−13.6 dB**, HF 2–3.4k **−27.4 dB**, speech fraction **0.65**. The
 broadband HF 2–3.4k target is −27.5 dB, so the old 3.5 dB high-band deficit
@@ -810,9 +810,14 @@ The old high-band deficit (−3.8/−5.1/−4.1/−5.4 dB at
 1600/2000/2500/3150 Hz) is gone. The remaining difference is low-mid
 brightness (315–500 Hz, +1.8…+3.0 dB): the 67-file target is brighter there
 than the Outside subset, which is a corpus-spread issue rather than the
-normalization bug. The all-67 validation remains within 0.9 dB. Broadband
-Outside medians: speech **−25.5 dBFS**, noise **−72.8 dBFS**, HF 1–2k
-**−13.6 dB**, HF 2–3.4k **−27.4 dB**, centroid **490 Hz**, roll95 **672 Hz**.
+normalization bug. Accepted tradeoff: the 500 Hz Outside residual is +3.0 dB
+while the all-67 residual is +0.7 dB; the all-67 target is 2.33 dB brighter at
+500 Hz, so one EQ cannot zero both. The all-67 validation remains within
+0.9 dB. Broadband
+Outside medians: speech **−25.6 dBFS**, noise **−71.3 dBFS**, HF 1–2k
+**−12.9 dB**, HF 2–3.4k **−26.7 dB**, centroid **464 Hz**, roll95 **656 Hz**;
+the customer profile measures **−25.5 dBFS**, **−72.8 dBFS**, **−13.6 dB**,
+**−27.4 dB**, **490 Hz**, **672 Hz** respectively.
 
 ### Held-out speaker check
 
