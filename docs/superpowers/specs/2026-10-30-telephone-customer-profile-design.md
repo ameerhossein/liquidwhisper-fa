@@ -201,7 +201,7 @@ Add committed analysis manifests (no runtime dependency on AST):
   - The `Outside` sample is exactly: all 163 readable `noisy` + `quiet_noisy` customer calls, plus 50 random `gated` customer calls sampled with `random.seed(42)` from the 1,842 readable gated customer calls. The authoritative list is `content_sample_out/music_files.csv`; copy it into the manifest.
   - The 67-file calibration subset is the rows with `content_class=speech_only`, `is_gated=true`, `caller_class=mobile`, and `calibration=true`.
 - `RecordingTesting/analysis/answered_customer_bands.csv`
-  - One row per calibration file, one column per 1/3-octave band (dB relative to 1 kHz, loud-frame median). This lets the EQ fit be reproduced without the external `Outside` audio.
+  - One row per calibration file, one column per 1/3-octave band (absolute loud-frame band level; the fit normalizes to the pooled 1 kHz median). This lets the EQ fit be reproduced without the external `Outside` audio.
   - The in-repo 36 audio files remain available; the 31 Outside files are only represented by their committed band rows and metadata.
 - A short `RecordingTesting/analysis/answered_customer_manifest.md` explaining the AST model, the windowing, the label families, the 213-file sampling, and the limitation that labels are model-derived and should be spot-checked.
 

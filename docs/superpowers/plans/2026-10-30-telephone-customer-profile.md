@@ -41,6 +41,7 @@ These inputs/failure modes are easy to miss and get a test in the owning task:
 **Files:**
 - Create: `RecordingTesting/analysis/ast_labels_in_repo.csv` (copy of `/tmp/opencode/real_corpus_music/music_files.csv`)
 - Create: `RecordingTesting/analysis/ast_labels_outside.csv` (copy of `/tmp/opencode/content_sample_out/music_files.csv`)
+- Create: `RecordingTesting/analysis/outside_spectral_features.csv` (merge of `/tmp/opencode/gated_sample_features.csv` and `/tmp/opencode/outside_classification/noisy_customer_features.csv`)
 - Create: `RecordingTesting/analysis/build_answered_manifest.py`
 - Create: `RecordingTesting/analysis/build_answered_bands.py`
 - Create: `RecordingTesting/analysis/answered_customer_manifest.csv`
@@ -50,7 +51,7 @@ These inputs/failure modes are easy to miss and get a test in the owning task:
 
 **Interfaces:**
 - Produces: `answered_customer_manifest.csv` with columns `path,file,source,caller_class,is_gated,content_class,duration_s,speech_rms_db,noise_rms_db,hf_1_2k_rel_db,hf_2_3k_rel_db,spec_centroid,spec_roll95,calibration`.
-- Produces: `answered_customer_bands.csv` with `file,source` plus `hz_125,hz_160,...,hz_4000` (16 columns), one row per calibration file.
+- Produces: `answered_customer_bands.csv` with `file,source` plus `hz_125,hz_160,...,hz_4000` (16 columns), one row per calibration file; values are **absolute** 1/3-octave band levels, and the fit normalizes to the pooled 1 kHz median.
 - Produces: 67 `calibration=true` rows (`speech_only`, `is_gated=true`, `caller_class=mobile`).
 
 - [ ] **Step 1: Copy the AST label tables into the repo**
@@ -62,7 +63,9 @@ cp /tmp/opencode/real_corpus_music/music_files.csv RecordingTesting/analysis/ast
 cp /tmp/opencode/content_sample_out/music_files.csv RecordingTesting/analysis/ast_labels_outside.csv
 ```
 
-Expected: both files exist; the in-repo file has 107 data rows, the outside file has 213.
+Build `outside_spectral_features.csv` by merging `/tmp/opencode/gated_sample_features.csv` and `/tmp/opencode/outside_classification/noisy_customer_features.csv` on `path`, keeping `path,duration_s,speech_rms_db,noise_rms_db,hf_1_2k_rel_db,hf_2_3k_rel_db,spec_centroid,spec_roll95,speech_frac` (213 unique rows).
+
+Expected: all three files exist; the in-repo file has 107 data rows, the outside file has 213, and the spectral features file has 213.
 
 - [ ] **Step 2: Write the failing manifest test**
 
@@ -110,14 +113,15 @@ def test_answered_bands_have_67_rows_and_16_bands():
     assert len(band_cols) == 16
     assert band_cols[0] == "hz_125"
     assert band_cols[-1] == "hz_4000"
-    assert all(abs(float(r["hz_1000"])) < 0.05 for r in rows)
+    med = {c: median(float(r[c]) for r in rows) for c in band_cols}
+    ref = med["hz_1000"]
     for col, expected in {
         "hz_315": 4.52,
         "hz_400": 12.99,
         "hz_500": 12.95,
         "hz_3150": -19.77,
     }.items():
-        assert abs(median(float(r[col]) for r in rows) - expected) < 0.5
+        assert abs((med[col] - ref) - expected) < 0.2
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -163,6 +167,7 @@ Document in 10–15 lines: the AST model, 10 s windows with first/middle/last sa
 ```bash
 git add RecordingTesting/analysis/ast_labels_in_repo.csv \
         RecordingTesting/analysis/ast_labels_outside.csv \
+        RecordingTesting/analysis/outside_spectral_features.csv \
         RecordingTesting/analysis/build_answered_manifest.py \
         RecordingTesting/analysis/build_answered_bands.py \
         RecordingTesting/analysis/answered_customer_manifest.csv \
@@ -479,7 +484,7 @@ Expected: PASS.
 - [ ] **Step 5: Implement `fit_customer_eq.py`**
 
 The script must:
-- Read `answered_customer_bands.csv`; compute the median target level per band.
+- Read `answered_customer_bands.csv`; compute the median target level per band and normalize to the pooled median 1 kHz level.
 - Generate the baseline customer output on the 46 clean voices with `eq_gains_db={}` and the same seeds as the analysis (start with seeds 1–3 for speed, full 1–5 for the final run).
 - Compute the residual `target - synth` at 315–3150 Hz; add it to the current gains with damping 0.7, clip to ±15 dB.
 - Regenerate with the updated gains; repeat 3 iterations.
