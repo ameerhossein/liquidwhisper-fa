@@ -1,10 +1,11 @@
-"""Offline tests for POST /api/train/start: the command it builds and its validation.
+"""Offline tests for server training control and benchmark endpoints.
 
 Training is never launched: the audio-backend check is stubbed and subprocess.Popen
-records the command instead.
+records the command instead. Benchmark tests only read files under tmp_path.
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "_check_audio_backend_or_400", lambda: None)
     monkeypatch.setattr(mod.subprocess, "Popen", _fake_popen)
     client = TestClient(mod.app)
+    client.mod = mod
     client.launched = launched
     return client
 
@@ -59,7 +61,8 @@ def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
     assert flags["--grad_accum"] == "4"
     assert flags["--eval_steps"] == "1000"
     assert flags["--save_steps"] == "1000"
-    assert flags["--max_benchmark_samples"] == "300"
+    assert flags["--max_benchmark_samples"] == "1000"
+    assert flags["--preflight_samples"] == "1000"
     assert flags["--telephony_prob"] == "0.5"
     assert "--no-gradient_checkpointing" in client.launched[0]
 
@@ -82,3 +85,37 @@ def test_eval_steps_out_of_range_is_rejected(client):
     res = client.post("/api/train/start", json={"eval_steps": 0})
     assert res.status_code == 400
     assert client.launched == []
+
+
+def test_default_benchmarks_load_preflight_rows(client, tmp_path, monkeypatch):
+    preflight = tmp_path / "baselines" / "preflight.json"
+    preflight.parent.mkdir(parents=True)
+    preflight.write_text(json.dumps({"models": {
+        "buzzasr_base": {"name": "BuzzASR Base", "epoch": "BuzzASR Base (preflight, 1,000)",
+                         "total_samples": 1000, "normalized_wer": 17.2,
+                         "phone_normalized_wer": 24.1},
+        "whisper_v3": {"name": "Whisper", "epoch": "Whisper (preflight)",
+                       "is_reference": True, "total_samples": 1000,
+                       "normalized_wer": 28.5, "phone_normalized_wer": 35.0},
+    }}))
+    monkeypatch.setattr(client.mod, "PREFLIGHT_FILE", preflight)
+    by_epoch = {r["epoch"]: r for r in client.mod.get_default_benchmarks()}
+    assert by_epoch["BuzzASR Base (preflight, 1,000)"]["phone_normalized_wer"] == 24.1
+    assert by_epoch["Whisper (preflight)"]["is_reference"] is True
+
+
+def test_default_benchmarks_empty_without_preflight(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(client.mod, "PREFLIGHT_FILE", tmp_path / "missing.json")
+    assert client.mod.get_default_benchmarks() == []
+
+
+def test_benchmarks_endpoint_drops_unmeasured_baselines(client, tmp_path, monkeypatch):
+    bench = tmp_path / "epoch_benchmarks.json"
+    bench.write_text(json.dumps([
+        {"epoch": "Old hardcoded base", "is_baseline": True, "normalized_wer": 17.2},
+        {"epoch": "Epoch 1", "is_baseline": False, "normalized_wer": 15.0},
+    ]))
+    monkeypatch.setattr(client.mod, "BENCHMARKS_FILE", bench)
+    rows = client.get("/api/benchmarks").json()
+    assert not any(r.get("is_baseline") for r in rows)
+    assert any(r.get("epoch") == "Epoch 1" for r in rows)

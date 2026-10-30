@@ -53,6 +53,7 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEMETRY_FILE = RESULTS_DIR / "live_telemetry.json"
 BENCHMARKS_FILE = RESULTS_DIR / "epoch_benchmarks.json"
+PREFLIGHT_FILE = RESULTS_DIR / "baselines" / "preflight.json"
 LOSS_HISTORY_FILE = RESULTS_DIR / "loss_history.json"
 LOG_FILE = RESULTS_DIR / "training_live.log"
 STOP_SIGNAL_FILE = RESULTS_DIR / "stop_training.signal"
@@ -97,81 +98,30 @@ ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
 
-_HARDCODED_BASELINES = [
-    {
-        "epoch": "Whisper Large v3 (Zero-Shot)",
-        "epoch_number": 0,
-        "type": "baseline",
-        "is_baseline": True,
-        "normalized_wer": 28.50,
-        "normalized_cer": 8.90,
-        "diagnostic_wer": 26.10,
-        "formal_wer": 24.00,
-        "informal_wer": 36.80,
-        "delta_vs_whisper": 0.0,
-        "total_samples": 2149,
-        "canary_transcriptions": []
-    },
-    {
-        "epoch": "BuzzASR Base (Zero-Shot)",
-        "epoch_number": 0,
-        "type": "baseline",
-        "is_baseline": True,
-        "normalized_wer": 17.20,
-        "normalized_cer": 4.80,
-        "diagnostic_wer": 15.90,
-        "formal_wer": 15.10,
-        "informal_wer": 22.40,
-        "delta_vs_whisper": -11.30,
-        "total_samples": 2149,
-        "canary_transcriptions": []
-    }
-]
+def _load_preflight_benchmarks() -> List[Dict[str, Any]]:
+    """Baseline rows from the measured preflight cache, empty when absent.
 
-
-def _load_shared_baselines() -> List[Dict[str, Any]]:
-    """Single source of truth: configs/baselines.json, fallback to hardcoded."""
-    for cand in (BASE_DIR / "configs" / "baselines.json", Path("configs/baselines.json")):
-        try:
-            if cand.exists():
-                with open(cand, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                w = data.get("whisper_v3", {})
-                b = data.get("buzzasr_base", {})
-                if w and b:
-                    return [
-                        {
-                            "epoch": w.get("epoch", w.get("name", "Whisper Large v3 (Zero-Shot)")),
-                            "epoch_number": 0,
-                            "type": "baseline",
-                            "is_baseline": True,
-                            "normalized_wer": float(w.get("normalized_wer", 28.5)),
-                            "normalized_cer": float(w.get("normalized_cer", 8.9)),
-                            "diagnostic_wer": float(w.get("diagnostic_wer", 26.1)),
-                            "formal_wer": float(w.get("formal_wer", 24.0)),
-                            "informal_wer": float(w.get("informal_wer", 36.8)),
-                            "delta_vs_whisper": 0.0,
-                            "total_samples": int(w.get("total_samples", 2149)),
-                            "canary_transcriptions": []
-                        },
-                        {
-                            "epoch": b.get("epoch", b.get("name", "BuzzASR Base (Zero-Shot)")),
-                            "epoch_number": 0,
-                            "type": "baseline",
-                            "is_baseline": True,
-                            "normalized_wer": float(b.get("normalized_wer", 17.2)),
-                            "normalized_cer": float(b.get("normalized_cer", 4.8)),
-                            "diagnostic_wer": float(b.get("diagnostic_wer", 15.9)),
-                            "formal_wer": float(b.get("formal_wer", 15.1)),
-                            "informal_wer": float(b.get("informal_wer", 22.4)),
-                            "delta_vs_whisper": round(float(b.get("normalized_wer", 17.2)) - float(w.get("normalized_wer", 28.5)), 2),
-                            "total_samples": int(b.get("total_samples", 2149)),
-                            "canary_transcriptions": []
-                        },
-                    ]
-        except Exception:
+    The trainer writes ``results/baselines/preflight.json`` after evaluating
+    BuzzASR and Whisper on the same rows. There is no hardcoded fallback: a
+    missing or malformed cache means the API has no measured baseline yet.
+    """
+    data = read_json_safely(PREFLIGHT_FILE, {})
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, dict):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for key in ("buzzasr_base", "whisper_v3"):
+        row = models.get(key)
+        if not isinstance(row, dict) or not row:
             continue
-    return [dict(r) for r in _HARDCODED_BASELINES]
+        rows.append({
+            "epoch_number": 0,
+            "type": "baseline",
+            "is_baseline": True,
+            "canary_transcriptions": [],
+            **row,
+        })
+    return rows
 
 
 def _is_process_running(pid: Optional[int] = None) -> bool:
@@ -203,7 +153,7 @@ def _check_auth(config: Optional[Dict[str, Any]]) -> None:
 
 
 def get_default_benchmarks() -> List[Dict[str, Any]]:
-    return _load_shared_baselines()
+    return _load_preflight_benchmarks()
 
 
 def read_json_safely(path: Path, default: Any) -> Any:
@@ -455,8 +405,17 @@ async def get_status():
 @app.get("/api/benchmarks")
 async def get_benchmarks():
     data = read_json_safely(BENCHMARKS_FILE, None)
-    if not data or not isinstance(data, list) or len(data) == 0:
-        data = get_default_benchmarks()
+    if isinstance(data, list) and data:
+        # Drop legacy baseline rows that carry no measured preflight source
+        # (old hardcoded/config rows would show numbers we cannot reproduce).
+        filtered = [
+            row for row in data
+            if not (isinstance(row, dict) and row.get("is_baseline") and row.get("source") != "preflight")
+        ]
+        if filtered:
+            return filtered
+    data = get_default_benchmarks()
+    if data:
         with open(BENCHMARKS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     return data
@@ -506,8 +465,8 @@ async def start_training(config: Dict[str, Any] = None):
         eval_steps_i = int(config.get("eval_steps", 1000))
         lr_f = float(config.get("learning_rate", 1e-4))
         eval_bs_i = int(config.get("eval_batch_size", 16))
-        max_bench = config.get("max_benchmark_samples", 300)
-        max_bench_i = int(max_bench) if max_bench not in (None, "") else 300
+        max_bench = config.get("max_benchmark_samples", 1000)
+        max_bench_i = int(max_bench) if max_bench not in (None, "") else 1000
         # Preprocessing workers for datasets.map (fork-based). Default 8;
         # capped at os.cpu_count(). Each worker pins torch to one thread and
         # the ffmpeg probe is cached, so workers scale. Override via POST
@@ -573,6 +532,7 @@ async def start_training(config: Dict[str, Any] = None):
         "--learning_rate", str(lr_f),
         "--eval_batch_size", str(eval_bs_i),
         "--max_benchmark_samples", str(max_bench_i),
+        "--preflight_samples", str(max_bench_i),
         "--num_proc", str(num_proc_i),
         "--telephony_prob", str(tele_f),
         "--enable_telemetry",
