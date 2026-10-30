@@ -11,54 +11,14 @@ Handles:
 import os
 import time
 import json
-from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
+from src.preflight import compute_deltas
+
 
 DEFAULT_TELEPHONY_PROFILES = ["customer"]
-
-
-def _default_baselines() -> Dict[str, Any]:
-    return {
-        "whisper_v3": {
-            "name": "Whisper Large v3 (Zero-Shot)",
-            "normalized_wer": 28.50,
-            "normalized_cer": 8.90,
-            "diagnostic_wer": 26.10,
-            "formal_wer": 24.00,
-            "informal_wer": 36.80,
-        },
-        "buzzasr_base": {
-            "name": "BuzzASR Base (Zero-Shot)",
-            "normalized_wer": 17.20,
-            "normalized_cer": 4.80,
-            "diagnostic_wer": 15.90,
-            "formal_wer": 15.10,
-            "informal_wer": 22.40,
-        }
-    }
-
-
-def load_baselines(path: Optional[str] = None) -> Dict[str, Any]:
-    """Load shared baselines from configs/baselines.json with safe fallback."""
-    candidates = []
-    if path:
-        candidates.append(Path(path))
-    # <repo>/configs/baselines.json relative to this file
-    candidates.append(Path(__file__).resolve().parent.parent / "configs" / "baselines.json")
-    candidates.append(Path("configs/baselines.json"))
-    for cand in candidates:
-        try:
-            if cand.exists():
-                with open(cand, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and "whisper_v3" in data:
-                    return data
-        except Exception:
-            continue
-    return _default_baselines()
 
 
 def _resolve_infer_dtype(device: str):
@@ -94,7 +54,6 @@ class WebTelemetryCallback(TrainerCallback):
         normalizer: Optional[Any] = None,
         canary_samples: Optional[List[Dict[str, Any]]] = None,
         baseline_benchmark: Optional[Dict[str, Any]] = None,
-        baselines_path: Optional[str] = None,
         eval_batch_size: int = 16,
         max_benchmark_samples: Optional[int] = 300,
         phone_benchmark: bool = True,
@@ -122,8 +81,9 @@ class WebTelemetryCallback(TrainerCallback):
         )
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
 
-        # Baselines to compare against (single source: configs/baselines.json)
-        self.baseline_benchmark = baseline_benchmark or load_baselines(baselines_path)
+        # Measured preflight baseline. Whisper is reference-only and may be
+        # omitted when its preflight evaluation failed.
+        self.baseline_benchmark = baseline_benchmark or {}
 
         os.makedirs(self.results_dir, exist_ok=True)
         self.telemetry_file = os.path.join(self.results_dir, "live_telemetry.json")
@@ -161,23 +121,34 @@ class WebTelemetryCallback(TrainerCallback):
             "updated_at": time.time(),
         })
 
-        # Initialize benchmarks file if not existing
-        if not os.path.exists(self.benchmarks_file):
-            initial_benchmarks = [
-                {
-                    "epoch": "Whisper Large v3",
-                    "type": "baseline",
-                    "is_baseline": True,
-                    **self.baseline_benchmark["whisper_v3"]
-                },
-                {
-                    "epoch": "BuzzASR Base",
-                    "type": "baseline",
-                    "is_baseline": True,
-                    **self.baseline_benchmark["buzzasr_base"]
-                }
-            ]
-            self._write_json(self.benchmarks_file, initial_benchmarks)
+        # Install the measured preflight rows, replacing any stale baselines
+        # from an earlier run while preserving epoch history.
+        initial_benchmarks = []
+        for key in ("buzzasr_base", "whisper_v3"):
+            baseline = self.baseline_benchmark.get(key)
+            if not baseline:
+                continue
+            initial_benchmarks.append({
+                "type": "baseline",
+                "is_baseline": True,
+                "canary_transcriptions": [],
+                **baseline,
+            })
+
+        preserved_benchmarks = []
+        if os.path.exists(self.benchmarks_file):
+            try:
+                with open(self.benchmarks_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, list):
+                    preserved_benchmarks = [
+                        row for row in existing if not row.get("is_baseline")
+                    ]
+            except Exception:
+                preserved_benchmarks = []
+        self._write_json(
+            self.benchmarks_file, initial_benchmarks + preserved_benchmarks
+        )
 
     def _get_gpu_stats(self) -> Dict[str, Any]:
         """Fetch current CUDA VRAM and device metadata."""
@@ -536,13 +507,6 @@ class WebTelemetryCallback(TrainerCallback):
         formal_wer = formal.get("normalized_wer", 0.0)
         informal_wer = informal.get("normalized_wer", 0.0)
 
-        # Baseline comparisons
-        whisper_wer = self.baseline_benchmark["whisper_v3"]["normalized_wer"]
-        delta_vs_whisper = round(norm_wer - whisper_wer, 2)  # negative is improvement
-
-        buzzasr_wer = self.baseline_benchmark["buzzasr_base"]["normalized_wer"]
-        delta_vs_buzzasr = round(norm_wer - buzzasr_wer, 2)
-
         record = {
             "epoch": f"Epoch {epoch_num}",
             "epoch_number": epoch_num,
@@ -553,8 +517,6 @@ class WebTelemetryCallback(TrainerCallback):
             "diagnostic_wer": round(diag_wer, 2),
             "formal_wer": round(formal_wer, 2),
             "informal_wer": round(informal_wer, 2),
-            "delta_vs_whisper": delta_vs_whisper,
-            "delta_vs_buzzasr": delta_vs_buzzasr,
             "total_samples": results.get("total_samples", 0),
             "canary_transcriptions": results.get("canary_transcriptions", []),
             "timestamp": time.time()
@@ -580,6 +542,15 @@ class WebTelemetryCallback(TrainerCallback):
             record["phone_profile_skipped_samples"] = results.get(
                 "phone_profile_skipped_samples", 0
             )
+
+        # Compare against the measured preflight baseline. Deltas are None when
+        # the sample counts differ (e.g. 1,000-row preflight vs 2,149 test).
+        record.update(compute_deltas(
+            norm_wer,
+            record.get("phone_normalized_wer"),
+            record["total_samples"],
+            self.baseline_benchmark.get("buzzasr_base"),
+        ))
 
         # Read existing records
         records = []
