@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import signal
+import shutil
 import subprocess
 import asyncio
 from pathlib import Path
@@ -258,6 +259,10 @@ def _read_log_tail(path: Path, tail: int = 30) -> List[str]:
             return [line.rstrip() for line in f.readlines()[-tail:]]
     except Exception:
         return []
+
+
+def _any_training_running() -> bool:
+    return _training_running() or _smoke_running()
 
 
 def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any]:
@@ -563,24 +568,147 @@ async def get_logs(tail: int = 150):
         return {"logs": [f"Error reading log file: {e}"]}
 
 
+@app.post("/api/train/smoke")
+async def start_smoke_test(config: Dict[str, Any] = None):
+    global smoke_process, smoke_log_fd, smoke_last_exit_code
+
+    _check_auth(config)
+    _check_audio_backend_or_400()
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+
+    config = config or {}
+    try:
+        batch_i = int(config.get("batch_size", 8))
+        accum_i = int(config.get("grad_accum", 4))
+        lr_f = float(config.get("learning_rate", 1e-4))
+        eval_bs_i = int(config.get("eval_batch_size", 16))
+        num_proc_i = int(config.get("num_proc", 8))
+        tele_f = float(config.get("telephony_prob", 0.5))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="batch_size/grad_accum/eval_batch_size/num_proc must be integers; "
+                   "learning_rate/telephony_prob numeric.",
+        )
+    if not (1 <= batch_i <= 64):
+        raise HTTPException(status_code=400, detail="batch_size must be 1..64.")
+    if not (1 <= accum_i <= 16):
+        raise HTTPException(status_code=400, detail="grad_accum must be 1..16.")
+    if not (1e-7 <= lr_f <= 1e-2):
+        raise HTTPException(status_code=400, detail="learning_rate must be 1e-7..1e-2.")
+    if not (1 <= eval_bs_i <= 64):
+        raise HTTPException(status_code=400, detail="eval_batch_size must be 1..64.")
+    if not (1 <= num_proc_i <= 16):
+        raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
+    if not (0.0 <= tele_f <= 1.0):
+        raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
+
+    ckpt_raw = config.get("gradient_checkpointing", False)
+    gradient_ckpt = (
+        str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(ckpt_raw, str)
+        else bool(ckpt_raw)
+    )
+    if batch_i > 8 and not gradient_ckpt:
+        raise HTTPException(
+            status_code=400,
+            detail="batch_size above 8 needs gradient_checkpointing on; "
+                   "without it batch 16 runs out of memory on a 48 GB GPU.",
+        )
+
+    dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
+    if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
+        raise HTTPException(status_code=400, detail="Invalid dataset_name.")
+
+    output_dir = _smoke_output_dir()
+    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    _abs_output_path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # A new attempt must never inherit a previous pass.
+    shutil.rmtree(_abs_output_path(output_dir) / "best_adapter", ignore_errors=True)
+    SMOKE_PID_FILE.unlink(missing_ok=True)
+    SMOKE_ATTEMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SMOKE_ATTEMPT_FILE.write_text(
+        json.dumps({"started_at": time.time()}), encoding="utf-8"
+    )
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "scripts" / "train_lora.py"),
+        "--base_model", "BuzzASR/persian",
+        "--dataset_name", dataset_name,
+        "--output_dir", output_dir,
+        "--results_dir", str(SMOKE_RESULTS_DIR),
+        "--epochs", "1",
+        "--batch_size", str(batch_i),
+        "--grad_accum", str(accum_i),
+        "--learning_rate", str(lr_f),
+        "--eval_batch_size", str(eval_bs_i),
+        "--max_train_samples", "200",
+        "--max_eval_samples", "50",
+        "--max_benchmark_samples", "25",
+        "--preflight_samples", "25",
+        "--num_proc", str(num_proc_i),
+        "--telephony_prob", str(tele_f),
+        "--warmup_steps", "2",
+        "--eval_steps", "5",
+        "--save_steps", "5",
+        "--enable_telemetry",
+        "--run_epoch_benchmark",
+        "--no-run-post-test-eval",
+        "--fresh_start",
+        "--no-auto_resume",
+        "--gradient_checkpointing" if gradient_ckpt else "--no-gradient_checkpointing",
+    ]
+
+    _close_smoke_log_fd()
+    smoke_log_fd = open(SMOKE_LOG_FILE, "w", encoding="utf-8")
+    smoke_log_fd.write(f"=== Smoke test launched at {time.ctime()} ===\n")
+    smoke_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
+    smoke_log_fd.flush()
+    smoke_last_exit_code = None
+
+    try:
+        smoke_process = subprocess.Popen(
+            cmd,
+            stdout=smoke_log_fd,
+            stderr=subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            preexec_fn=os.setsid if sys.platform != "win32" else None,
+        )
+    except Exception as e:
+        try:
+            smoke_log_fd.write(f"\n!!! Failed to launch smoke test: {e}\n")
+            smoke_log_fd.flush()
+        except Exception:
+            pass
+        _close_smoke_log_fd()
+        smoke_process = None
+        raise HTTPException(status_code=500, detail=f"Failed to launch smoke test: {e}")
+
+    try:
+        SMOKE_PID_FILE.write_text(str(smoke_process.pid), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "status": "started",
+        "mode": "smoke",
+        "pid": smoke_process.pid,
+        "output_dir": output_dir,
+        "results_dir": str(SMOKE_RESULTS_DIR),
+    }
+
+
 @app.post("/api/train/start")
 async def start_training(config: Dict[str, Any] = None):
     global training_process, training_log_fd, last_exit_code, halt_requested
     _check_auth(config)
     _check_audio_backend_or_400()
-    if training_process is not None and training_process.poll() is None:
-        raise HTTPException(status_code=400, detail="Training is already currently running.")
-    # Recover from PID file after restart.
-    try:
-        if PID_FILE.exists():
-            pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
-            if _is_process_running(pid):
-                raise HTTPException(status_code=400, detail=f"Training already running (pid {pid}).")
-            PID_FILE.unlink(missing_ok=True)
-    except HTTPException:
-        raise
-    except Exception:
-        pass
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
 
     config = config or {}
     try:

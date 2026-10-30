@@ -229,3 +229,109 @@ def test_smoke_status_includes_log_tail_on_failure(client):
     res = client.get("/api/train/smoke/status")
     assert res.json()["status"] == "failed"
     assert res.json()["log_tail"][-1] == "RuntimeError: out of memory"
+
+
+def _flag_value(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
+class _RunningProcess:
+    pid = 999_999
+
+    def poll(self):
+        return None
+
+
+def test_smoke_start_builds_fast_isolated_command(client):
+    res = client.post(
+        "/api/train/smoke",
+        json={
+            "batch_size": 4,
+            "grad_accum": 8,
+            "learning_rate": 2e-4,
+            "gradient_checkpointing": False,
+        },
+    )
+    assert res.status_code == 200, res.text
+    cmd = client.launched[0]
+    assert _flag_value(cmd, "--max_train_samples") == "200"
+    assert _flag_value(cmd, "--max_eval_samples") == "50"
+    assert _flag_value(cmd, "--epochs") == "1"
+    assert _flag_value(cmd, "--eval_steps") == "5"
+    assert _flag_value(cmd, "--save_steps") == "5"
+    assert _flag_value(cmd, "--warmup_steps") == "2"
+    assert _flag_value(cmd, "--max_benchmark_samples") == "25"
+    assert _flag_value(cmd, "--batch_size") == "4"
+    assert _flag_value(cmd, "--grad_accum") == "8"
+    assert _flag_value(cmd, "--learning_rate") == "0.0002"
+    assert "--no-run-post-test-eval" in cmd
+    assert "--fresh_start" in cmd
+    assert "--no-auto_resume" in cmd
+    assert Path(_flag_value(cmd, "--output_dir")).name == "smoke-test"
+    assert Path(_flag_value(cmd, "--results_dir")).name == "smoke-test"
+    assert res.json()["mode"] == "smoke"
+
+
+def test_smoke_start_removes_stale_adapter_and_writes_attempt(client):
+    out = Path(client.mod._smoke_output_dir())
+    adapter_dir = out / "best_adapter"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 200, res.text
+    assert not adapter_dir.exists()
+    assert client.mod.SMOKE_ATTEMPT_FILE.is_file()
+
+
+def test_smoke_start_rejects_batch_above_8_without_checkpointing(client):
+    res = client.post(
+        "/api/train/smoke",
+        json={"batch_size": 16, "gradient_checkpointing": False},
+    )
+    assert res.status_code == 400
+    assert "gradient_checkpointing" in res.json()["detail"]
+    assert client.launched == []
+
+
+def test_smoke_start_rejects_invalid_accumulation(client):
+    res = client.post("/api/train/smoke", json={"grad_accum": 0})
+    assert res.status_code == 400
+    assert client.launched == []
+
+
+def test_smoke_start_rejects_invalid_learning_rate(client):
+    res = client.post("/api/train/smoke", json={"learning_rate": 1.0})
+    assert res.status_code == 400
+    assert client.launched == []
+
+
+def test_smoke_start_rejected_while_full_run_active(client):
+    client.mod.training_process = _RunningProcess()
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 400
+    assert client.launched == []
+
+
+def test_full_start_rejected_while_smoke_active(client):
+    assert client.post("/api/train/smoke", json={}).status_code == 200
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 400
+    assert len(client.launched) == 1
+
+
+def test_full_start_works_after_smoke_finishes(client):
+    assert client.post("/api/train/smoke", json={}).status_code == 200
+    client.mod.smoke_process = None
+    client.mod.smoke_last_exit_code = 0
+    client.mod.SMOKE_PID_FILE.unlink(missing_ok=True)
+
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 200
+    assert len(client.launched) == 2
+
+
+def test_smoke_status_reports_running_after_start(client):
+    assert client.post("/api/train/smoke", json={}).status_code == 200
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "running"
