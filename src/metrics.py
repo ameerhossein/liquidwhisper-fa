@@ -47,7 +47,7 @@ def _levenshtein_distance(ref_tokens: List[str], hyp_tokens: List[str]) -> int:
 def _canonical_profile_name(profile: Any) -> str:
     """Normalize profile aliases used by the simulator and eval scripts."""
     name = str(profile).strip().lower()
-    return "gated" if name == "clean" else name
+    return "customer" if name in ("clean", "gated") else name
 
 
 def profile_subsets(

@@ -2,23 +2,25 @@
 Iranian telephony simulation for Persian ASR training/eval.
 
 Converts clean 16 kHz Neyshekar audio to phone-call quality matching:
-- gated clean landline (dominant real-call population: no line noise/hum,
-  dark handset response, A-law digital silence)
-- MCI / Irancell cellular (AMR-NB, coloured noise, fading/packet loss)
-- TCI landline / PSTN (G.711 A-law, coloured line noise, rare low hum)
+- customer (default): answered mobile-customer channel, no line noise/hum,
+  gated A-law silence, measured 1/3-octave speech EQ
+- MCI / Irancell cellular (legacy, explicit only): AMR-NB, coloured noise,
+  fading/packet loss
+- TCI landline / PSTN (legacy, explicit only): G.711 A-law, coloured line
+  noise, rare low hum
 
 Chain (order follows a real call):
   mobile: 16k -> 8k -> bandpass -> level calibration -> noise/gain -> AMR-NB
           -> packet loss -> line-noise bed -> A-law storage -> 8k -> 16k
   PSTN:   16k -> 8k -> bandpass -> level calibration -> noise/hum/gain
           -> line-noise bed -> A-law storage -> 8k -> 16k
-  gated:  16k -> 8k -> handset EQ -> level calibration/gain -> silence gate
-          -> A-law storage -> 8k -> 16k
+  customer: 16k -> 8k -> bandpass -> 1/3-octave EQ -> level calibration/gain
+          -> silence gate -> A-law storage -> 8k -> 16k
 
-The default profile mixture is 70 % gated / 15 % mobile / 15 % PSTN,
-calibrated against the 2026-10-22 real-call corpus.  Every profile is
-A-law-quantized at 8 kHz before the final upsample, and can return the 8 kHz
-A-law stream directly with ``output_sr=8000``.
+The default profile is ``customer``, calibrated against answered gated
+mobile-customer recordings only (music-only/no-answer recordings excluded).
+Every profile is A-law-quantized at 8 kHz before the final upsample, and can
+return the 8 kHz A-law stream directly with ``output_sr=8000``.
 
 Two codec tiers:
 - full (default for mobile): true AMR-NB via system ffmpeg
@@ -64,13 +66,13 @@ FRAME_LEN = 160  # 20 ms at 8 kHz
 
 MOBILE_PROFILES = ("mobile",)
 PSTN_PROFILES = ("pstn",)
-GATED_PROFILES = ("gated",)
-DEFAULT_PROFILES = ("gated", "mobile", "pstn")
-# Channel-condition weights, not carrier shares. Caller-number analysis of
-# the 2026-10-22 corpus: 74/77 gated calls were mobile-originated; the noisy
-# subset was mostly internal extensions. "gated" is therefore the closer
-# mobile-customer condition, while "mobile" below is a noisy-line condition.
-DEFAULT_PROFILE_WEIGHTS = {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
+CUSTOMER_PROFILES = ("customer",)
+DEFAULT_PROFILES = ("customer",)
+# The customer profile is the answered mobile-customer channel. The old
+# gated/mobile/PSTN mixture was fitted to a corpus contaminated by ringback
+# music and noisy internal extensions; those profiles remain explicit only.
+DEFAULT_PROFILE_WEIGHTS = {"customer": 1.0}
+LEGACY_PROFILE_WEIGHTS = {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
 
 # Calibrated against the 2026-10-22 call corpus (see RecordingTesting/analysis).
 # Caveat: the SNR/level ranges were fitted to the noisy-line subset (mostly
@@ -89,7 +91,9 @@ _AMR_FALLBACK_COUNT = 0
 # Level/noise calibration fitted to the real noisy-line vs gated populations.
 MOBILE_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
 PSTN_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
-GATED_TARGET_RMS_DB_RANGE = (-25.9, -17.8)
+CUSTOMER_TARGET_RMS_DB_RANGE = (-28.5, -21.5)
+# Deprecated alias for external callers that imported the gated constant.
+GATED_TARGET_RMS_DB_RANGE = CUSTOMER_TARGET_RMS_DB_RANGE
 # Bed ranges are deliberately wider than the fitted median for training
 # diversity; the medians remain the corpus-calibrated 21 / 19 dB.
 MOBILE_BED_SNR_DB_RANGE = (17.0, 25.0)
@@ -733,11 +737,11 @@ def choose_telephone_profile(
     rng: Optional[random.Random] = None,
     profile_weights: Optional[Mapping[str, float]] = None,
 ) -> str:
-    """Pick a profile, weighted by the real-corpus mixture by default.
+    """Pick a profile, weighted by the default mixture.
 
-    Explicitly passing ``["mobile", "pstn"]`` (the old default) is still
-    uniform, because both weights are equal.  Unknown profile names fall back
-    to uniform choice unless ``profile_weights`` is supplied.
+    The default is a single ``customer`` profile, so the default draw is
+    deterministic. Explicit multi-profile lists use ``profile_weights`` when
+    supplied; unknown names fall back to uniform choice.
     """
     profs = [str(p) for p in profiles]
     if not profs:
@@ -903,32 +907,30 @@ def simulate_pstn(waveform: Union[np.ndarray, Sequence[float]],
     return _format_phone_output(x8, target_len, output_sr)
 
 
-def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
-                   sr: int = TARGET_SR,
-                   seed: Optional[int] = None,
-                   use_ffmpeg: bool = True,
-                   gain_db_range: Tuple[float, float] = (-1.0, 1.0),
-                   band_low_hz: float = 300.0,
-                   band_high_hz: float = 3400.0,
-                   output_sr: int = TARGET_SR,
-                   normalize_level: bool = True,
-                   target_rms_db: Optional[float] = None,
-                   gate_silence: bool = True,
-                   gate_relative_db: float = -35.0,
-                   gate_hangover_ms: float = 150.0,
-                   gate_fade_ms: float = 5.0,
-                   low_shelf_db: float = 4.0,
-                   low_shelf_hz: float = 500.0) -> np.ndarray:
-    """Simulate a clean/gated landline recording.
+def simulate_customer(waveform: Union[np.ndarray, Sequence[float]],
+                      sr: int = TARGET_SR,
+                      seed: Optional[int] = None,
+                      use_ffmpeg: bool = True,
+                      gain_db_range: Tuple[float, float] = (-1.0, 1.0),
+                      band_low_hz: float = 300.0,
+                      band_high_hz: float = 3400.0,
+                      output_sr: int = TARGET_SR,
+                      normalize_level: bool = True,
+                      target_rms_db: Optional[float] = None,
+                      gate_silence: bool = True,
+                      gate_relative_db: float = -35.0,
+                      gate_hangover_ms: float = 150.0,
+                      gate_fade_ms: float = 5.0,
+                      low_shelf_db: float = 4.0,
+                      low_shelf_hz: float = 500.0) -> np.ndarray:
+    """Simulate the answered mobile-customer channel.
 
-    This is the dominant real-call population: no added line noise or hum,
-    a standard 300-3400 Hz telephone band with a gentle low-frequency shelf,
-    A-law digital silence between utterances, and active speech normalised
-    to the real gated level range.  The shelf is deliberately modest: the
-    real corpus has a strong 400-500 Hz peak, but that peak is partly
-    source/F0 dependent, so matching it blindly hurts intelligibility and
-    overfits the corpus.  ``use_ffmpeg`` is accepted for API symmetry;
-    A-law storage is exact and does not need an external codec.
+    No added line noise or hum, a standard 300-3400 Hz telephone band with a
+    gentle low-frequency shelf, A-law digital silence between utterances, and
+    active speech normalised to the answered-customer level range. The
+    measured 1/3-octave EQ is added in a follow-up change. ``use_ffmpeg`` is
+    accepted for API symmetry; A-law storage is exact and does not need an
+    external codec.
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_gated expects {TARGET_SR} Hz input, got {sr}.")
@@ -946,7 +948,7 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
         x8, PHONE_SR, gain_db=low_shelf_db, corner_hz=low_shelf_hz
     )
     x8 = calibrate_active_rms(
-        x8, GATED_TARGET_RMS_DB_RANGE, rng,
+        x8, CUSTOMER_TARGET_RMS_DB_RANGE, rng,
         enabled=normalize_level, target_db=target_rms_db,
     )
     gain = float(rng.uniform(gain_db_range[0], gain_db_range[1]))
@@ -960,9 +962,13 @@ def simulate_gated(waveform: Union[np.ndarray, Sequence[float]],
     return _format_phone_output(x8, target_len, output_sr)
 
 
+# Deprecated name retained for explicit legacy call sites and analysis scripts.
+simulate_gated = simulate_customer
+
+
 def simulate_telephone(waveform: Union[np.ndarray, Sequence[float]],
                        sr: int = TARGET_SR,
-                       profile: str = "mobile",
+                       profile: str = "customer",
                        seed: Optional[int] = None,
                        use_ffmpeg: bool = True,
                        output_sr: int = TARGET_SR,
@@ -978,13 +984,13 @@ def simulate_telephone(waveform: Union[np.ndarray, Sequence[float]],
         return simulate_pstn(waveform, sr=sr, seed=seed, use_ffmpeg=use_ffmpeg,
                              output_sr=output_sr, normalize_level=normalize_level,
                              target_rms_db=target_rms_db)
-    if profile in ("gated", "clean"):
-        return simulate_gated(waveform, sr=sr, seed=seed, use_ffmpeg=use_ffmpeg,
-                              output_sr=output_sr, normalize_level=normalize_level,
-                              target_rms_db=target_rms_db)
+    if profile in ("customer", "gated", "clean"):
+        return simulate_customer(waveform, sr=sr, seed=seed, use_ffmpeg=use_ffmpeg,
+                                 output_sr=output_sr, normalize_level=normalize_level,
+                                 target_rms_db=target_rms_db)
     raise ValueError(
         f"Unknown telephone profile '{profile}' "
-        "(expected 'gated', 'mobile' or 'pstn')."
+        "(expected 'customer', 'gated', 'clean', 'mobile' or 'pstn')."
     )
 
 
@@ -1003,8 +1009,8 @@ def apply_random_telephone(
 
     Returns (waveform_out, applied_profile_or_None).
     Uses stdlib `random` (picklable, safe inside datasets.map workers).
-    Profile choice follows the real-corpus mixture when the default profile
-    names are used (70 % gated / 15 % mobile / 15 % PSTN).
+    The default profile set is the single ``customer`` profile; explicit
+    legacy lists use the supplied weights or fall back to uniform choice.
     """
     x = _as_float32_mono(waveform)
     if prob <= 0 or not profiles:
@@ -1027,9 +1033,9 @@ def degrade_for_eval_profiled(waveform: Union[np.ndarray, Sequence[float]],
                               use_ffmpeg: bool = True) -> Tuple[np.ndarray, str]:
     """Deterministic per-sample degradation returning the applied profile."""
     profs = list(profiles) or list(DEFAULT_PROFILES)
-    profile = str(profs[index % len(profs)])
-    if profile.lower() == "clean":
-        profile = "gated"
+    profile = str(profs[index % len(profs)]).strip().lower()
+    if profile in ("gated", "clean"):
+        profile = "customer"
     degraded = simulate_telephone(waveform, sr=TARGET_SR, profile=profile,
                                   seed=int(seed_base) + int(index),
                                   use_ffmpeg=use_ffmpeg)

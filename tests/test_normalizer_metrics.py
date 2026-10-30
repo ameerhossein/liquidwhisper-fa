@@ -75,33 +75,34 @@ def test_profile_subsets_and_weighted_wer():
 
     refs = ["a", "b", "c", "d"]
     preds = ["a", "x", "c", "y"]
-    profiles = ["gated", "gated", "mobile", "pstn"]
+    profiles = ["customer", "customer", "mobile", "pstn"]
     subsets = profile_subsets(
         refs, preds, profiles, is_informal_flags=[False, False, True, False]
     )
-    assert subsets["gated"][0] == ["a", "b"]
-    assert subsets["gated"][1] == ["a", "x"]
-    assert subsets["gated"][2] == [False, False]
+    assert subsets["customer"][0] == ["a", "b"]
+    assert subsets["customer"][1] == ["a", "x"]
+    assert subsets["customer"][2] == [False, False]
     assert subsets["mobile"][0] == ["c"]
     assert subsets["pstn"][0] == ["d"]
 
     results = {
-        "gated": {"overall": {"normalized_wer": 10.0}},
+        "customer": {"overall": {"normalized_wer": 10.0}},
         "mobile": {"overall": {"normalized_wer": 20.0}},
         "pstn": {"overall": {"normalized_wer": 30.0}},
     }
     weighted = weighted_normalized_wer(
-        results, {"gated": 0.7, "mobile": 0.15, "pstn": 0.15}
+        results, {"customer": 0.7, "mobile": 0.15, "pstn": 0.15}
     )
     assert abs(weighted - 14.5) < 1e-9
 
 
-def test_profile_subsets_canonicalizes_clean_alias():
+def test_profile_subsets_maps_gated_and_clean_to_customer():
     from src.metrics import profile_subsets
 
-    subsets = profile_subsets(["a", "b"], ["a", "b"], ["clean", "mobile"])
-    assert set(subsets) == {"gated", "mobile"}
-    assert subsets["gated"][0] == ["a"]
+    subsets = profile_subsets(["a", "b", "c"], ["a", "b", "c"],
+                              ["clean", "gated", "mobile"])
+    assert set(subsets) == {"customer", "mobile"}
+    assert subsets["customer"][0] == ["a", "b"]
 
 
 def test_filter_valid_profiles_keeps_successful_rows_and_counts_skipped():
@@ -122,9 +123,9 @@ def test_profile_weights_for_subsets_and_aliases():
     from src.metrics import profile_weights
 
     weights = profile_weights(
-        ["clean", "mobile"], {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
+        ["clean", "mobile"], {"customer": 0.70, "mobile": 0.15, "pstn": 0.15}
     )
-    assert abs(weights["gated"] - 0.70 / 0.85) < 1e-9
+    assert abs(weights["customer"] - 0.70 / 0.85) < 1e-9
     assert abs(weights["mobile"] - 0.15 / 0.85) < 1e-9
 
 
@@ -135,7 +136,7 @@ def test_weighted_normalized_wer_raises_without_matching_weights():
     with pytest.raises(ValueError):
         weighted_normalized_wer(
             {"unknown": {"overall": {"normalized_wer": 42.0}}},
-            {"gated": 0.70, "mobile": 0.15, "pstn": 0.15},
+            {"customer": 0.70, "mobile": 0.15, "pstn": 0.15},
         )
 
 
@@ -149,9 +150,10 @@ def test_evaluate_predictions_by_profile_counts():
         ["سلام", "خداحافظ"],
         ["gated", "mobile"],
     )
-    assert results["gated"]["total_samples"] == 1
+    assert results["customer"]["total_samples"] == 1
     assert results["mobile"]["total_samples"] == 1
-    assert results["gated"]["overall"]["normalized_wer"] == 0.0
+    assert results["customer"]["overall"]["normalized_wer"] == 0.0
+    assert "gated" not in results
 
 
 def test_metrics_empty_and_single():

@@ -311,7 +311,7 @@ def test_apply_random_prob_edges():
 def test_degrade_for_eval_profiled_returns_profiles_and_matches_audio():
     from src import telephone
     x = _sine_mix(dur=0.5)
-    profiles = ["gated", "mobile", "pstn"]
+    profiles = ["customer", "mobile", "pstn"]
     for idx, expected in enumerate(profiles):
         y, prof = telephone.degrade_for_eval_profiled(
             x, index=idx, seed_base=1234, profiles=profiles, use_ffmpeg=False
@@ -321,10 +321,11 @@ def test_degrade_for_eval_profiled_returns_profiles_and_matches_audio():
         )
         assert prof == expected
         np.testing.assert_allclose(y, z, atol=1e-6)
-    _, alias = telephone.degrade_for_eval_profiled(
-        x, index=0, seed_base=1234, profiles=["clean"], use_ffmpeg=False
-    )
-    assert alias == "gated"
+    for alias in ("gated", "clean"):
+        _, prof = telephone.degrade_for_eval_profiled(
+            x, index=0, seed_base=1234, profiles=[alias], use_ffmpeg=False
+        )
+        assert prof == "customer"
 
 
 @requires_scipy
@@ -389,22 +390,23 @@ def test_ffmpeg_roundtrip_if_available():
 # Match-report P0 regressions: A-law storage, gated profile, noise/dropouts.
 # ---------------------------------------------------------------------------
 
-def test_default_profiles_include_gated():
+def test_legacy_profile_weights_sum_to_one():
     from src import telephone
-    assert "gated" in telephone.DEFAULT_PROFILES
-    assert abs(sum(telephone.DEFAULT_PROFILE_WEIGHTS.values()) - 1.0) < 1e-9
-    assert telephone.DEFAULT_PROFILE_WEIGHTS["gated"] >= 0.6
+    assert abs(sum(telephone.LEGACY_PROFILE_WEIGHTS.values()) - 1.0) < 1e-9
+    assert telephone.LEGACY_PROFILE_WEIGHTS["gated"] >= 0.6
 
 
-def test_choose_telephone_profile_is_weighted():
+def test_choose_telephone_profile_is_weighted_for_explicit_profiles():
     import random
     from src import telephone
     rng = random.Random(0)
-    counts = {"gated": 0, "mobile": 0, "pstn": 0}
+    profiles = ["customer", "mobile"]
+    weights = {"customer": 0.75, "mobile": 0.25}
+    counts = {p: 0 for p in profiles}
     for _ in range(2000):
-        counts[telephone.choose_telephone_profile(telephone.DEFAULT_PROFILES, rng)] += 1
-    assert counts["gated"] > counts["mobile"] + counts["pstn"]
-    assert 0.60 < counts["gated"] / 2000.0 < 0.80
+        counts[telephone.choose_telephone_profile(profiles, rng, weights)] += 1
+    assert counts["customer"] > counts["mobile"]
+    assert 0.70 < counts["customer"] / 2000.0 < 0.80
 
 
 def test_apply_dropouts_leaves_residual_not_zero():
@@ -614,10 +616,10 @@ def test_add_noise_bed_has_slow_level_variation():
     assert variation > 2.5
 
 
-def test_data_pipeline_default_profiles_include_gated():
+def test_data_pipeline_default_profiles_include_customer():
     from src.data import PersianASRDataPipeline
     pipe = PersianASRDataPipeline(processor=None)
-    assert "gated" in pipe.telephony_profiles
+    assert tuple(pipe.telephony_profiles) == ("customer",)
 
 
 def test_active_speech_rms_and_calibration():
@@ -784,3 +786,89 @@ def test_gated_profile_gates_pauses():
     # 8 frames (160 ms), and the 5 ms fade follows it; require silence after
     # that boundary.
     assert float(np.max(np.abs(y[5440:]))) <= 8.0 / 32768.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Customer profile: one default, aliases, and edge inputs.
+# ---------------------------------------------------------------------------
+
+def test_default_profiles_is_customer_only():
+    from src import telephone
+    assert telephone.DEFAULT_PROFILES == ("customer",)
+    assert telephone.DEFAULT_PROFILE_WEIGHTS == {"customer": 1.0}
+
+
+def test_simulate_telephone_defaults_to_customer():
+    import inspect
+    from src import telephone
+    params = inspect.signature(telephone.simulate_telephone).parameters
+    assert params["profile"].default == "customer"
+
+
+@requires_scipy
+def test_gated_and_clean_alias_to_customer():
+    from src.telephone import simulate_telephone
+    x = _sine_mix(dur=0.5)
+    y_customer = simulate_telephone(x, profile="customer", seed=7, use_ffmpeg=False)
+    for alias in ("gated", "clean"):
+        y = simulate_telephone(x, profile=alias, seed=7, use_ffmpeg=False)
+        np.testing.assert_allclose(y, y_customer, atol=1e-7)
+
+
+@requires_scipy
+def test_simulate_customer_preserves_length_and_alaw():
+    from src.telephone import simulate_customer
+    x = _sine_mix(dur=0.5)
+    y = simulate_customer(x, seed=1, output_sr=8000, use_ffmpeg=False)
+    assert len(y) == 4000
+    xi = np.round(y * 32768.0).astype(np.int32)
+    assert np.mean(xi % 8 == 0) > 0.99
+
+
+@requires_scipy
+def test_simulate_customer_handles_empty_and_stereo():
+    from src.telephone import simulate_customer
+    assert len(simulate_customer(np.zeros(0, dtype=np.float32), use_ffmpeg=False)) == 0
+    x = _sine_mix(dur=0.5)
+    stereo = np.stack([x, x], axis=1)
+    mono = simulate_customer(x, seed=3, use_ffmpeg=False)
+    st = simulate_customer(stereo, seed=3, use_ffmpeg=False)
+    np.testing.assert_allclose(mono, st, atol=1e-7)
+
+
+@requires_scipy
+def test_simulate_customer_rejects_non_16k():
+    from src.telephone import simulate_customer
+    with pytest.raises(ValueError):
+        simulate_customer(np.zeros(1600, dtype=np.float32), sr=8000, use_ffmpeg=False)
+
+
+def test_simulate_customer_requires_scipy(monkeypatch):
+    from src import telephone
+    monkeypatch.setattr(telephone, "_SCIPY_AVAILABLE", False)
+    with pytest.raises(ImportError):
+        telephone.simulate_customer(_sine_mix(dur=0.1), use_ffmpeg=False)
+
+
+@requires_scipy
+def test_degrade_for_eval_profiled_canonicalizes_customer_aliases():
+    from src import telephone
+    x = _sine_mix(dur=0.5)
+    for alias in ("gated", "clean"):
+        _, prof = telephone.degrade_for_eval_profiled(
+            x, index=0, seed_base=1, profiles=[alias], use_ffmpeg=False
+        )
+        assert prof == "customer"
+
+
+def test_apply_random_telephone_defaults_never_mobile_or_pstn():
+    from src import telephone
+    import random
+    rng = random.Random(5)
+    seen = {
+        telephone.choose_telephone_profile(
+            telephone.DEFAULT_PROFILES, rng, telephone.DEFAULT_PROFILE_WEIGHTS
+        )
+        for _ in range(100)
+    }
+    assert seen == {"customer"}
