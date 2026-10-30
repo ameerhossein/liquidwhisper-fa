@@ -33,7 +33,7 @@ try:
 except Exception:
     pass
 from pathlib import Path
-from typing import Dict, Any, Mapping, Optional
+from typing import Dict, Any, Mapping, Optional, Callable
 import torch
 import evaluate
 from transformers import (
@@ -579,6 +579,16 @@ def _load_run_baseline(
     return None
 
 
+def _resolve_eval_device() -> str:
+    """Device the post-training evaluation passes must run on."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _is_halt_requested(exc: BaseException) -> bool:
+    """True when *exc* is the cooperative-halt signal from evaluation."""
+    return isinstance(exc, RuntimeError) and str(exc) == "halt requested"
+
+
 def _run_post_eval_only(args) -> None:
     """Run only the full-test report from an existing ``best_adapter``.
 
@@ -589,6 +599,12 @@ def _run_post_eval_only(args) -> None:
     raw_results = getattr(args, "results_dir", None)
     results_dir = _resolve_results_dir(str(raw_results) if raw_results else None)
     run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
+    stop_signal = os.path.join(results_dir, "stop_training.signal")
+    if os.path.exists(stop_signal):
+        print("Stop signal found before post-eval; halting run.")
+        _halt_run(run_dir, results_dir, "post_eval")
+        return
+
     adapter_path = output_dir / "best_adapter"
     if not (adapter_path / "adapter_config.json").is_file():
         message = (
@@ -609,14 +625,15 @@ def _run_post_eval_only(args) -> None:
         normalizer = PersianTextNormalizer()
         metrics_calculator = ASRMetricsCalculator(normalizer=normalizer)
 
+        device = _resolve_eval_device()
         try:
             bf16_ok = torch.cuda.is_bf16_supported()
         except Exception:
             bf16_ok = False
-        if not torch.cuda.is_available():
-            dtype = torch.float32
-        else:
+        if device.startswith("cuda"):
             dtype = torch.bfloat16 if bf16_ok else torch.float16
+        else:
+            dtype = torch.float32
 
         print(f"Post-eval-only: loading base model {args.base_model} in {dtype}...")
         model = WhisperForConditionalGeneration.from_pretrained(
@@ -644,8 +661,13 @@ def _run_post_eval_only(args) -> None:
                 getattr(args, "telephony_profiles", "customer")
             ),
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+            should_stop=lambda: os.path.exists(stop_signal),
         )
     except Exception as exc:
+        if _is_halt_requested(exc):
+            print("Stop signal received during post-eval; halting run.")
+            _halt_run(run_dir, results_dir, "post_eval")
+            return
         _mark_run_stage(
             run_dir, "post_eval", "failed", detail=f"post-eval failed: {exc}"
         )
@@ -654,7 +676,9 @@ def _run_post_eval_only(args) -> None:
         )
         raise
     _mark_run_stage(run_dir, "post_eval", "completed")
-    _mark_run_status(run_dir, "completed")
+    _mark_run_status(
+        run_dir, "completed", failed_stage=None, last_error=None
+    )
 
 
 def main():
@@ -1075,8 +1099,13 @@ def main():
                 phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
                 telephony_profiles=args.telephony_profiles,
                 telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+                should_stop=lambda: os.path.exists(stop_signal),
             )
         except Exception as exc:
+            if _is_halt_requested(exc):
+                print("\nStop signal received during post-eval; halting run.")
+                _halt_run(run_dir, args.results_dir, "post_eval")
+                return
             _mark_run_stage(run_dir, "post_eval", "failed",
                             detail=f"post-eval failed: {exc}")
             _mark_run_status(run_dir, "failed", failed_stage="post_eval",
@@ -1156,13 +1185,22 @@ def _run_post_training_evaluation(
     telephony_profiles: Optional[list] = None,
     telephony_use_ffmpeg: bool = True,
     baseline_benchmark: Optional[Dict[str, Any]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ):
     import time
 
     phone_profiles = list(telephony_profiles or ["customer"])
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_eval_device()
     dtype = _resolve_infer_dtype(device)
     use_amp = _should_autocast(device)
+
+    def _check_halt() -> None:
+        if should_stop is not None and should_stop():
+            raise RuntimeError("halt requested")
+
+    # The caller may hand over a CPU-resident model (post-eval-only resume);
+    # features below are moved to this device, so the model must match it.
+    model.to(device)
 
     # 1. Load full test dataset
     pipeline = PersianASRDataPipeline(processor=processor, dataset_name=dataset_name)
@@ -1222,6 +1260,7 @@ def _run_post_training_evaluation(
         return preds, audio_seconds, profiles_used
 
     model.eval()
+    _check_halt()
     start_eval_time = time.time()
     predictions, total_audio_seconds, _ = _transcribe("clean")
     elapsed_eval_time = max(0.001, time.time() - start_eval_time)
@@ -1233,6 +1272,10 @@ def _run_post_training_evaluation(
         predictions=predictions,
         is_informal_flags=is_informal,
     )
+
+    # Stop between the clean and phone passes instead of starting another full
+    # transcription pass after a user halt.
+    _check_halt()
 
     # 2b. Phone-simulated second pass on the same test split (deterministic)
     phone_block = None

@@ -285,6 +285,13 @@ def test_post_eval_only_calls_report_without_training(tmp_path, monkeypatch):
     monkeypatch.setattr(train_lora, "Seq2SeqTrainer", _TrainerMustNotRun)
     monkeypatch.setattr(train_lora, "_run_post_training_evaluation", fake_report)
 
+    # Simulate a previous failed post-eval attempt: a successful resume must
+    # not leave the old failure visible on a completed run.
+    run_state.set_stage(run_dir, "post_eval", "failed", detail="prior boom")
+    run_state.set_status(
+        run_dir, "failed", failed_stage="post_eval", last_error="prior boom"
+    )
+
     args = _main_args(tmp_path, run_dir, post_eval_only=True)
     train_lora._run_post_eval_only(args)
 
@@ -297,9 +304,12 @@ def test_post_eval_only_calls_report_without_training(tmp_path, monkeypatch):
     assert report["output_dir"] == str(output_dir)
     assert report["results_dir"] == str(run_dir)
     assert report["model"].name == "peft"
+    assert callable(report["should_stop"])
 
     run = run_state.load_run(run_dir)
     assert run["status"] == "completed"
+    assert run["failed_stage"] is None
+    assert run["last_error"] is None
     assert _stages(run_dir)["post_eval"]["status"] == "completed"
     # Post-eval-only must never replay or append optimizer steps.
     assert not (run_dir / "steps.jsonl").exists()
@@ -347,3 +357,191 @@ def test_main_runs_post_eval_only_before_processor_load(tmp_path, monkeypatch):
     train_lora.main()
 
     assert seen == [args]
+
+
+class _FakeEvalDataset:
+    """Mapping-like test split: slices return column lists, iteration yields rows."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __len__(self):
+        return len(self._rows)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            rows = self._rows[index]
+            return {
+                "audio": [row["audio"] for row in rows],
+                "text": [row["text"] for row in rows],
+            }
+        return self._rows[index]
+
+
+class _FakeFeatures:
+    def to(self, device):
+        return self
+
+
+class _FakeEvalProcessor:
+    def __call__(self, waveforms, sampling_rate=16000, return_tensors="pt"):
+        return SimpleNamespace(input_features=_FakeFeatures())
+
+    def batch_decode(self, pred_ids, skip_special_tokens=True):
+        return ["متن"] * len(pred_ids)
+
+
+class _FakeEvalModel:
+    def __init__(self):
+        self.generate_calls = 0
+        self.devices = []
+
+    def to(self, device):
+        self.devices.append(device)
+        return self
+
+    def eval(self):
+        return self
+
+    def generate(self, input_features=None, max_new_tokens=225):
+        self.generate_calls += 1
+        return [[1, 2]]
+
+
+class _FakeEvalMetrics:
+    def evaluate_predictions(self, references, predictions, is_informal_flags):
+        return {
+            "total_samples": len(references),
+            "overall": {
+                "normalized_wer": 10.0,
+                "normalized_cer": 2.0,
+                "diagnostic_wer_zwnj_space": 9.0,
+            },
+            "formal": {"normalized_wer": 10.0, "count": 1},
+            "informal": {"normalized_wer": 10.0, "count": 0},
+        }
+
+
+def _exercise_post_training_eval(
+    train_lora, monkeypatch, tmp_path, model, *, should_stop, device=None
+):
+    rows = [
+        {
+            "text": "سلام",
+            "informal": False,
+            "audio": {"array": [0.0] * 160, "sampling_rate": 16000},
+        }
+    ]
+
+    class _FakePipeline:
+        def __init__(self, *a, **k):
+            pass
+
+        def load_raw_dataset(self, split):
+            assert split == "test"
+            return _FakeEvalDataset(rows)
+
+    monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
+    if device is not None:
+        monkeypatch.setattr(train_lora, "_resolve_eval_device", lambda: device)
+
+    train_lora._run_post_training_evaluation(
+        model=model,
+        processor=_FakeEvalProcessor(),
+        metrics_calculator=_FakeEvalMetrics(),
+        normalizer=SimpleNamespace(is_colloquial=lambda text: False),
+        dataset_name="test/dataset",
+        output_dir=str(Path(tmp_path) / "output"),
+        results_dir=str(Path(tmp_path) / "results"),
+        eval_batch_size=1,
+        phone_benchmark=True,
+        should_stop=should_stop,
+    )
+
+
+def test_post_training_evaluation_halts_between_passes_on_eval_device(
+    tmp_path, monkeypatch
+):
+    train_lora = _train_lora()
+    model = _FakeEvalModel()
+    stop_calls = []
+
+    def should_stop():
+        stop_calls.append(1)
+        return len(stop_calls) > 1
+
+    with pytest.raises(RuntimeError, match="halt requested"):
+        _exercise_post_training_eval(
+            train_lora, monkeypatch, tmp_path, model,
+            should_stop=should_stop, device="cuda",
+        )
+
+    # Model placement is the eval function's responsibility; the post-eval-only
+    # loader may hand it a CPU-resident PEFT model.
+    assert model.devices == ["cuda"]
+    # The signal was consumed between the clean and phone passes.
+    assert model.generate_calls == 1
+    assert len(stop_calls) == 2
+
+
+def test_post_eval_only_honors_stop_signal_before_start(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+    (run_dir / "stop_training.signal").write_text("stop", encoding="utf-8")
+
+    monkeypatch.setattr(
+        train_lora,
+        "_run_post_training_evaluation",
+        lambda **kwargs: pytest.fail("halted post-eval must not start"),
+    )
+    train_lora._run_post_eval_only(args)
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "stopped"
+    stages = _stages(run_dir)
+    assert stages["post_eval"]["status"] == "stopped"
+    assert stages["merge"]["status"] == "skipped"
+    assert not (run_dir / "stop_training.signal").exists()
+
+
+def test_post_eval_only_marks_stopped_when_report_halts(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    adapter_path = run_dir / "output" / "best_adapter"
+    adapter_path.mkdir(parents=True)
+    (adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakeBaseModel:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakePeftModel:
+        @classmethod
+        def from_pretrained(cls, model, *a, **k):
+            return model
+
+    def halt_report(**kwargs):
+        raise RuntimeError("halt requested")
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "WhisperForConditionalGeneration", _FakeBaseModel)
+    monkeypatch.setattr(train_lora, "PeftModel", _FakePeftModel)
+    monkeypatch.setattr(train_lora, "_run_post_training_evaluation", halt_report)
+
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+    train_lora._run_post_eval_only(args)  # a halt is not a failure
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "stopped"
+    assert run["failed_stage"] is None
+    stages = _stages(run_dir)
+    assert stages["post_eval"]["status"] == "stopped"
+    assert stages["merge"]["status"] == "skipped"
+    assert not (run_dir / "stop_training.signal").exists()

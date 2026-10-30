@@ -311,14 +311,15 @@ class WebTelemetryCallback(TrainerCallback):
         })
         self.step_count += 1
         if self.run_dir and (self.step_count % 100 == 0):
-            self._set_run_progress(
-                step=state.global_step,
-                step_count=self.step_count,
-                last_step_at=now,
-            )
+            self._set_run_progress(step=state.global_step, last_step_at=now)
 
-    def _set_run_progress(self, *, step: int, step_count: int, last_step_at: float) -> None:
-        """Refresh ``run.json`` progress, tolerating a plain ``--run_dir``."""
+    def _set_run_progress(self, *, step: int, last_step_at: float) -> None:
+        """Refresh ``run.json`` progress, tolerating a plain ``--run_dir``.
+
+        The count comes from the deduplicated ``steps.jsonl`` on every flush:
+        a checkpoint resume replays steps already in the file, so the local
+        append counter would overcount unique optimizer steps.
+        """
         if not self.run_dir:
             return
         if run_state.load_run(self.run_dir) is None:
@@ -329,7 +330,7 @@ class WebTelemetryCallback(TrainerCallback):
             run_state.set_progress(
                 self.run_dir,
                 step=step,
-                step_count=step_count,
+                step_count=run_state.step_count(self.results_dir),
                 last_step_at=last_step_at,
             )
         except (OSError, ValueError) as exc:
@@ -648,11 +649,7 @@ class WebTelemetryCallback(TrainerCallback):
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         # Final progress flush: every 100-step update is best-effort, so the
         # last partial interval must not be lost.
-        self._set_run_progress(
-            step=state.global_step,
-            step_count=self.step_count,
-            last_step_at=time.time(),
-        )
+        self._set_run_progress(step=state.global_step, last_step_at=time.time())
         self._write_telemetry({
             "status": "stopped" if self.halt_requested else "completed",
             "step": state.global_step,

@@ -173,6 +173,28 @@ def test_progress_is_skipped_without_run_dir(tmp_path):
     assert len(_records(tmp_path)) == 1
 
 
+def test_replayed_step_keeps_progress_count_unique(tmp_path):
+    run_dir = Path(tmp_path) / RUN_ID
+    run_state.create_run(tmp_path, config={}, trainer_args={}, run_id=RUN_ID)
+    for step in range(1, 100):
+        run_state.append_step(run_dir, {"step": step, "loss": 0.1})
+
+    cb = _callback(run_dir, run_dir=str(run_dir))
+    assert cb.step_count == 99
+    args, control = _args_control()
+
+    # A resume from checkpoint-90 replays step 90 before reaching new steps.
+    # The local append counter reaches 100, but only 99 steps are unique.
+    cb.on_step_end(args, _state(90), control)
+    run = run_state.load_run(run_dir)
+    assert run["step_count"] == 99
+
+    cb.on_train_end(args, _state(90), control)
+    run = run_state.load_run(run_dir)
+    assert run["step_count"] == 99
+    assert run["last_step"] == 90
+
+
 def test_on_step_end_consumes_stop_signal_and_records_halted_step(tmp_path):
     cb = _callback(tmp_path)
     (tmp_path / "stop_training.signal").write_text("stop", encoding="utf-8")
