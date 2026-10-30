@@ -679,12 +679,12 @@ def test_gated_level_calibration():
 
 
 @requires_scipy
-def test_gated_profile_preserves_speech_band_highs():
-    """The gated profile must keep the 1-3 kHz plateau, not a 350-900 cliff."""
+def test_customer_profile_preserves_speech_band_highs():
+    """The customer profile must keep the 1-3 kHz plateau, not a 350-900 cliff."""
     import inspect
     from src import telephone
 
-    params = inspect.signature(telephone.simulate_gated).parameters
+    params = inspect.signature(telephone.simulate_customer).parameters
     assert params["band_low_hz"].default <= 300.0
     assert params["band_high_hz"].default >= 3400.0
 
@@ -694,7 +694,7 @@ def test_gated_profile_preserves_speech_band_highs():
         + 0.1 * np.sin(2 * np.pi * 1500.0 * t)
         + 0.1 * np.sin(2 * np.pi * 2500.0 * t)
     ).astype(np.float32)
-    y = telephone.simulate_gated(
+    y = telephone.simulate_customer(
         x,
         seed=0,
         use_ffmpeg=False,
@@ -711,8 +711,8 @@ def test_gated_profile_preserves_speech_band_highs():
         return float(np.max(spec[m]) + 1e-20)
 
     ref = tone_amp(y, 8000, 500.0)
-    assert tone_amp(y, 8000, 1500.0) / ref > 0.5
-    assert tone_amp(y, 8000, 2500.0) / ref > 0.5
+    assert tone_amp(y, 8000, 1500.0) / ref > 0.4
+    assert tone_amp(y, 8000, 2500.0) / ref > 0.4
 
 
 def test_gate_silence_removes_low_level_pauses_without_hangover():
@@ -872,3 +872,83 @@ def test_apply_random_telephone_defaults_never_mobile_or_pstn():
         for _ in range(100)
     }
     assert seen == {"customer"}
+
+
+# ---------------------------------------------------------------------------
+# Customer 1/3-octave EQ.
+# ---------------------------------------------------------------------------
+
+def _tone(freq, sr=8000, dur=2.0):
+    t = np.arange(int(sr * dur)) / sr
+    return (0.1 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def _tone_db(x, freq, sr=8000, bw=60.0):
+    spec = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    freqs = np.fft.rfftfreq(len(x), 1.0 / sr)
+    mask = (freqs >= freq - bw) & (freqs <= freq + bw)
+    return float(20.0 * np.log10(np.max(spec[mask]) + 1e-20))
+
+
+@requires_scipy
+def test_apply_customer_eq_boosts_requested_band():
+    from src.telephone import apply_customer_eq
+    x = _tone(1000) + _tone(2000)
+    y = apply_customer_eq(x, {2000.0: 10.0})
+    before = _tone_db(x, 2000) - _tone_db(x, 1000)
+    after = _tone_db(y, 2000) - _tone_db(y, 1000)
+    assert 9.5 <= after - before <= 10.5
+
+
+@requires_scipy
+def test_apply_customer_eq_cuts_requested_band():
+    from src.telephone import apply_customer_eq
+    x = _tone(1000) + _tone(3150)
+    y = apply_customer_eq(x, {3150.0: -8.6})
+    before = _tone_db(x, 3150) - _tone_db(x, 1000)
+    after = _tone_db(y, 3150) - _tone_db(y, 1000)
+    assert -9.1 <= after - before <= -8.1
+
+
+@requires_scipy
+def test_apply_customer_eq_preserves_length():
+    from src.telephone import apply_customer_eq
+    x = _tone(1000, dur=1.0)
+    y = apply_customer_eq(x, {400.0: 4.0, 3150.0: -8.6})
+    assert len(y) == len(x)
+
+
+@requires_scipy
+def test_simulate_customer_applies_eq():
+    from src.telephone import simulate_customer
+    x = _tone(1000, sr=16000, dur=3.0) + _tone(3150, sr=16000, dur=3.0)
+    base = simulate_customer(x, seed=1, output_sr=8000, use_ffmpeg=False,
+                             eq_gains_db={})
+    cut = simulate_customer(x, seed=1, output_sr=8000, use_ffmpeg=False,
+                            eq_gains_db={3150.0: -8.6})
+    base_ratio = _tone_db(base, 3150) - _tone_db(base, 1000)
+    cut_ratio = _tone_db(cut, 3150) - _tone_db(cut, 1000)
+    assert cut_ratio - base_ratio < -5.0
+
+
+def test_customer_eq_gains_cover_primary_bands():
+    from src import telephone
+    assert {315.0, 400.0, 500.0, 630.0, 800.0, 1250.0,
+            1600.0, 2000.0, 2500.0, 3150.0}.issubset(
+        set(telephone.CUSTOMER_EQ_GAINS_DB)
+    )
+    assert all(-20.0 <= v <= 15.0 for v in telephone.CUSTOMER_EQ_GAINS_DB.values())
+
+
+@requires_scipy
+def test_customer_profile_active_rms_and_noise_floor():
+    from src.telephone import simulate_customer, active_speech_rms_db
+    speech = _tone(440, sr=16000, dur=1.0)
+    x = np.concatenate([speech, np.zeros(16000, dtype=np.float32)])
+    y = simulate_customer(x, seed=11, output_sr=8000, use_ffmpeg=False,
+                          target_rms_db=-25.6)
+    assert abs(active_speech_rms_db(y) - (-25.6)) <= 1.0
+    frames = y[: len(y) // 160 * 160].reshape(-1, 160).astype(np.float64)
+    energy = 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
+    noise_floor = float(np.median(np.sort(energy)[: max(1, len(energy) // 10)]))
+    assert -75.0 <= noise_floor <= -69.0

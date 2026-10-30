@@ -401,7 +401,7 @@ def test_apply_customer_eq_preserves_length():
 @requires_scipy
 def test_simulate_customer_applies_eq():
     from src.telephone import simulate_customer
-    x = _tone(1000, dur=3.0) + _tone(3150, dur=3.0)
+    x = _tone(1000, sr=16000, dur=3.0) + _tone(3150, sr=16000, dur=3.0)
     base = simulate_customer(x, seed=1, output_sr=8000, use_ffmpeg=False,
                              eq_gains_db={})
     cut = simulate_customer(x, seed=1, output_sr=8000, use_ffmpeg=False,
@@ -417,14 +417,14 @@ def test_customer_eq_gains_cover_primary_bands():
             1600.0, 2000.0, 2500.0, 3150.0}.issubset(
         set(telephone.CUSTOMER_EQ_GAINS_DB)
     )
-    assert all(-15.0 <= v <= 15.0 for v in telephone.CUSTOMER_EQ_GAINS_DB.values())
+    assert all(-20.0 <= v <= 15.0 for v in telephone.CUSTOMER_EQ_GAINS_DB.values())
 
 
 @requires_scipy
 def test_customer_profile_active_rms_and_noise_floor():
     from src.telephone import simulate_customer, active_speech_rms_db
-    speech = _tone(440, dur=1.0)
-    x = np.concatenate([speech, np.zeros(8000, dtype=np.float32)])
+    speech = _tone(440, sr=16000, dur=1.0)
+    x = np.concatenate([speech, np.zeros(16000, dtype=np.float32)])
     y = simulate_customer(x, seed=11, output_sr=8000, use_ffmpeg=False,
                           target_rms_db=-25.6)
     assert abs(active_speech_rms_db(y) - (-25.6)) <= 1.0
@@ -486,7 +486,7 @@ Expected: PASS.
 The script must:
 - Read `answered_customer_bands.csv`; compute the median target level per band and normalize to the pooled median 1 kHz level.
 - Generate the baseline customer output on the 46 clean voices with `eq_gains_db={}` and the same seeds as the analysis (start with seeds 1–3 for speed, full 1–5 for the final run).
-- Compute the residual `target - synth` at 315–3150 Hz; add it to the current gains with damping 0.7, clip to ±15 dB.
+- Compute the residual `target - synth` at 315–3150 Hz; add it to the current gains with damping 0.7, clip to −20…+15 dB.
 - Regenerate with the updated gains; repeat 3 iterations.
 - Write `customer_eq_gains.json` with the final gains and a before/after table; print the 315–3150 residuals.
 

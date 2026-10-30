@@ -94,6 +94,25 @@ PSTN_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
 CUSTOMER_TARGET_RMS_DB_RANGE = (-28.5, -21.5)
 # Deprecated alias for external callers that imported the gated constant.
 GATED_TARGET_RMS_DB_RANGE = CUSTOMER_TARGET_RMS_DB_RANGE
+
+# Measured 1/3-octave correction for the answered mobile-customer channel.
+# Values are the target-minus-current gated delta; the fit script refines them.
+CUSTOMER_EQ_GAINS_DB = {
+    315.0: -4.46,
+    400.0: 3.81,
+    500.0: 2.49,
+    630.0: 0.87,
+    800.0: -0.90,
+    1250.0: 2.28,
+    1600.0: 2.46,
+    2000.0: -2.33,
+    2500.0: 0.91,
+    3150.0: -20.0,
+}
+CUSTOMER_EQ_Q = 1.0 / (2.0 ** (1.0 / 6.0) - 2.0 ** (-1.0 / 6.0))
+# The 3150 Hz band sits against the 3400 Hz band edge; a wider peaking filter
+# is needed to move the 1/3-octave band average without an unstable gain.
+CUSTOMER_EQ_Q_BY_BAND = {3150.0: 3.0}
 # Bed ranges are deliberately wider than the fitted median for training
 # diversity; the medians remain the corpus-calibrated 21 / 19 dB.
 MOBILE_BED_SNR_DB_RANGE = (17.0, 25.0)
@@ -230,6 +249,47 @@ def apply_low_shelf(wav8k: np.ndarray, sr: int = PHONE_SR,
     sos = np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]],
                    dtype=np.float64)
     return _ssignal.sosfilt(sos, x).astype(np.float32)
+
+
+def _peaking_eq_sos(f0: float, gain_db: float, sr: int,
+                    q: float = CUSTOMER_EQ_Q) -> np.ndarray:
+    """RBJ peaking EQ biquad as a single SOS row."""
+    a = 10.0 ** (float(gain_db) / 40.0)
+    w0 = 2.0 * np.pi * float(np.clip(f0, 1.0, sr * 0.45)) / float(sr)
+    cos_w0 = float(np.cos(w0))
+    alpha = float(np.sin(w0)) / (2.0 * float(q))
+    b0 = 1.0 + alpha * a
+    b1 = -2.0 * cos_w0
+    b2 = 1.0 - alpha * a
+    a0 = 1.0 + alpha / a
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha / a
+    return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]],
+                    dtype=np.float64)
+
+
+def apply_customer_eq(wav8k: np.ndarray,
+                      gains_db: Optional[Mapping[float, float]] = None,
+                      sr: int = PHONE_SR) -> np.ndarray:
+    """Apply the measured 1/3-octave customer EQ.
+
+    ``gains_db`` maps 1/3-octave center frequencies to peaking gains. ``None``
+    uses ``CUSTOMER_EQ_GAINS_DB``; an empty mapping bypasses the EQ, which the
+    fit script uses to measure the baseline chain.
+    """
+    _require_scipy()
+    x = np.asarray(wav8k, dtype=np.float32)
+    if len(x) == 0:
+        return x.copy()
+    gains = CUSTOMER_EQ_GAINS_DB if gains_db is None else gains_db
+    y = x
+    for f0 in sorted(float(k) for k in gains):
+        gain = float(gains[f0])
+        if abs(gain) < 1e-9:
+            continue
+        q = CUSTOMER_EQ_Q_BY_BAND.get(f0, CUSTOMER_EQ_Q)
+        y = _ssignal.sosfilt(_peaking_eq_sos(f0, gain, sr, q=q), y).astype(np.float32)
+    return y
 
 
 # --- G.711 A-law lite approximation ----------------------------------------
@@ -922,18 +982,18 @@ def simulate_customer(waveform: Union[np.ndarray, Sequence[float]],
                       gate_hangover_ms: float = 150.0,
                       gate_fade_ms: float = 5.0,
                       low_shelf_db: float = 4.0,
-                      low_shelf_hz: float = 500.0) -> np.ndarray:
+                      low_shelf_hz: float = 500.0,
+                      eq_gains_db: Optional[Mapping[float, float]] = None) -> np.ndarray:
     """Simulate the answered mobile-customer channel.
 
     No added line noise or hum, a standard 300-3400 Hz telephone band with a
-    gentle low-frequency shelf, A-law digital silence between utterances, and
-    active speech normalised to the answered-customer level range. The
-    measured 1/3-octave EQ is added in a follow-up change. ``use_ffmpeg`` is
-    accepted for API symmetry; A-law storage is exact and does not need an
-    external codec.
+    gentle low-frequency shelf, the measured 1/3-octave customer EQ, A-law
+    digital silence between utterances, and active speech normalised to the
+    answered-customer level range. ``use_ffmpeg`` is accepted for API
+    symmetry; A-law storage is exact and does not need an external codec.
     """
     if sr != TARGET_SR:
-        raise ValueError(f"simulate_gated expects {TARGET_SR} Hz input, got {sr}.")
+        raise ValueError(f"simulate_customer expects {TARGET_SR} Hz input, got {sr}.")
     rng = np.random.default_rng(seed)
     x = _as_float32_mono(waveform)
     if x.size == 0:
@@ -947,6 +1007,9 @@ def simulate_customer(waveform: Union[np.ndarray, Sequence[float]],
     x8 = apply_low_shelf(
         x8, PHONE_SR, gain_db=low_shelf_db, corner_hz=low_shelf_hz
     )
+    gains = CUSTOMER_EQ_GAINS_DB if eq_gains_db is None else eq_gains_db
+    if gains:
+        x8 = apply_customer_eq(x8, gains, sr=PHONE_SR)
     x8 = calibrate_active_rms(
         x8, CUSTOMER_TARGET_RMS_DB_RANGE, rng,
         enabled=normalize_level, target_db=target_rms_db,
