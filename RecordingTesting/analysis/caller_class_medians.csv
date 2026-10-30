@@ -2,4 +2,4 @@ group,n,gated,noisy,content_class,speech_rms_db,noise_rms_db,speech_frac,hf_1_2k
 real_mobile,79,74,5,music_only:36;music_then_speech:4;speech_only:39,-21.2,-71.83,0.72,-24.86,-37.11,450.49,562.5
 real_extension,21,0,21,mixed:1;music_only:1;speech_only:19,-29.62,-49.85,0.56,-3.66,-10.85,511.54,1531.25
 real_landline,5,3,2,music_only:1;speech_only:4,-30.93,-68.63,0.65,-13.55,-22.66,502.06,781.25
-current_customer,230,,,,-25.54,-72.81,0.65,-14.75,-30.38,483.21,648.44
+current_customer,230,,,,-25.48,-72.81,0.65,-13.6,-27.44,490.08,671.88

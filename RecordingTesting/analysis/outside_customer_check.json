@@ -1,0 +1,103 @@
+{
+  "n_outside": 31,
+  "note": "all 31 are in the 67-file calibration set; in-sample check",
+  "bands": [
+    {
+      "hz": "315",
+      "outside_db_re_1k": 3.374,
+      "customer_db_re_1k": 5.18,
+      "diff_db": 1.806
+    },
+    {
+      "hz": "400",
+      "outside_db_re_1k": 11.827,
+      "customer_db_re_1k": 13.83,
+      "diff_db": 2.003
+    },
+    {
+      "hz": "500",
+      "outside_db_re_1k": 10.803,
+      "customer_db_re_1k": 13.84,
+      "diff_db": 3.037
+    },
+    {
+      "hz": "630",
+      "outside_db_re_1k": 7.703,
+      "customer_db_re_1k": 8.68,
+      "diff_db": 0.977
+    },
+    {
+      "hz": "800",
+      "outside_db_re_1k": 3.095,
+      "customer_db_re_1k": 3.45,
+      "diff_db": 0.355
+    },
+    {
+      "hz": "1250",
+      "outside_db_re_1k": -0.755,
+      "customer_db_re_1k": -0.0,
+      "diff_db": 0.755
+    },
+    {
+      "hz": "1600",
+      "outside_db_re_1k": -0.738,
+      "customer_db_re_1k": -1.85,
+      "diff_db": -1.112
+    },
+    {
+      "hz": "2000",
+      "outside_db_re_1k": -8.049,
+      "customer_db_re_1k": -7.64,
+      "diff_db": 0.409
+    },
+    {
+      "hz": "2500",
+      "outside_db_re_1k": -10.605,
+      "customer_db_re_1k": -8.51,
+      "diff_db": 2.095
+    },
+    {
+      "hz": "3150",
+      "outside_db_re_1k": -13.897,
+      "customer_db_re_1k": -14.18,
+      "diff_db": -0.283
+    }
+  ],
+  "broadband": {
+    "speech_rms_db": {
+      "outside_median": -25.612,
+      "customer_median": -25.48,
+      "diff_db": 0.133
+    },
+    "noise_rms_db": {
+      "outside_median": -71.278,
+      "customer_median": -72.807,
+      "diff_db": -1.529
+    },
+    "hf_1_2k_rel_db": {
+      "outside_median": -12.865,
+      "customer_median": -13.601,
+      "diff_db": -0.735
+    },
+    "hf_2_3k_rel_db": {
+      "outside_median": -26.67,
+      "customer_median": -27.435,
+      "diff_db": -0.765
+    },
+    "spec_centroid": {
+      "outside_median": 463.544,
+      "customer_median": 490.082,
+      "diff": 26.538
+    },
+    "spec_roll95": {
+      "outside_median": 656.25,
+      "customer_median": 671.875,
+      "diff": 15.625
+    },
+    "speech_frac": {
+      "outside_median": 0.713,
+      "customer_median": 0.65,
+      "diff": -0.062
+    }
+  }
+}

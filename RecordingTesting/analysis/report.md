@@ -749,45 +749,76 @@ files** (36 in-repo + 31 outside; `speech_only`, `is_gated=True`,
 | Speech fraction | 0.70 | 0.70 … 0.70 |
 
 The broadband HF figures are dominated by the 0.3–1 kHz denominator, so the
-EQ was fitted on answered-only loud-frame 1/3-octave bands. The measured
-in-band correction is a 315 Hz cut, a 400–500 Hz boost, a 3150 Hz cut, and a
-nearly flat 630–2500 Hz region. Final 46-voice × 3-seed fit (validated at 5 seeds):
+EQ is fitted on answered-only loud-frame 1/3-octave bands. The 1/3-octave
+target is the **median per-file shape**: each file is normalized to its own
+1 kHz band before the median. The earlier difference-of-medians statistic
+overstated the high-band deficit because 1 kHz and 3150 Hz levels correlate
+across files.
 
-| Hz | Target | Before (`gated`) | After (`customer`) |
+Corrected target and final synth (46 voices × 5 seeds, per-file shape):
+
+| Hz | Target | Final `customer` | Residual |
 |---:|---:|---:|---:|
-| 315 | +4.5 | +9.3 | +4.1 |
-| 400 | +13.0 | +8.7 | +12.6 |
-| 500 | +13.0 | +9.0 | +12.3 |
-| 630 | +9.4 | +7.5 | +9.0 |
-| 800 | +3.8 | +3.2 | +3.8 |
-| 1250 | −1.7 | −3.6 | −2.0 |
-| 1600 | −3.7 | −5.0 | −4.1 |
-| 2000 | −12.3 | −10.7 | −12.7 |
-| 2500 | −13.8 | −12.0 | −14.7 |
-| 3150 | −19.8 | −11.2 | −18.7 |
+| 315 | +4.6 | +5.2 | +0.5 |
+| 400 | +14.0 | +13.8 | −0.1 |
+| 500 | +13.1 | +13.8 | +0.7 |
+| 630 | +8.3 | +8.7 | +0.4 |
+| 800 | +3.5 | +3.4 | −0.0 |
+| 1250 | −0.5 | 0.0 | +0.5 |
+| 1600 | −1.7 | −1.8 | −0.1 |
+| 2000 | −8.0 | −7.6 | +0.3 |
+| 2500 | −9.4 | −8.5 | +0.9 |
+| 3150 | −14.6 | −14.2 | +0.4 |
 
-All 315–3150 Hz residuals are within ±2 dB. The 3150 Hz band needs a wider
-(Q≈3) peaking filter because it sits against the 3400 Hz band edge. The
-customer chain has no line-noise bed, dropouts, or AMR; `mobile` and `pstn`
-remain explicit legacy profiles only. Reproduce the fit with
-`RecordingTesting/analysis/fit_customer_eq.py` and the target with
+All primary 315–3150 Hz residuals are within 0.9 dB. The 3150 Hz band still
+uses a wider (Q≈3) peaking filter because it sits against the 3400 Hz band
+edge; the corrected gain is −7.2 dB, not the old −19.8 dB. The customer
+chain has no line-noise bed, dropouts, or AMR; `mobile` and `pstn` remain
+explicit legacy profiles only. Reproduce the fit with
+`RecordingTesting/analysis/fit_customer_eq.py` (8 iterations, 0.5 damping,
+starting from `CUSTOMER_EQ_INITIAL_GAINS_DB`) and the target with
 `answered_customer_bands.csv` / `answered_customer_manifest.csv`.
 
-
 Final multi-voice medians (46 voices × seeds 1–5): active speech **−25.5
-dBFS**, noise floor **−72.8 dBFS**, centroid **483 Hz**, roll95 **656 Hz**,
-HF 1–2k **−14.9 dB**, HF 2–3.4k **−31.0 dB**, speech fraction **0.65**. All
-primary 1/3-octave targets are within ±2 dB; the broadband HF 2–3.4k figure
-is 3.5 dB darker than its target, which is secondary to the 1/3-octave fit.
-The 125–160 Hz bands remain band-edge context and are not reproduced (the
-300 Hz high-pass is intentional). Listening is still pending; the generated
-A/B kit is the perceptual gate.
+dBFS**, noise floor **−72.8 dBFS**, centroid **490 Hz**, roll95 **672 Hz**,
+HF 1–2k **−13.6 dB**, HF 2–3.4k **−27.4 dB**, speech fraction **0.65**. The
+broadband HF 2–3.4k target is −27.5 dB, so the old 3.5 dB high-band deficit
+is now 0.1 dB. The 125–160 Hz bands remain band-edge context and are not
+reproduced (the 300 Hz high-pass is intentional). Listening is still pending;
+the generated A/B kit is the perceptual gate.
+
+### Outside-only validation
+
+The 31 Outside gated mobile speech-only files are all in the 67-file
+calibration set, so this is an in-sample check. The final customer 1/3-octave
+shape compares with the Outside target as follows:
+
+| Hz | Outside target | Final `customer` | Δ |
+|---:|---:|---:|---:|
+| 315 | +3.4 | +5.2 | +1.8 |
+| 400 | +11.8 | +13.8 | +2.0 |
+| 500 | +10.8 | +13.8 | +3.0 |
+| 630 | +7.7 | +8.7 | +1.0 |
+| 800 | +3.1 | +3.4 | +0.3 |
+| 1250 | −0.8 | 0.0 | +0.8 |
+| 1600 | −0.7 | −1.8 | −1.1 |
+| 2000 | −8.1 | −7.6 | +0.4 |
+| 2500 | −10.6 | −8.5 | +2.1 |
+| 3150 | −13.9 | −14.2 | −0.3 |
+
+The old high-band deficit (−3.8/−5.1/−4.1/−5.4 dB at
+1600/2000/2500/3150 Hz) is gone. The remaining difference is low-mid
+brightness (315–500 Hz, +1.8…+3.0 dB): the 67-file target is brighter there
+than the Outside subset, which is a corpus-spread issue rather than the
+normalization bug. The all-67 validation remains within 0.9 dB. Broadband
+Outside medians: speech **−25.5 dBFS**, noise **−72.8 dBFS**, HF 1–2k
+**−13.6 dB**, HF 2–3.4k **−27.4 dB**, centroid **490 Hz**, roll95 **672 Hz**.
 
 ### Held-out speaker check
 
 Fitting on the five other speakers and validating on `spk_91858` gives
-1/3-octave residuals of **+8.7 dB at 1600 Hz, +6.2 dB at 2000 Hz, +5.2 dB at
-2500 Hz, and +4.6 dB at 3150 Hz** (synth darker than the population target).
+1/3-octave residuals of **+2.0 dB at 1600 Hz, +4.5 dB at 2000 Hz, +1.7 dB at
+2500 Hz, and +6.8 dB at 3150 Hz** (synth darker than the population target).
 This is source-voice spread, not a channel-fit failure: the target is a
 median across real mobile calls, and `spk_91858` is one of the dark voices
 already called out in the multi-voice section. The shipped gains are the

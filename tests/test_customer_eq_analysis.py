@@ -65,3 +65,17 @@ def test_octave_shape_is_median_of_per_file_shapes():
     shape = gs.octave_shape([psd_a, psd_b], freqs)
     idx = gs.CENTERS.index(3150.0)
     assert shape[idx] == pytest.approx(-15.0, abs=0.15)
+
+
+def test_outside_high_band_residuals_are_not_dark():
+    path = ANALYSIS / "outside_customer_check.csv"
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    high = {
+        int(row["hz"]): float(row["diff_db"])
+        for row in rows
+        if 1600 <= int(row["hz"]) <= 3150
+    }
+    assert high
+    assert all(abs(value) <= 2.5 for value in high.values()), high
+    assert high[3150] > -2.0

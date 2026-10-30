@@ -80,6 +80,12 @@ Read:
 
 Measured with the same `gated_spectrum_check.py` method: 67 answered customer files vs 46 clean voices × 5 seeds through the current gated chain. Values are dB relative to 1 kHz.
 
+> **Correction (2026-10-30):** the target column below is the old
+> difference-of-medians statistic. The per-file normalized target used by the
+> final fit is +4.6/+14.0/+13.1/+8.3/+3.5/−0.5/−1.7/−8.0/−9.4/−14.6 dB at
+> 315/400/500/630/800/1250/1600/2000/2500/3150 Hz. The old statistic
+> over-cut 1600–3150 Hz; see Final calibration.
+
 | Hz | Target | Current `gated` | Delta (target − current) |
 |---:|---:|---:|---:|
 | 125 | −23.7 | −37.2 | **+13.5** |
@@ -168,7 +174,7 @@ Replace the gated constants with customer equivalents:
 - `CUSTOMER_PROFILES = ("customer",)`
 - `DEFAULT_PROFILES = ("customer",)`
 - `DEFAULT_PROFILE_WEIGHTS = {"customer": 1.0}`
-- `CUSTOMER_TARGET_RMS_DB_RANGE = (-28.5, -21.5)` — target median −25.6 dBFS; keep the width for training diversity. Builder may tighten to (−28.0, −23.0) if validation shows too much spread.
+- `CUSTOMER_TARGET_RMS_DB_RANGE = (-29.5, -22.5)` — target median −25.6 dBFS; keep the width for training diversity. Builder may tighten if validation shows too much spread.
 - Keep `GATED_*` names only as deprecated aliases if needed; prefer renaming all internal references.
 - Keep `MOBILE_*` and `PSTN_*` constants for explicit legacy use; do not use them in defaults.
 - Keep `LEGACY_PROFILE_WEIGHTS = {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}` for analysis scripts. Explicit `gated,mobile,pstn` remains **uniform 1/3** unless weights are supplied; the old 70/15/15 is not the default. Historical comparisons can pass the legacy weights explicitly. No new CLI flag is required.
@@ -340,9 +346,9 @@ The fitted peaking gains are:
 
 ```python
 CUSTOMER_EQ_GAINS_DB = {
-    315.0: -4.02, 400.0: 4.02, 500.0: 2.70, 630.0: 1.10,
-    800.0: -0.37, 1250.0: 2.51, 1600.0: 2.50, 2000.0: -2.05,
-    2500.0: 0.29, 3150.0: -19.77,
+    315.0: -2.99, 400.0: 6.40, 500.0: 3.01, 630.0: 1.12,
+    800.0: 0.69, 1250.0: 3.07, 1600.0: 5.49, 2000.0: 2.21,
+    2500.0: 5.66, 3150.0: -7.17,
 }
 CUSTOMER_EQ_Q_BY_BAND = {3150.0: 3.0}
 ```
@@ -350,14 +356,22 @@ CUSTOMER_EQ_Q_BY_BAND = {3150.0: 3.0}
 `CUSTOMER_TARGET_RMS_DB_RANGE` was shifted to `(-29.5, -22.5)` so the
 generated median lands on −25.5 dBFS (the original range produced −24.6).
 The committed `customer_eq_gains.json` starts from
-`CUSTOMER_EQ_INITIAL_GAINS_DB` and records five fit iterations.
+`CUSTOMER_EQ_INITIAL_GAINS_DB` and records eight fit iterations at 0.5
+damping. The per-file normalized 1/3-octave target is +4.6/+14.0/+13.1/+8.3/
++3.5/−0.5/−1.7/−8.0/−9.4/−14.6 dB at 315/400/500/630/800/1250/1600/2000/
+2500/3150 Hz. The old difference-of-medians target over-cut 1600–3150 Hz;
+the corrected fit moves the 3150 Hz gain from −19.77 to −7.17 dB.
 
 Final 46-voice × 5-seed medians: active speech **−25.5 dBFS**, noise floor
-**−72.8 dBFS**, centroid **483 Hz**, roll95 **656 Hz**, HF 1–2k **−14.9 dB**,
-HF 2–3.4k **−31.0 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
-1/3-octave check is within ±2 dB at every band 315–3150 Hz. A true
+**−72.8 dBFS**, centroid **490 Hz**, roll95 **672 Hz**, HF 1–2k **−13.6 dB**,
+HF 2–3.4k **−27.4 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
+1/3-octave check is within 0.9 dB at every band 315–3150 Hz against the
+corrected target. On the 31 Outside gated mobile speech-only files, the old
+high-band deficit (−3.8/−5.1/−4.1/−5.4 dB at 1600/2000/2500/3150 Hz) is gone;
+the remaining low-mid difference is +1.8…+3.0 dB at 315–500 Hz because the
+67-file target is brighter there than the Outside subset. A true
 speaker-held-out fit (five speakers train, `spk_91858` held out) leaves
-+8.7/+6.2/+5.2/+4.6 dB residuals at 1600/2000/2500/3150 Hz; that is
++2.0/+4.5/+1.7/+6.8 dB residuals at 1600/2000/2500/3150 Hz; that is
 source-voice spread, not a channel-fit failure, and the shipped gains remain
 the all-voice fit (`customer_eq_holdout.json` records the held-out run).
 Listening is the remaining perceptual gate; the A/B kit was generated but has

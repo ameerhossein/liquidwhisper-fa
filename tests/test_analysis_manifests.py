@@ -39,12 +39,15 @@ def test_answered_bands_have_67_rows_and_16_bands():
     assert len(band_cols) == 16
     assert band_cols[0] == "hz_125"
     assert band_cols[-1] == "hz_4000"
-    med = {c: median(float(r[c]) for r in rows) for c in band_cols}
-    ref = med["hz_1000"]
+    # Typical file shape: normalize each file to its own 1 kHz band first.
+    med = {
+        c: median(float(r[c]) - float(r["hz_1000"]) for r in rows)
+        for c in band_cols
+    }
     for col, expected in {
-        "hz_315": 4.52,
-        "hz_400": 12.99,
-        "hz_500": 12.95,
-        "hz_3150": -19.77,
+        "hz_315": 4.64,
+        "hz_400": 13.96,
+        "hz_500": 13.13,
+        "hz_3150": -14.60,
     }.items():
-        assert abs((med[col] - ref) - expected) < 0.2
+        assert abs(med[col] - expected) < 0.2

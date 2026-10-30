@@ -110,19 +110,20 @@ CUSTOMER_EQ_INITIAL_GAINS_DB = {
     2500.0: -1.8,
     3150.0: -8.6,
 }
-# Final fitted gains (46 voices, seeds 1-3, five iterations from the initial
-# delta; see customer_eq_gains.json for the full history).
+# Final fitted gains (per-file normalized 1/3-octave target, 46 voices,
+# seeds 1-3, eight iterations at 0.5 damping from the initial delta; see
+# customer_eq_gains.json for the full history).
 CUSTOMER_EQ_GAINS_DB = {
-    315.0: -4.02,
-    400.0: 4.02,
-    500.0: 2.70,
-    630.0: 1.10,
-    800.0: -0.37,
-    1250.0: 2.51,
-    1600.0: 2.50,
-    2000.0: -2.05,
-    2500.0: 0.29,
-    3150.0: -19.77,
+    315.0: -2.99,
+    400.0: 6.40,
+    500.0: 3.01,
+    630.0: 1.12,
+    800.0: 0.69,
+    1250.0: 3.07,
+    1600.0: 5.49,
+    2000.0: 2.21,
+    2500.0: 5.66,
+    3150.0: -7.17,
 }
 CUSTOMER_EQ_Q = 1.0 / (2.0 ** (1.0 / 6.0) - 2.0 ** (-1.0 / 6.0))
 # The 3150 Hz band sits against the 3400 Hz band edge; a wider peaking filter
