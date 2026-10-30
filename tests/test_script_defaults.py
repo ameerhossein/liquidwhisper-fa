@@ -88,3 +88,11 @@ def test_web_ui_eval_default_is_1000():
     match = re.search(r'id="inputEvalSteps"[^>]*value="(\d+)"', html)
     assert match is not None
     assert match.group(1) == "1000"
+
+
+def test_no_production_baseline_file_or_fallbacks():
+    assert not (ROOT / "configs" / "baselines.json").exists()
+    for rel in ("src/trainer_callbacks.py", "server/app.py",
+                "server/static/app.js", "scripts/train_lora.py"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "28.5" not in text and "17.2" not in text

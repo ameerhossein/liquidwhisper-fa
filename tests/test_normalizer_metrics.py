@@ -243,16 +243,6 @@ def test_duration_helpers():
     print("✓ Duration drop (no truncate) passed.")
 
 
-def test_baselines_config():
-    import json
-    p = Path(__file__).resolve().parent.parent / "configs" / "baselines.json"
-    assert p.exists(), "configs/baselines.json must exist"
-    data = json.loads(p.read_text(encoding="utf-8"))
-    assert "whisper_v3" in data and "buzzasr_base" in data
-    assert data["whisper_v3"]["normalized_wer"] > data["buzzasr_base"]["normalized_wer"]
-    print("✓ Baselines config passed.")
-
-
 def test_metrics_evaluation():
     norm = PersianTextNormalizer(use_hazm=False)
     calc = ASRMetricsCalculator(normalizer=norm)
@@ -287,5 +277,4 @@ if __name__ == "__main__":
     test_metrics_evaluation()
     test_collator_mask()
     test_duration_helpers()
-    test_baselines_config()
     print("\nAll unit tests passed successfully!")

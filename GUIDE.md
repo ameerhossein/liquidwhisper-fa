@@ -15,8 +15,10 @@ You can launch and explore the full Web Cockpit right now on your local machine 
 Open **`http://127.0.0.1:7860`** in your browser:
 * Click **Launch Run** to simulate active Persian ASR training.
 * Watch the live loss curve descent, VRAM telemetry, and step throughput.
-* Watch the **Epoch Benchmark Matrix** update as simulated epochs complete (calculating normalized WER, CER, and emerald improvement badges vs. Whisper Large v3).
+* Watch the **Epoch Benchmark Matrix** update as simulated epochs complete (calculating normalized WER, CER, and emerald `Δ clean vs base` / `Δ phone vs base` badges from the demo's simulated BuzzASR baseline).
 * Inspect the **Canary Audio Orthography Diff** cards showing ZWNJ and colloquial contractions.
+
+The demo baseline values are simulated only (`DEMO_SIMULATED_BASELINES`); training and the server never read them.
 
 ---
 
@@ -100,6 +102,16 @@ Before fine-tuning, benchmark `openai/whisper-large-v3` against `BuzzASR/persian
   - Formal vs. Informal subset accuracy
 - Saves full predictions to `results/baselines/benchmark_summary.json`.
 
+### Automatic Training Preflight (Mandatory)
+
+Training always runs a preflight before the model loads. It measures `BuzzASR/persian` (the authoritative baseline) and `openai/whisper-large-v3` (reference-only) on the first 1,000 test rows — the same rows the epoch matrix evaluates — and caches the result at `results/baselines/preflight.json`. A matching dataset/split/sample-count/phone fingerprint reuses the cache; pass `--overwrite_preflight` to force a fresh measurement. The former `configs/` baseline file (`baselines.json`) is gone; baselines are always measured.
+
+For a smoke run, keep both evaluations aligned with matching small values:
+
+```bash
+./run_train.sh --preflight_samples 20 --max_benchmark_samples 20
+```
+
 ---
 
 ## 4. Fine-Tuning on NVIDIA L40S
@@ -133,7 +145,8 @@ source .venv/bin/activate
 | **Validation / Checkpoint** | Every 1,000 optimizer steps (`--eval_steps 1000 --save_steps 1000`) |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
 | **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |
-| **Epoch Benchmark** | 300-sample subset by default (`--max_benchmark_samples 0` = full 2,149) |
+| **Preflight Baseline** | Mandatory, cached at `results/baselines/preflight.json`; first 1,000 test rows (BuzzASR authoritative, Whisper reference-only) |
+| **Epoch Benchmark** | 1,000-sample subset by default, matching the preflight (`--max_benchmark_samples 0` = full 2,149) |
 
 ### Live Monitoring & Management (RunPod Web Cockpit):
 Launch the web interface (port 7860, RunPod HTTP proxy compatible):
@@ -142,7 +155,7 @@ Launch the web interface (port 7860, RunPod HTTP proxy compatible):
 ```
 Open your RunPod HTTP proxy URL in your browser to view:
 - **Real-time Telemetry:** GPU VRAM allocation gauge, Loss curve, LR, and ETA.
-- **Epoch Benchmark Comparison Matrix:** Evaluates a 300-sample subset per epoch by default (use `--max_benchmark_samples 0` for the complete 2,149-sample test split) and records normalized WER, CER, formal vs. informal breakdown, and emerald delta badges vs. Whisper Large v3.
+- **Epoch Benchmark Comparison Matrix:** Evaluates a 1,000-sample subset per epoch by default, matching the preflight rows (use `--max_benchmark_samples 0` for the complete 2,149-sample test split). It records normalized WER, CER, formal vs. informal breakdown, and `Δ clean vs base` / `Δ phone vs base` deltas in percentage points (pp) against the measured BuzzASR baseline.
 - **Canary Audio Inspector:** Live orthography comparison for ZWNJ and colloquial contractions.
 - Set `ASR_COCKPIT_TOKEN` env to require a token on train start/stop (public proxy hardening).
 
@@ -164,9 +177,11 @@ python scripts/evaluate_model.py \
 ```
 
 **Features:**
-- Compares post-training WER and CER against baseline results.
+- Compares post-training WER and CER against the measured BuzzASR baseline when the sample counts match.
 - Breaks down accuracy on formal vs. colloquial/informal Persian.
 - Displays the top 5 worst errors for qualitative inspection.
+
+The final full-test report shows no delta without a matching full-test baseline: the default 1,000-row preflight yields `n/a (no matching full-test baseline)` against the 2,149-row test split.
 
 ---
 

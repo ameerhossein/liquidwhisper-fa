@@ -28,7 +28,7 @@ You can launch and explore the full Web Cockpit right now on your local machine 
 ./run_local_demo.sh
 ```
 
-Then open `http://127.0.0.1:7860` in your browser. You can click **Launch Run** to simulate active Persian ASR training, watch the live loss trajectory, view simulated epoch benchmarks updating in real time, and inspect the canary Persian sentences.
+Then open `http://127.0.0.1:7860` in your browser. You can click **Launch Run** to simulate active Persian ASR training, watch the live loss trajectory, view simulated epoch benchmarks updating in real time, and inspect the canary Persian sentences. The demo's baseline values are simulated only (`DEMO_SIMULATED_BASELINES`); training and the server never read them.
 
 ---
 
@@ -134,6 +134,9 @@ tmux new -s train_asr
 
 # Launch training with default L40S configuration:
 ./run_train.sh
+
+# Smoke-run wiring check: keep preflight and epoch evaluation on the same rows.
+./run_train.sh --preflight_samples 20 --max_benchmark_samples 20
 ```
 
 ### Key Training Flags:
@@ -146,11 +149,11 @@ tmux new -s train_asr
 * `--learning_rate 1e-4`: Optimal for LoRA.
 * `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).
-* `--eval_batch_size 16 --max_benchmark_samples 300`: epoch benchmark guard (`0` = full 2,149-sample test set; default 300 avoids L40S OOM).
+* `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows (`0` = full 2,149-sample test set).
 * `--no-enable-telemetry / --no-run-epoch-benchmark`: disable live telemetry or epoch eval.
 * Training keeps punctuation in targets; eval strips it for standardized WER (intentional, see `src/data.py`).
 * CPU inference runs without autocast (CUDA-only AMP); >30s audio is truncated to 30s, <0.5s filtered.
-* Baseline numbers live in `configs/baselines.json` (single source for trainer, server, demo).
+* Before training starts, a mandatory preflight measures `BuzzASR/persian` and `openai/whisper-large-v3` on the same test rows and caches the result at `results/baselines/preflight.json`. A matching fingerprint reuses the cache; `--overwrite_preflight` forces re-measurement. BuzzASR is the authoritative baseline and Whisper is reference-only. The former `configs/` baseline file (`baselines.json`) is gone; baselines are always measured.
 
 ### Monitor & Control in Real-Time via Web Interface (RunPod Cockpit):
 Launch the zero-dependency web interface on port 7860 (compatible with RunPod HTTP proxy):
@@ -160,9 +163,9 @@ Launch the zero-dependency web interface on port 7860 (compatible with RunPod HT
 Features available in your browser:
 - Start/stop training directly from the UI.
 - Real-time VRAM allocation, loss curve, learning rate, and ETA.
-- Automatic **Epoch Benchmark Comparison Matrix** (default 300-sample subset per epoch; `--max_benchmark_samples 0` for all 2,149 test recordings; plots delta improvements vs. Whisper Large v3).
+- Automatic **Epoch Benchmark Comparison Matrix** (default 1,000-row subset per epoch, the same rows as the preflight; `--max_benchmark_samples 0` for all 2,149 test recordings). Deltas are `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), against the measured BuzzASR preflight baseline; rows evaluated on a different sample count show `—`.
 - **Canary Persian Orthography Diff** showing ZWNJ and spoken contractions side-by-side.
-- Note: 2,149 test-sample count comes from `configs/baselines.json` / Neyshekar test split metadata; verify with `load_dataset("shekar-ai/Neyshekar", split="test")` if the dataset version changes.
+- Note: the 2,149 test-sample count comes from the Neyshekar test split metadata; verify with `load_dataset("shekar-ai/Neyshekar", split="test")` if the dataset version changes.
 
 ---
 
@@ -185,6 +188,8 @@ This generates:
 1. Overall Normalized WER & CER.
 2. Formal vs. Informal subset accuracy.
 3. Diagnostic analysis showing the top 5 worst transcription errors to inspect remaining phonetic or dialect edge cases.
+
+The final full-test report shows BuzzASR deltas only when a baseline was measured on the same full-test row count. With the default 1,000-row preflight it reports `n/a (no matching full-test baseline)` instead of a cross-sample comparison.
 
 ---
 

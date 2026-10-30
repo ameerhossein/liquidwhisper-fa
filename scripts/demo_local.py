@@ -28,31 +28,16 @@ except Exception:
     pass
 
 
-def _load_demo_baselines():
-    """Load shared baselines so demo matches server/training numbers."""
-    defaults = (28.50, 8.90, 26.10, 24.00, 36.80, 17.20, 4.80, 15.90, 15.10, 22.40)
-    try:
-        with open(BASE_DIR / "configs" / "baselines.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        w, b = data.get("whisper_v3", {}), data.get("buzzasr_base", {})
-        return (
-            float(w.get("normalized_wer", defaults[0])),
-            float(w.get("normalized_cer", defaults[1])),
-            float(w.get("diagnostic_wer", defaults[2])),
-            float(w.get("formal_wer", defaults[3])),
-            float(w.get("informal_wer", defaults[4])),
-            float(b.get("normalized_wer", defaults[5])),
-            float(b.get("normalized_cer", defaults[6])),
-            float(b.get("diagnostic_wer", defaults[7])),
-            float(b.get("formal_wer", defaults[8])),
-            float(b.get("informal_wer", defaults[9])),
-        )
-    except Exception:
-        return defaults
-
+# Simulated local-demo values only; never read by training or the server.
+# Layout: (normalized WER, normalized CER, diagnostic WER, formal WER,
+#          informal WER) for Whisper (reference) then BuzzASR (authoritative).
+DEMO_SIMULATED_BASELINES = (
+    28.50, 8.90, 26.10, 24.00, 36.80,  # Whisper Large v3, reference-only
+    17.20, 4.80, 15.90, 15.10, 22.40,  # BuzzASR Base, authoritative
+)
 
 _WHISPER_WER, _WHISPER_CER, _WHISPER_DIAG, _WHISPER_FORMAL, _WHISPER_INFORMAL, \
-    _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, _BUZZ_INFORMAL = _load_demo_baselines()
+    _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, _BUZZ_INFORMAL = DEMO_SIMULATED_BASELINES
 
 DEMO_FAIL_AT_STEP = int(os.environ.get("DEMO_FAIL_AT_STEP", "0") or 0)
 
