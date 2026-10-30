@@ -62,7 +62,8 @@ from src.normalizer import PersianTextNormalizer
 from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding
 from src.data import PersianASRDataPipeline, persian_label_ids
-from src.trainer_callbacks import WebTelemetryCallback, load_baselines, _resolve_infer_dtype, _should_autocast
+from src.trainer_callbacks import WebTelemetryCallback, _resolve_infer_dtype, _should_autocast
+from src.preflight import compute_deltas, run_preflight
 from src import paths as _managed_paths
 
 
@@ -111,7 +112,11 @@ def parse_args():
     parser.add_argument("--fresh_start", "--fresh-start", action=argparse.BooleanOptionalAction, default=False, help="Start fresh: delete prior checkpoint-*, best_adapter, reports and telemetry history in output_dir/results before training.")
     parser.add_argument("--num_proc", type=int, default=4, help="Number of preprocessing workers")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Per-device eval + benchmark batch size")
-    parser.add_argument("--max_benchmark_samples", type=int, default=300, help="Test subset for end-of-epoch benchmark, decoded twice (300 clean + same 300 phone). 0/None = full set (2149).")
+    parser.add_argument("--max_benchmark_samples", type=int, default=1000, help="Test subset for end-of-epoch benchmark, decoded twice (1000 clean + same 1000 phone). 0/None = full set (2149).")
+    parser.add_argument("--preflight_samples", type=int, default=None,
+                        help="Preflight rows; default follows --max_benchmark_samples (0 = full test).")
+    parser.add_argument("--overwrite_preflight", "--overwrite-preflight",
+                        action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--run_post_test_eval", "--run-post-test-eval", action=argparse.BooleanOptionalAction, default=True, help="Run full test evaluation on best model post-training and save report")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
@@ -181,6 +186,9 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "save_total_limit": "save_total_limit", "num_workers": "num_proc",
         "num_proc": "num_proc", "eval_batch_size": "eval_batch_size",
         "max_benchmark_samples": "max_benchmark_samples",
+        "preflight_samples": "preflight_samples",
+        "overwrite_preflight": "overwrite_preflight",
+        "overwrite-preflight": "overwrite_preflight",
         "prob": "telephony_prob", "telephony_prob": "telephony_prob",
         "profiles": "telephony_profiles", "telephony_profiles": "telephony_profiles",
         "seed": "telephony_seed", "telephony_seed": "telephony_seed",
@@ -197,7 +205,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "gradient_checkpointing": "gradient_checkpointing",
         "gradient-checkpointing": "gradient_checkpointing",
     }
-    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark", "reuse_prep", "overwrite_prep_cache", "gradient_checkpointing"}
+    _BOOL_KEYS = {"auto_resume", "fresh_start", "phone_benchmark", "reuse_prep", "overwrite_prep_cache", "overwrite_preflight", "gradient_checkpointing"}
     for yk, ak in key_map.items():
         if yk in flat:
             cli_name = "--" + ak
@@ -545,6 +553,29 @@ def main():
         eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
         _save_prep_cache(eval_dataset, os.path.join(prep_cache_dir, "validation"), eval_fp)
     assert train_dataset is not None and eval_dataset is not None
+
+    # Mandatory measured baseline: reuse a matching cache or evaluate BuzzASR
+    # (and Whisper) on exactly the same rows the epoch benchmark will use.
+    # Runs after datasets.map prep and before the model/CUDA load so the
+    # subprocess evaluation sees an idle GPU.
+    preflight_count = args.preflight_samples
+    if preflight_count is None:
+        preflight_count = args.max_benchmark_samples
+    preflight = run_preflight(
+        results_dir=Path(args.results_dir),
+        dataset_name=args.dataset_name,
+        split="test",
+        sample_count=int(preflight_count or 0),
+        phone_seed=int(args.phone_seed),
+        telephony_profiles=args.telephony_profiles,
+        telephony_use_ffmpeg=bool(args.telephony_use_ffmpeg),
+        eval_batch_size=int(args.eval_batch_size),
+        overwrite=bool(args.overwrite_preflight),
+    )
+    baseline_benchmark = preflight["models"]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Release raw Arrow tables before the multi-GB model load.
     del raw_train, raw_eval
     try:
@@ -608,6 +639,7 @@ def main():
             normalizer=normalizer,
             eval_batch_size=args.eval_batch_size,
             max_benchmark_samples=args.max_benchmark_samples,
+            baseline_benchmark=baseline_benchmark,
             phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
             phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
             telephony_profiles=args.telephony_profiles,
@@ -729,11 +761,19 @@ def main():
             results_dir=args.results_dir,
             eval_batch_size=args.eval_batch_size,
             trainer_state=trainer.state,
+            baseline_benchmark=baseline_benchmark,
             phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
             phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
             telephony_profiles=args.telephony_profiles,
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
         )
+
+
+def _format_delta(value: Optional[float]) -> str:
+    """Format a WER delta, or an explicit marker when no baseline matches."""
+    if value is None:
+        return "n/a (no matching full-test baseline)"
+    return f"{value:+.2f}%"
 
 
 def _run_post_training_evaluation(
@@ -750,6 +790,7 @@ def _run_post_training_evaluation(
     phone_seed: int = 1234,
     telephony_profiles: Optional[list] = None,
     telephony_use_ffmpeg: bool = True,
+    baseline_benchmark: Optional[Dict[str, Any]] = None,
 ):
     import time
 
@@ -937,19 +978,24 @@ def _run_post_training_evaluation(
             "eval_logs": eval_logs,
         }
 
-    # 4. Compare vs Baselines
-    baselines = load_baselines()
+    # 4. Compare vs the measured preflight baseline. Deltas are only produced
+    # when the baseline and this full test split have the same sample count
+    # (1,000-row preflight vs 2,149-row full test => n/a).
+    buzz = (baseline_benchmark or {}).get("buzzasr_base") or {}
     norm_wer = eval_results.get("overall", {}).get("normalized_wer", 0.0)
     norm_cer = eval_results.get("overall", {}).get("normalized_cer", 0.0)
     diag_wer = eval_results.get("overall", {}).get("diagnostic_wer_zwnj_space", 0.0)
     formal_wer = eval_results.get("formal", {}).get("normalized_wer", 0.0)
     informal_wer = eval_results.get("informal", {}).get("normalized_wer", 0.0)
 
-    whisper_wer = baselines.get("whisper_v3", {}).get("normalized_wer", 28.5)
-    buzzasr_wer = baselines.get("buzzasr_base", {}).get("normalized_wer", 17.2)
-
-    delta_vs_whisper = round(norm_wer - whisper_wer, 2)
-    delta_vs_buzzasr = round(norm_wer - buzzasr_wer, 2)
+    deltas = compute_deltas(
+        norm_wer,
+        phone_block.get("normalized_wer") if phone_block else None,
+        total_samples,
+        buzz,
+    )
+    delta_vs_buzzasr = deltas["delta_vs_buzzasr"]
+    delta_phone_vs_buzzasr = deltas["delta_phone_vs_buzzasr"]
 
     final_report = {
         "dataset_name": dataset_name,
@@ -966,14 +1012,15 @@ def _run_post_training_evaluation(
             "informal_wer": round(informal_wer, 2),
             "raw_wer": round(eval_results.get("overall", {}).get("raw_wer", 0.0), 2),
             "raw_cer": round(eval_results.get("overall", {}).get("raw_cer", 0.0), 2),
-            "delta_vs_whisper_v3": delta_vs_whisper,
             "delta_vs_buzzasr_base": delta_vs_buzzasr,
+            "delta_phone_vs_buzzasr_base": delta_phone_vs_buzzasr,
             "details": eval_results,
             "phone": phone_block,
         },
-        "baselines_comparison": {
-            "whisper_large_v3": baselines.get("whisper_v3"),
-            "buzzasr_base": baselines.get("buzzasr_base"),
+        "baseline_comparison": {
+            "source": buzz.get("source"),
+            "sample_count": buzz.get("total_samples"),
+            "evaluated_samples": total_samples,
         },
         "all_epoch_benchmarks": epoch_benchmarks,
         "trainer_state_summary": epoch_training_summary,
@@ -1010,24 +1057,28 @@ def _run_post_training_evaluation(
         f"| **Diagnostic WER (ZWNJ $\\to$ Space)** | {diag_wer:.2f}% |",
         f"| **Formal Subset WER** | {formal_wer:.2f}% ({eval_results.get('formal', {}).get('count', 0)} samples) |",
         f"| **Informal Subset WER** | {informal_wer:.2f}% ({eval_results.get('informal', {}).get('count', 0)} samples) |",
-        f"| **$\\Delta$ vs. Whisper Large v3** | **{delta_vs_whisper:+.2f}%** |",
-        f"| **$\\Delta$ vs. BuzzASR Base** | **{delta_vs_buzzasr:+.2f}%** |",
+        f"| **$\\Delta$ vs. BuzzASR Base (clean)** | **{_format_delta(delta_vs_buzzasr)}** |",
+        f"| **$\\Delta$ vs. BuzzASR Base (phone)** | **{_format_delta(delta_phone_vs_buzzasr)}** |",
         "",
         "## 2. Benchmark History Across All Epochs",
         "",
     ]
 
     if epoch_benchmarks:
-        md_lines.append("| Epoch | Samples | Norm WER (%) | Phone WER (%) | Norm CER (%) | Formal WER (%) | Informal WER (%) | $\\Delta$ vs Whisper | $\\Delta$ vs BuzzASR |")
+        md_lines.append("| Epoch | Samples | Norm WER (%) | Phone WER (%) | Norm CER (%) | Formal WER (%) | Informal WER (%) | $\\Delta$ clean vs base | $\\Delta$ phone vs base |")
         md_lines.append("|---|---|---|---|---|---|---|---|---|")
         for ep in epoch_benchmarks:
             phone_wer = ep.get("phone_normalized_wer")
             phone_str = f"{phone_wer:.2f}%" if phone_wer is not None else "--"
+            clean_delta = ep.get("delta_vs_buzzasr")
+            phone_delta = ep.get("delta_phone_vs_buzzasr")
+            clean_delta_str = "--" if clean_delta is None else f"{clean_delta:+.2f}%"
+            phone_delta_str = "--" if phone_delta is None else f"{phone_delta:+.2f}%"
             md_lines.append(
                 f"| {ep.get('epoch', 'N/A')} | {ep.get('total_samples', '-')} | "
                 f"{ep.get('normalized_wer', 0.0):.2f}% | {phone_str} | {ep.get('normalized_cer', 0.0):.2f}% | "
                 f"{ep.get('formal_wer', 0.0):.2f}% | {ep.get('informal_wer', 0.0):.2f}% | "
-                f"{ep.get('delta_vs_whisper', 0.0):+.2f}% | {ep.get('delta_vs_buzzasr', 0.0):+.2f}% |"
+                f"{clean_delta_str} | {phone_delta_str} |"
             )
         md_lines.append("")
     else:
@@ -1040,8 +1091,8 @@ def _run_post_training_evaluation(
 
     # Print summary table to console
     print("\n" + metrics_calculator.format_results_table("BuzzASR + LoRA (Final Full Test)", eval_results))
-    print(f"Improvement vs. Whisper v3: {delta_vs_whisper:+.2f}%")
-    print(f"Improvement vs. BuzzASR Base: {delta_vs_buzzasr:+.2f}%")
+    print(f"Delta vs. BuzzASR Base (clean): {_format_delta(delta_vs_buzzasr)}")
+    print(f"Delta vs. BuzzASR Base (phone): {_format_delta(delta_phone_vs_buzzasr)}")
     if phone_block:
         print(f"Clean WER: {norm_wer:.2f}% | Phone WER: {phone_block['normalized_wer']:.2f}% | Gap: {phone_block['gap_vs_clean_pp']:+.2f}pp\n")
 

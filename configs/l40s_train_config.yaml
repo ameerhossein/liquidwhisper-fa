@@ -34,7 +34,8 @@ training:
   gradient_checkpointing: false
   num_workers: 4
   eval_batch_size: 16
-  max_benchmark_samples: 300  # subset decoded twice: 300 clean + same 300 phone (600 decodes); 0 = full test set (2149)
+  max_benchmark_samples: 1000  # subset decoded twice: 1000 clean + same 1000 phone (2000 decodes); 0 = full test set (2149)
+  preflight_samples: 1000      # mandatory measured baseline on the same rows; 0 = full test set (2149)
   # Telemetry/benchmark dir (loss_history, epoch_benchmarks, live_telemetry).
   # Persistent on RunPod; local runs without /workspace fall back to results/.
   results_dir: "/workspace/stt-outputs/results"

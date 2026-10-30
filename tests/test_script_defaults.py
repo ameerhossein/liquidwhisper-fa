@@ -48,7 +48,8 @@ def test_train_lora_parser_matches_fast_l40s_defaults(monkeypatch):
     assert args.eval_steps == 1000
     assert args.save_steps == 1000
     assert args.gradient_checkpointing is False
-    assert args.max_benchmark_samples == 300
+    assert args.max_benchmark_samples == 1000
+    assert args.preflight_samples is None
     assert args.telephony_prob == 0.5
 
 
@@ -62,7 +63,8 @@ def test_l40s_config_matches_fast_defaults():
     assert training["eval_steps"] == 1000
     assert training["save_steps"] == 1000
     assert training["gradient_checkpointing"] is False
-    assert training["max_benchmark_samples"] == 300
+    assert training["max_benchmark_samples"] == 1000
+    assert training["preflight_samples"] == 1000
     assert cfg["telephony"]["prob"] == 0.5
 
 
@@ -73,7 +75,8 @@ def test_run_train_script_matches_fast_defaults():
         "--grad_accum 4",
         "--eval_steps 1000",
         "--save_steps 1000",
-        "--max_benchmark_samples 300",
+        "--max_benchmark_samples 1000",
+        "--preflight_samples 1000",
         "--telephony_prob 0.5",
         "--no-gradient_checkpointing",
     ):
