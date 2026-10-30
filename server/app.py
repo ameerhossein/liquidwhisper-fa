@@ -96,10 +96,6 @@ PID_FILE = RESULTS_DIR / "training.pid"
 last_exit_code: Optional[int] = None
 halt_requested = False
 SMOKE_DIR_NAME = "smoke-test"
-SMOKE_RESULTS_DIR = RESULTS_DIR / SMOKE_DIR_NAME
-SMOKE_LOG_FILE = SMOKE_RESULTS_DIR / "training_live.log"
-SMOKE_PID_FILE = SMOKE_RESULTS_DIR / "training.pid"
-SMOKE_ATTEMPT_FILE = SMOKE_RESULTS_DIR / "smoke_attempt.json"
 smoke_process: Optional[subprocess.Popen] = None
 smoke_log_fd = None
 smoke_last_exit_code: Optional[int] = None
@@ -207,8 +203,69 @@ def _abs_output_path(path: str) -> Path:
 
 
 def _smoke_output_dir() -> str:
-    base = Path(_default_output_dir())
-    return _sanitize_output_dir(str(base.parent / SMOKE_DIR_NAME))
+    production = _abs_output_path(
+        _managed_paths.resolve_output_dir(_default_output_dir())
+    ).resolve()
+    candidates = [
+        Path(_default_output_dir()).parent / SMOKE_DIR_NAME,
+        BASE_DIR / "outputs" / SMOKE_DIR_NAME,
+        BASE_DIR / "outputs" / f"{SMOKE_DIR_NAME}-check",
+    ]
+    for candidate in candidates:
+        effective = _managed_paths.resolve_output_dir(str(candidate))
+        if _abs_output_path(effective).resolve() != production:
+            return _sanitize_output_dir(effective)
+    raise HTTPException(
+        status_code=400,
+        detail="Smoke output would collide with the production output; "
+               "set ASR_OUTPUT_DIR to a different directory.",
+    )
+
+
+def _smoke_results_dir() -> Path:
+    production = _default_results_dir().resolve()
+    candidates = [
+        RESULTS_DIR / SMOKE_DIR_NAME,
+        BASE_DIR / "results" / SMOKE_DIR_NAME,
+        BASE_DIR / "results" / f"{SMOKE_DIR_NAME}-check",
+    ]
+    for candidate in candidates:
+        effective = Path(_managed_paths.resolve_results_dir(str(candidate)))
+        if not effective.is_absolute():
+            effective = BASE_DIR / effective
+        effective = effective.resolve()
+        if effective != production:
+            return effective
+    raise HTTPException(
+        status_code=400,
+        detail="Smoke results would collide with production results; "
+               "set ASR_RESULTS_DIR to a different directory.",
+    )
+
+
+def _smoke_log_file() -> Path:
+    return _smoke_results_dir() / "training_live.log"
+
+
+def _smoke_pid_file() -> Path:
+    return _smoke_results_dir() / "training.pid"
+
+
+def _smoke_attempt_file() -> Path:
+    return _smoke_results_dir() / "smoke_attempt.json"
+
+
+def _record_smoke_result(exit_code: int) -> None:
+    try:
+        path = _smoke_attempt_file()
+        data = read_json_safely(path, {})
+        if not isinstance(data, dict):
+            data = {}
+        data["exit_code"] = int(exit_code)
+        data["finished_at"] = time.time()
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _close_smoke_log_fd() -> None:
@@ -236,16 +293,18 @@ def _smoke_running() -> bool:
         smoke_last_exit_code = code
         smoke_process = None
         _close_smoke_log_fd()
+        _record_smoke_result(code)
         try:
-            SMOKE_PID_FILE.unlink(missing_ok=True)
+            _smoke_pid_file().unlink(missing_ok=True)
         except Exception:
             pass
     try:
-        if SMOKE_PID_FILE.exists():
-            pid = int(SMOKE_PID_FILE.read_text(encoding="utf-8").strip() or "0")
+        pid_file = _smoke_pid_file()
+        if pid_file.exists():
+            pid = int(pid_file.read_text(encoding="utf-8").strip() or "0")
             if _is_process_running(pid):
                 return True
-            SMOKE_PID_FILE.unlink(missing_ok=True)
+            pid_file.unlink(missing_ok=True)
     except Exception:
         pass
     return False
@@ -483,36 +542,70 @@ async def get_status():
 @app.get("/api/train/smoke/status")
 async def get_smoke_status():
     running = _smoke_running()
+    adapter_path = None
     try:
         output_dir = _smoke_output_dir()
-        adapter_exists = (
+        adapter_path = (
             _abs_output_path(output_dir) / "best_adapter" / "adapter_config.json"
-        ).is_file()
+        )
+        adapter_exists = adapter_path.is_file()
     except Exception:
         output_dir = ""
         adapter_exists = False
 
-    attempt_exists = SMOKE_ATTEMPT_FILE.is_file()
+    try:
+        attempt = read_json_safely(_smoke_attempt_file(), {})
+    except Exception:
+        attempt = {}
+    attempt_exists = isinstance(attempt, dict) and bool(attempt)
+    persisted_exit = attempt.get("exit_code") if attempt_exists else None
+    effective_exit = (
+        smoke_last_exit_code if smoke_last_exit_code is not None else persisted_exit
+    )
+
+    adapter_is_new = False
+    if adapter_exists and adapter_path is not None:
+        started_at = attempt.get("started_at") if attempt_exists else None
+        try:
+            adapter_is_new = (
+                started_at is None
+                or adapter_path.stat().st_mtime >= float(started_at) - 1.0
+            )
+        except Exception:
+            adapter_is_new = False
+
+    reason = None
     if running:
         status = "running"
     elif not attempt_exists:
         status = "idle"
-    elif smoke_last_exit_code == 0 and adapter_exists:
+    elif effective_exit == 0 and adapter_exists:
         status = "passed"
-    elif smoke_last_exit_code is None and adapter_exists:
+    elif effective_exit is None and adapter_exists and adapter_is_new:
         status = "passed"
     else:
         status = "failed"
+        if effective_exit is not None and effective_exit != 0:
+            reason = "nonzero_exit"
+        elif effective_exit == 0 and not adapter_exists:
+            reason = "missing_adapter"
+        else:
+            reason = "ended_without_result"
 
     payload: Dict[str, Any] = {
         "status": status,
         "running": running,
-        "exit_code": smoke_last_exit_code,
+        "exit_code": effective_exit,
         "output_dir": output_dir,
         "adapter_exists": adapter_exists,
     }
+    if reason:
+        payload["reason"] = reason
     if status == "failed":
-        payload["log_tail"] = _read_log_tail(SMOKE_LOG_FILE)
+        try:
+            payload["log_tail"] = _read_log_tail(_smoke_log_file())
+        except Exception:
+            payload["log_tail"] = []
     return payload
 
 
@@ -622,16 +715,24 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
 
     output_dir = _smoke_output_dir()
-    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    smoke_results_dir = _smoke_results_dir()
+    smoke_results_dir.mkdir(parents=True, exist_ok=True)
     _abs_output_path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # A new attempt must never inherit a previous pass.
-    shutil.rmtree(_abs_output_path(output_dir) / "best_adapter", ignore_errors=True)
-    SMOKE_PID_FILE.unlink(missing_ok=True)
-    SMOKE_ATTEMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SMOKE_ATTEMPT_FILE.write_text(
+    adapter_dir = _abs_output_path(output_dir) / "best_adapter"
+    shutil.rmtree(adapter_dir, ignore_errors=True)
+    if adapter_dir.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Could not remove the previous smoke adapter; refusing to start.",
+        )
+    _smoke_pid_file().unlink(missing_ok=True)
+    _smoke_attempt_file().parent.mkdir(parents=True, exist_ok=True)
+    _smoke_attempt_file().write_text(
         json.dumps({"started_at": time.time()}), encoding="utf-8"
     )
+    smoke_last_exit_code = None
 
     cmd = [
         sys.executable,
@@ -640,7 +741,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         "--base_model", "BuzzASR/persian",
         "--dataset_name", dataset_name,
         "--output_dir", output_dir,
-        "--results_dir", str(SMOKE_RESULTS_DIR),
+        "--results_dir", str(smoke_results_dir),
         "--epochs", "1",
         "--batch_size", str(batch_i),
         "--grad_accum", str(accum_i),
@@ -664,11 +765,10 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     ]
 
     _close_smoke_log_fd()
-    smoke_log_fd = open(SMOKE_LOG_FILE, "w", encoding="utf-8")
+    smoke_log_fd = open(_smoke_log_file(), "w", encoding="utf-8")
     smoke_log_fd.write(f"=== Smoke test launched at {time.ctime()} ===\n")
     smoke_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
     smoke_log_fd.flush()
-    smoke_last_exit_code = None
 
     try:
         smoke_process = subprocess.Popen(
@@ -689,16 +789,26 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         raise HTTPException(status_code=500, detail=f"Failed to launch smoke test: {e}")
 
     try:
-        SMOKE_PID_FILE.write_text(str(smoke_process.pid), encoding="utf-8")
-    except Exception:
-        pass
+        _smoke_pid_file().write_text(str(smoke_process.pid), encoding="utf-8")
+    except Exception as e:
+        try:
+            os.killpg(os.getpgid(smoke_process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                smoke_process.terminate()
+            except Exception:
+                pass
+        _close_smoke_log_fd()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to record smoke PID: {e}"
+        )
 
     return {
         "status": "started",
         "mode": "smoke",
         "pid": smoke_process.pid,
         "output_dir": output_dir,
-        "results_dir": str(SMOKE_RESULTS_DIR),
+        "results_dir": str(smoke_results_dir),
     }
 
 
@@ -757,6 +867,16 @@ async def start_training(config: Dict[str, Any] = None):
     dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
+    try:
+        smoke_output = _abs_output_path(_smoke_output_dir()).resolve()
+        smoke_results = _smoke_results_dir().resolve()
+    except Exception:
+        smoke_output = None
+        smoke_results = None
+    if smoke_output is not None and _abs_output_path(output_dir).resolve() == smoke_output:
+        raise HTTPException(status_code=400, detail="output_dir must not be the smoke-test directory.")
+    if smoke_results is not None and _abs_output_path(results_dir).resolve() == smoke_results:
+        raise HTTPException(status_code=400, detail="results_dir must not be the smoke-test directory.")
     # Resume controls: default auto-resume ON so pod restarts continue from
     # persistent-volume checkpoints. Send {"fresh_start": true} for clean run,
     # or {"resume_from_checkpoint": "<path|last>"} to force a checkpoint.

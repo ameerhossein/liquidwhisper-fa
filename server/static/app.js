@@ -51,6 +51,7 @@ let lossHistory = [];
 let renderedTicks = 0;
 let smokeRunning = false;
 let smokePollTimer = null;
+let fullRunRunning = false;
 
 // Formatters
 
@@ -181,6 +182,14 @@ const STATE_LABELS = {
   failed: "Run failed (see log)",
 };
 
+function syncRunButtons(stopping = false) {
+  const busy = fullRunRunning || smokeRunning;
+  el.btnStart.disabled = busy;
+  el.btnFresh.disabled = busy;
+  if (el.btnSmoke) el.btnSmoke.disabled = busy;
+  el.btnStop.disabled = !fullRunRunning || stopping;
+}
+
 function updateTelemetry(tel) {
   const status = tel.status || "idle";
   const running = !!tel.process_running || ["initializing", "training", "stopping", "evaluating_benchmark"].includes(status);
@@ -190,10 +199,8 @@ function updateTelemetry(tel) {
   el.statusDot.className = `dot dot-${state}`;
   el.statusLabel.textContent = STATE_LABELS[state];
 
-  el.btnStart.disabled = running || smokeRunning;
-  el.btnFresh.disabled = running || smokeRunning;
-  el.btnSmoke.disabled = running || smokeRunning;
-  el.btnStop.disabled = !running || state === "stopping";
+  fullRunRunning = running;
+  syncRunButtons(state === "stopping");
 
   const gpu = tel.gpu || {};
   if (gpu.available) {
@@ -522,13 +529,14 @@ async function fetchLogs() {
 // Controls
 
 function setSmokeResult(kind, text, logLines = []) {
+  if (!el.smokeResult || !el.smokeStatus) return;
   el.smokeResult.hidden = kind === "idle";
   el.smokeResult.className = `smoke-result ${kind}`;
   el.smokeStatus.textContent = text;
   const hasLog = logLines.length > 0;
-  el.smokeLogWrap.hidden = !hasLog;
-  el.smokeLog.textContent = hasLog ? logLines.join("\n") : "";
-  if (hasLog) el.smokeLogWrap.open = kind === "fail";
+  if (el.smokeLogWrap) el.smokeLogWrap.hidden = !hasLog;
+  if (el.smokeLog) el.smokeLog.textContent = hasLog ? logLines.join("\n") : "";
+  if (hasLog && el.smokeLogWrap) el.smokeLogWrap.open = kind === "fail";
 }
 
 function scheduleSmokePoll(delay = 2000) {
@@ -537,6 +545,7 @@ function scheduleSmokePoll(delay = 2000) {
 }
 
 async function pollSmokeStatus() {
+  if (!el.smokeResult) return;
   if (smokePollTimer) {
     clearTimeout(smokePollTimer);
     smokePollTimer = null;
@@ -548,6 +557,7 @@ async function pollSmokeStatus() {
     if (data.status === "running") {
       smokeRunning = true;
       setSmokeResult("running", "Smoke test running — 200 train / 50 eval samples.");
+      syncRunButtons();
       scheduleSmokePoll();
       return;
     }
@@ -556,24 +566,30 @@ async function pollSmokeStatus() {
       setSmokeResult("pass", "Smoke test passed. Ready to start the full run.");
     } else if (data.status === "failed") {
       const exit = data.exit_code != null ? ` (exit ${data.exit_code})` : "";
-      setSmokeResult("fail", `Smoke test failed${exit}.`, data.log_tail || []);
+      const reasons = {
+        nonzero_exit: "Trainer exited non-zero.",
+        missing_adapter: "Adapter was not saved.",
+        ended_without_result: "Run ended without a result.",
+      };
+      const reason = reasons[data.reason] ? ` ${reasons[data.reason]}` : "";
+      setSmokeResult("fail", `Smoke test failed${exit}.${reason}`, data.log_tail || []);
     } else {
       setSmokeResult("idle", "");
     }
+    syncRunButtons();
     pollTelemetryFallback();
   } catch (e) {
-    smokeRunning = false;
-    setSmokeResult("fail", `Could not read smoke status: ${e}`);
-    pollTelemetryFallback();
+    smokeRunning = true;
+    setSmokeResult("running", "Smoke status unavailable — retrying…");
+    syncRunButtons();
+    scheduleSmokePoll(5000);
   }
 }
 
 async function startSmokeRun() {
-  if (smokeRunning) return;
+  if (!el.btnSmoke || !el.smokeResult || smokeRunning) return;
   smokeRunning = true;
-  el.btnSmoke.disabled = true;
-  el.btnStart.disabled = true;
-  el.btnFresh.disabled = true;
+  syncRunButtons();
   setSmokeResult("running", "Smoke test running — 200 train / 50 eval samples.");
   try {
     const res = await fetch("/api/train/smoke", {
@@ -597,6 +613,7 @@ async function startSmokeRun() {
       }
       smokeRunning = false;
       setSmokeResult("fail", `Could not start smoke test: ${detail}`);
+      syncRunButtons();
       pollTelemetryFallback();
       return;
     }
@@ -604,6 +621,7 @@ async function startSmokeRun() {
   } catch (e) {
     smokeRunning = false;
     setSmokeResult("fail", `Could not start smoke test: ${e}`);
+    syncRunButtons();
     pollTelemetryFallback();
   }
 }
@@ -653,7 +671,7 @@ async function startRun(freshStart) {
 }
 
 el.btnStart.addEventListener("click", () => startRun(false));
-el.btnSmoke.addEventListener("click", startSmokeRun);
+if (el.btnSmoke) el.btnSmoke.addEventListener("click", startSmokeRun);
 
 el.btnFresh.addEventListener("click", () => {
   if (!confirm("Fresh start deletes existing checkpoints, the best adapter, reports and telemetry history before training. This cannot be undone. Continue?")) {
