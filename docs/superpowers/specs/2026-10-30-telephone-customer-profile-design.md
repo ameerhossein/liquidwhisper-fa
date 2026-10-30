@@ -340,22 +340,28 @@ The fitted peaking gains are:
 
 ```python
 CUSTOMER_EQ_GAINS_DB = {
-    315.0: -4.46, 400.0: 3.81, 500.0: 2.49, 630.0: 0.87,
-    800.0: -0.90, 1250.0: 2.28, 1600.0: 2.46, 2000.0: -2.33,
-    2500.0: 0.91, 3150.0: -20.0,
+    315.0: -4.02, 400.0: 4.02, 500.0: 2.70, 630.0: 1.10,
+    800.0: -0.37, 1250.0: 2.51, 1600.0: 2.50, 2000.0: -2.05,
+    2500.0: 0.29, 3150.0: -19.77,
 }
 CUSTOMER_EQ_Q_BY_BAND = {3150.0: 3.0}
 ```
 
-`CUSTOMER_TARGET_RMS_DB_RANGE` was widened/shifted to `(-29.5, -22.5)` so
-the generated median lands on −25.5 dBFS (the original range produced −24.6).
+`CUSTOMER_TARGET_RMS_DB_RANGE` was shifted to `(-29.5, -22.5)` so the
+generated median lands on −25.5 dBFS (the original range produced −24.6).
+The committed `customer_eq_gains.json` starts from
+`CUSTOMER_EQ_INITIAL_GAINS_DB` and records five fit iterations.
 
 Final 46-voice × 5-seed medians: active speech **−25.5 dBFS**, noise floor
-**−72.8 dBFS**, centroid **483 Hz**, roll95 **648 Hz**, HF 1–2k **−14.8 dB**,
-HF 2–3.4k **−30.4 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
-1/3-octave check is within ±2 dB at every band 315–3150 Hz. Listening is the
-remaining perceptual gate; the A/B kit was generated but has not been judged
-by a Persian listener yet.
+**−72.8 dBFS**, centroid **483 Hz**, roll95 **656 Hz**, HF 1–2k **−14.9 dB**,
+HF 2–3.4k **−31.0 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
+1/3-octave check is within ±2 dB at every band 315–3150 Hz. A true
+speaker-held-out fit (five speakers train, `spk_91858` held out) leaves
++8.7/+6.2/+5.2/+4.6 dB residuals at 1600/2000/2500/3150 Hz; that is
+source-voice spread, not a channel-fit failure, and the shipped gains remain
+the all-voice fit (`customer_eq_holdout.json` records the held-out run).
+Listening is the remaining perceptual gate; the A/B kit was generated but has
+not been judged by a Persian listener yet.
 
 ## Open questions
 

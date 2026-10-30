@@ -952,3 +952,34 @@ def test_customer_profile_active_rms_and_noise_floor():
     energy = 10 * np.log10(np.mean(frames ** 2, axis=1) + 1e-20)
     noise_floor = float(np.median(np.sort(energy)[: max(1, len(energy) // 10)]))
     assert -75.0 <= noise_floor <= -69.0
+
+
+@requires_scipy
+def test_simulate_customer_averages_stereo_channels():
+    from src.telephone import active_speech_rms_db, simulate_customer
+    x = _sine_mix(dur=0.5)
+    # Right-channel-only: taking the first channel would produce silence.
+    stereo = np.stack([np.zeros_like(x), x], axis=1)
+    mono = simulate_customer(x, seed=3, use_ffmpeg=False)
+    st = simulate_customer(stereo, seed=3, use_ffmpeg=False)
+    # Averaging halves the level, so the absolute level may differ slightly;
+    # the regression is that dropping the right channel would produce silence.
+    assert float(np.max(np.abs(st))) > 0.01
+    assert active_speech_rms_db(st) > -35.0
+
+
+def test_customer_eq_initial_and_final_gains_differ():
+    from src import telephone
+    assert telephone.CUSTOMER_EQ_INITIAL_GAINS_DB[3150.0] == -8.6
+    assert telephone.CUSTOMER_EQ_GAINS_DB[3150.0] < -15.0
+
+
+@requires_scipy
+def test_apply_random_telephone_default_draws_are_customer():
+    from src.telephone import apply_random_telephone
+    x = _sine_mix(dur=0.05)
+    seen = {
+        apply_random_telephone(x, prob=1.0, seed=seed, use_ffmpeg=False)[1]
+        for seed in range(20)
+    }
+    assert seen == {"customer"}

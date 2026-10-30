@@ -91,7 +91,7 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
             if degrade_phone and degrade_fn is not None:
                 wav, used_profile = degrade_fn(
                     wav, index=i + j, seed_base=phone_seed,
-                    profiles=profiles or ["gated", "mobile", "pstn"],
+                    profiles=profiles or ["customer"],
                     use_ffmpeg=use_ffmpeg,
                 )
             profiles_used.append(used_profile)

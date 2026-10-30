@@ -24,6 +24,7 @@ import argparse
 import csv
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -85,7 +86,8 @@ def medians(rows: Sequence[Dict[str, str]], keys: Sequence[str]) -> Dict[str, fl
     return out
 
 
-def summarize_real(rows: Sequence[Dict[str, str]], caller_class: str):
+def summarize_real(rows: Sequence[Dict[str, str]], caller_class: str,
+                   content_by_file: Optional[Dict[str, str]] = None):
     selected = [row for row in rows if classify_caller(row["file"]) == caller_class]
     gated = sum(str(row.get("is_gated", "")).lower() == "true" for row in selected)
     result = {
@@ -93,7 +95,15 @@ def summarize_real(rows: Sequence[Dict[str, str]], caller_class: str):
         "n": len(selected),
         "gated": gated,
         "noisy": len(selected) - gated,
+        "content_class": "",
     }
+    if content_by_file:
+        counts = Counter(
+            content_by_file.get(row["file"], "unknown") for row in selected
+        )
+        result["content_class"] = ";".join(
+            f"{name}:{count}" for name, count in sorted(counts.items())
+        )
     result.update(medians(selected, REAL_METRICS))
     return result
 
@@ -105,6 +115,7 @@ def summarize_synth(rows: Sequence[Dict[str, str]], profile: str):
         "n": len(selected),
         "gated": "",
         "noisy": "",
+        "content_class": "",
     }
     result.update(medians(selected, SYNTH_METRICS))
     return result
@@ -118,6 +129,10 @@ def main() -> None:
     parser.add_argument(
         "--multi-voice", type=Path, default=HERE / "multi_voice_files.csv"
     )
+    parser.add_argument(
+        "--content-manifest", type=Path,
+        default=HERE / "answered_customer_manifest.csv",
+    )
     parser.add_argument("--out-dir", type=Path, default=HERE)
     args = parser.parse_args()
 
@@ -128,11 +143,19 @@ def main() -> None:
     with open(args.multi_voice, newline="", encoding="utf-8") as fh:
         multi_voice = list(csv.DictReader(fh))
 
+    content_by_file: Dict[str, str] = {}
+    if args.content_manifest.is_file():
+        with open(args.content_manifest, newline="", encoding="utf-8") as fh:
+            content_by_file = {
+                row["file"]: row.get("content_class", "")
+                for row in csv.DictReader(fh)
+            }
+
     results = [
-        summarize_real(features, "mobile"),
-        summarize_real(features, "extension"),
-        summarize_real(features, "landline"),
-        summarize_real(features, "other"),
+        summarize_real(features, "mobile", content_by_file),
+        summarize_real(features, "extension", content_by_file),
+        summarize_real(features, "landline", content_by_file),
+        summarize_real(features, "other", content_by_file),
         summarize_synth(multi_voice, "customer"),
         summarize_synth(multi_voice, "mobile"),
         summarize_synth(multi_voice, "pstn"),
@@ -140,7 +163,7 @@ def main() -> None:
     results = [row for row in results if row["n"]]
 
     columns = [
-        "group", "n", "gated", "noisy", *OUTPUT_METRICS,
+        "group", "n", "gated", "noisy", "content_class", *OUTPUT_METRICS,
     ]
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with open(args.out_dir / "caller_class_medians.csv", "w",

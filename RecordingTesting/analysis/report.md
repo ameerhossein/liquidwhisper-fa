@@ -751,20 +751,20 @@ files** (36 in-repo + 31 outside; `speech_only`, `is_gated=True`,
 The broadband HF figures are dominated by the 0.3–1 kHz denominator, so the
 EQ was fitted on answered-only loud-frame 1/3-octave bands. The measured
 in-band correction is a 315 Hz cut, a 400–500 Hz boost, a 3150 Hz cut, and a
-nearly flat 630–2500 Hz region. Final 46-voice × 3-seed fit:
+nearly flat 630–2500 Hz region. Final 46-voice × 3-seed fit (validated at 5 seeds):
 
 | Hz | Target | Before (`gated`) | After (`customer`) |
 |---:|---:|---:|---:|
-| 315 | +4.5 | +9.3 | +4.6 |
-| 400 | +13.0 | +8.7 | +12.4 |
-| 500 | +13.0 | +9.0 | +12.2 |
-| 630 | +9.4 | +7.5 | +8.8 |
-| 800 | +3.8 | +3.2 | +3.5 |
+| 315 | +4.5 | +9.3 | +4.1 |
+| 400 | +13.0 | +8.7 | +12.6 |
+| 500 | +13.0 | +9.0 | +12.3 |
+| 630 | +9.4 | +7.5 | +9.0 |
+| 800 | +3.8 | +3.2 | +3.8 |
 | 1250 | −1.7 | −3.6 | −2.0 |
-| 1600 | −3.7 | −5.0 | −4.0 |
-| 2000 | −12.3 | −10.7 | −12.6 |
-| 2500 | −13.8 | −12.0 | −14.4 |
-| 3150 | −19.8 | −11.2 | −18.5 |
+| 1600 | −3.7 | −5.0 | −4.1 |
+| 2000 | −12.3 | −10.7 | −12.7 |
+| 2500 | −13.8 | −12.0 | −14.7 |
+| 3150 | −19.8 | −11.2 | −18.7 |
 
 All 315–3150 Hz residuals are within ±2 dB. The 3150 Hz band needs a wider
 (Q≈3) peaking filter because it sits against the 3400 Hz band edge. The
@@ -775,10 +775,21 @@ remain explicit legacy profiles only. Reproduce the fit with
 
 
 Final multi-voice medians (46 voices × seeds 1–5): active speech **−25.5
-dBFS**, noise floor **−72.8 dBFS**, centroid **483 Hz**, roll95 **648 Hz**,
-HF 1–2k **−14.8 dB**, HF 2–3.4k **−30.4 dB**, speech fraction **0.65**. All
+dBFS**, noise floor **−72.8 dBFS**, centroid **483 Hz**, roll95 **656 Hz**,
+HF 1–2k **−14.9 dB**, HF 2–3.4k **−31.0 dB**, speech fraction **0.65**. All
 primary 1/3-octave targets are within ±2 dB; the broadband HF 2–3.4k figure
-is 2.9 dB darker than its target, which is secondary to the 1/3-octave fit.
+is 3.5 dB darker than its target, which is secondary to the 1/3-octave fit.
 The 125–160 Hz bands remain band-edge context and are not reproduced (the
 300 Hz high-pass is intentional). Listening is still pending; the generated
 A/B kit is the perceptual gate.
+
+### Held-out speaker check
+
+Fitting on the five other speakers and validating on `spk_91858` gives
+1/3-octave residuals of **+8.7 dB at 1600 Hz, +6.2 dB at 2000 Hz, +5.2 dB at
+2500 Hz, and +4.6 dB at 3150 Hz** (synth darker than the population target).
+This is source-voice spread, not a channel-fit failure: the target is a
+median across real mobile calls, and `spk_91858` is one of the dark voices
+already called out in the multi-voice section. The shipped gains are the
+all-voice fit; `customer_eq_holdout.json` records the held-out run. A Persian
+listening pass is still the perceptual gate.

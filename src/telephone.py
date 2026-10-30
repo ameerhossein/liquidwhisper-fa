@@ -97,17 +97,32 @@ GATED_TARGET_RMS_DB_RANGE = CUSTOMER_TARGET_RMS_DB_RANGE
 
 # Measured 1/3-octave correction for the answered mobile-customer channel.
 # Values are the target-minus-current gated delta; the fit script refines them.
+# Starting point for a fresh fit: the measured target-minus-gated delta.
+CUSTOMER_EQ_INITIAL_GAINS_DB = {
+    315.0: -4.8,
+    400.0: 4.3,
+    500.0: 4.0,
+    630.0: 1.9,
+    800.0: 0.6,
+    1250.0: 1.9,
+    1600.0: 1.3,
+    2000.0: -1.6,
+    2500.0: -1.8,
+    3150.0: -8.6,
+}
+# Final fitted gains (46 voices, seeds 1-3, five iterations from the initial
+# delta; see customer_eq_gains.json for the full history).
 CUSTOMER_EQ_GAINS_DB = {
-    315.0: -4.46,
-    400.0: 3.81,
-    500.0: 2.49,
-    630.0: 0.87,
-    800.0: -0.90,
-    1250.0: 2.28,
-    1600.0: 2.46,
-    2000.0: -2.33,
-    2500.0: 0.91,
-    3150.0: -20.0,
+    315.0: -4.02,
+    400.0: 4.02,
+    500.0: 2.70,
+    630.0: 1.10,
+    800.0: -0.37,
+    1250.0: 2.51,
+    1600.0: 2.50,
+    2000.0: -2.05,
+    2500.0: 0.29,
+    3150.0: -19.77,
 }
 CUSTOMER_EQ_Q = 1.0 / (2.0 ** (1.0 / 6.0) - 2.0 ** (-1.0 / 6.0))
 # The 3150 Hz band sits against the 3400 Hz band edge; a wider peaking filter
@@ -173,10 +188,12 @@ def _as_float32_mono(wav: Union[np.ndarray, Sequence[float]]) -> np.ndarray:
     if arr.size == 0:
         return np.zeros(0, dtype=np.float32)
     if arr.ndim != 1:
-        # Take first channel if accidentally stereo.
+        # Average channels if accidentally stereo; do not drop the right
+        # channel (call-centre recordings can have the customer on one side).
         arr = np.asarray(wav, dtype=np.float64)
         if arr.ndim == 2:
-            arr = arr[:, 0] if arr.shape[1] <= arr.shape[0] else arr[0]
+            arr = (arr.mean(axis=1) if arr.shape[1] <= arr.shape[0]
+                   else arr.mean(axis=0))
         arr = np.asarray(arr, dtype=np.float64).reshape(-1)
     # Guard against int16 input.
     if np.max(np.abs(arr)) > 2.0:
