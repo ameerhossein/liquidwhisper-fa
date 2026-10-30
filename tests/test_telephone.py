@@ -971,7 +971,18 @@ def test_simulate_customer_averages_stereo_channels():
 def test_customer_eq_initial_and_final_gains_differ():
     from src import telephone
     assert telephone.CUSTOMER_EQ_INITIAL_GAINS_DB[3150.0] == -8.6
-    assert telephone.CUSTOMER_EQ_GAINS_DB[3150.0] < -15.0
+    # The per-file refit makes the 3150 Hz cut shallower than the measured
+    # delta, not deeper; the old -19.8 dB cut overcorrected the high band.
+    assert telephone.CUSTOMER_EQ_GAINS_DB[3150.0] > -8.6
+
+
+def test_customer_eq_high_band_not_overcut():
+    from src import telephone
+    gains = telephone.CUSTOMER_EQ_GAINS_DB
+    assert gains[1600.0] > 4.0
+    assert gains[2000.0] > 1.0
+    assert gains[2500.0] > 4.0
+    assert gains[3150.0] > -10.0
 
 
 @requires_scipy
