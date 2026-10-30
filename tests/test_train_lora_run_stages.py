@@ -1,5 +1,6 @@
 """Offline tests for trainer run-ledger stages and preflight plumbing."""
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -212,3 +213,137 @@ def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch)
     assert run["last_error"] == "processor boom"
     stage = _stages(run_dir)["preflight"]
     assert stage["status"] == "failed"
+
+
+def test_run_attempt_number_reads_latest_attempt(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    assert train_lora._run_attempt_number(None) == 1
+    assert train_lora._run_attempt_number(run_dir) == 1
+
+    run_state.start_attempt(run_dir, 1234)
+    assert train_lora._run_attempt_number(run_dir) == 1
+    run_state.finish_attempt(run_dir, 0, "completed")
+    run_state.start_attempt(run_dir, 5678, reason="resume")
+    assert train_lora._run_attempt_number(run_dir) == 2
+
+
+def test_post_eval_only_calls_report_without_training(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    output_dir = run_dir / "output"
+    adapter_path = output_dir / "best_adapter"
+    adapter_path.mkdir(parents=True)
+    (adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    baseline_models = {
+        "buzzasr_base": {"total_samples": 1000, "normalized_wer": 17.2}
+    }
+    (run_dir / "baselines").mkdir(exist_ok=True)
+    (run_dir / "baselines" / "preflight.json").write_text(
+        json.dumps({"models": baseline_models}), encoding="utf-8"
+    )
+
+    checkpoint = output_dir / "checkpoint-100"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 100, "log_history": [{"step": 100, "loss": 0.4}]}),
+        encoding="utf-8",
+    )
+
+    calls = {}
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, path, *a, **k):
+            calls["processor_path"] = str(path)
+            return SimpleNamespace()
+
+    class _FakeBaseModel:
+        @classmethod
+        def from_pretrained(cls, path, *a, **k):
+            calls["base_model"] = str(path)
+            return SimpleNamespace()
+
+    class _FakePeftModel:
+        @classmethod
+        def from_pretrained(cls, model, path, *a, **k):
+            calls["adapter_base"] = model
+            calls["adapter_path"] = str(path)
+            return SimpleNamespace(name="peft")
+
+    class _TrainerMustNotRun:
+        def __init__(self, *a, **k):
+            raise AssertionError("post-eval-only must not construct a Trainer")
+
+    def fake_report(**kwargs):
+        calls["report"] = kwargs
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "WhisperForConditionalGeneration", _FakeBaseModel)
+    monkeypatch.setattr(train_lora, "PeftModel", _FakePeftModel)
+    monkeypatch.setattr(train_lora, "Seq2SeqTrainer", _TrainerMustNotRun)
+    monkeypatch.setattr(train_lora, "_run_post_training_evaluation", fake_report)
+
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+    train_lora._run_post_eval_only(args)
+
+    assert calls["processor_path"] == str(adapter_path)
+    assert calls["base_model"] == "BuzzASR/persian"
+    assert calls["adapter_path"] == str(adapter_path)
+    report = calls["report"]
+    assert report["trainer_state"].global_step == 100
+    assert report["baseline_benchmark"] == baseline_models
+    assert report["output_dir"] == str(output_dir)
+    assert report["results_dir"] == str(run_dir)
+    assert report["model"].name == "peft"
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "completed"
+    assert _stages(run_dir)["post_eval"]["status"] == "completed"
+    # Post-eval-only must never replay or append optimizer steps.
+    assert not (run_dir / "steps.jsonl").exists()
+
+
+def test_post_eval_only_marks_post_eval_failed_when_adapter_missing(
+    tmp_path, monkeypatch
+):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+
+    monkeypatch.setattr(
+        train_lora,
+        "_run_post_training_evaluation",
+        lambda **kwargs: pytest.fail("report must not run without an adapter"),
+    )
+    with pytest.raises(SystemExit, match="adapter_config.json not found"):
+        train_lora._run_post_eval_only(args)
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "failed"
+    assert run["failed_stage"] == "post_eval"
+    assert "adapter_config.json not found" in run["last_error"]
+    assert _stages(run_dir)["post_eval"]["status"] == "failed"
+
+
+def test_main_runs_post_eval_only_before_processor_load(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+
+    seen = []
+    monkeypatch.setattr(
+        train_lora, "_run_post_eval_only", lambda parsed: seen.append(parsed)
+    )
+
+    class _NeverCalled:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            raise AssertionError("post-eval-only must branch before data prep")
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _NeverCalled)
+    train_lora.main()
+
+    assert seen == [args]

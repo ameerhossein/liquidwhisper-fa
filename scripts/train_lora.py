@@ -41,6 +41,7 @@ from transformers import (
     WhisperProcessor,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerState,
 )
 from peft import LoraConfig, get_peft_model, PeftModel
 
@@ -411,6 +412,20 @@ def _halt_run(run_dir, results_dir: str, stage: str) -> None:
         pass
 
 
+def _run_attempt_number(run_dir: Optional[str | Path]) -> int:
+    """Return the ledger attempt this trainer process belongs to (1 if unknown)."""
+    if not run_dir:
+        return 1
+    run = run_state.load_run(run_dir)
+    attempts = (run or {}).get("attempts") or []
+    if not attempts:
+        return 1
+    try:
+        return int(attempts[-1].get("attempt") or 1)
+    except (TypeError, ValueError, AttributeError):
+        return 1
+
+
 def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) -> None:
     """Delete prior run state so --fresh_start truly starts clean.
 
@@ -526,6 +541,122 @@ def _resolve_resume_checkpoint(args) -> Optional[bool | str]:
     return None
 
 
+def _load_post_eval_trainer_state(output_dir: str):
+    """Load ``TrainerState`` from the newest complete checkpoint when available."""
+    checkpoint = _find_last_checkpoint(output_dir)
+    if not checkpoint:
+        return None
+    state_path = Path(checkpoint) / "trainer_state.json"
+    try:
+        return TrainerState.load_from_json(str(state_path))
+    except Exception as exc:
+        print(f"Warning: could not load {state_path}: {exc}")
+        return None
+
+
+def _load_run_baseline(
+    run_dir: Optional[Path], results_dir: str
+) -> Optional[Dict[str, Any]]:
+    """Return the measured preflight model rows used for report deltas."""
+    candidates = []
+    if run_dir is not None:
+        candidates.append(Path(run_dir) / "baselines" / "preflight.json")
+    candidates.append(Path(results_dir) / "baselines" / "preflight.json")
+    seen = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if isinstance(models, dict):
+            return models
+    return None
+
+
+def _run_post_eval_only(args) -> None:
+    """Run only the full-test report from an existing ``best_adapter``.
+
+    Used by cockpit Resume when training completed but post-eval did not. It
+    never constructs a Trainer, restores an optimizer, or appends step records.
+    """
+    output_dir = Path(args.output_dir)
+    raw_results = getattr(args, "results_dir", None)
+    results_dir = _resolve_results_dir(str(raw_results) if raw_results else None)
+    run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
+    adapter_path = output_dir / "best_adapter"
+    if not (adapter_path / "adapter_config.json").is_file():
+        message = (
+            "post-eval-only: best_adapter/adapter_config.json not found at "
+            f"{adapter_path}"
+        )
+        _mark_run_stage(run_dir, "post_eval", "failed", detail=message)
+        _mark_run_status(
+            run_dir, "failed", failed_stage="post_eval", last_error=message
+        )
+        raise SystemExit(message)
+
+    _mark_run_status(run_dir, "running")
+    _mark_run_stage(run_dir, "post_eval", "running", detail="post-eval only")
+    try:
+        print(f"Post-eval-only: loading processor from {adapter_path}...")
+        processor = WhisperProcessor.from_pretrained(str(adapter_path))
+        normalizer = PersianTextNormalizer()
+        metrics_calculator = ASRMetricsCalculator(normalizer=normalizer)
+
+        try:
+            bf16_ok = torch.cuda.is_bf16_supported()
+        except Exception:
+            bf16_ok = False
+        if not torch.cuda.is_available():
+            dtype = torch.float32
+        else:
+            dtype = torch.bfloat16 if bf16_ok else torch.float16
+
+        print(f"Post-eval-only: loading base model {args.base_model} in {dtype}...")
+        model = WhisperForConditionalGeneration.from_pretrained(
+            args.base_model, torch_dtype=dtype, low_cpu_mem_usage=True
+        )
+        model = PeftModel.from_pretrained(model, str(adapter_path))
+
+        trainer_state = _load_post_eval_trainer_state(str(output_dir))
+        baseline_benchmark = _load_run_baseline(run_dir, results_dir)
+
+        _run_post_training_evaluation(
+            model=model,
+            processor=processor,
+            metrics_calculator=metrics_calculator,
+            normalizer=normalizer,
+            dataset_name=args.dataset_name,
+            output_dir=str(output_dir),
+            results_dir=results_dir,
+            eval_batch_size=int(getattr(args, "eval_batch_size", 16) or 16),
+            trainer_state=trainer_state,
+            baseline_benchmark=baseline_benchmark,
+            phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
+            phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
+            telephony_profiles=_parse_telephony_profiles(
+                getattr(args, "telephony_profiles", "customer")
+            ),
+            telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+        )
+    except Exception as exc:
+        _mark_run_stage(
+            run_dir, "post_eval", "failed", detail=f"post-eval failed: {exc}"
+        )
+        _mark_run_status(
+            run_dir, "failed", failed_stage="post_eval", last_error=str(exc)
+        )
+        raise
+    _mark_run_stage(run_dir, "post_eval", "completed")
+    _mark_run_status(run_dir, "completed")
+
+
 def main():
     args = parse_args()
     args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "customer"))
@@ -533,6 +664,15 @@ def main():
     args.results_dir = _resolve_results_dir(getattr(args, "results_dir", None))
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
+
+    # Post-eval-only resume: never repeat dataset prep, preflight, or training,
+    # and never replay optimizer steps.
+    if bool(getattr(args, "post_eval_only", False)):
+        if bool(getattr(args, "fresh_start", False)):
+            print("Note: --fresh_start is ignored with --post_eval_only.")
+        _run_post_eval_only(args)
+        return
+
     if bool(getattr(args, "fresh_start", False)):
         _clear_previous_state(args.output_dir, results_dir=args.results_dir)
 
@@ -779,6 +919,8 @@ def main():
         telemetry_cb = WebTelemetryCallback(
             output_dir=args.output_dir,
             results_dir=args.results_dir,
+            run_dir=str(run_dir) if run_dir is not None else None,
+            attempt=_run_attempt_number(run_dir),
             test_dataset=raw_test,
             processor=processor,
             metrics_calculator=metrics_calculator,

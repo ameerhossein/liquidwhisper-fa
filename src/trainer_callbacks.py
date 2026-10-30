@@ -16,6 +16,7 @@ import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
 from src.preflight import compute_deltas
+from src import run_state
 
 
 DEFAULT_TELEPHONY_PROFILES = ["customer"]
@@ -60,9 +61,13 @@ class WebTelemetryCallback(TrainerCallback):
         phone_seed: int = 1234,
         telephony_profiles: Optional[List[str]] = None,
         telephony_use_ffmpeg: bool = True,
+        run_dir: Optional[str] = None,
+        attempt: int = 1,
     ):
         self.output_dir = output_dir
         self.results_dir = results_dir
+        self.run_dir = str(run_dir) if run_dir else None
+        self.attempt = int(attempt or 1)
         self.test_dataset = test_dataset
         self.processor = processor
         self.metrics_calculator = metrics_calculator
@@ -90,6 +95,7 @@ class WebTelemetryCallback(TrainerCallback):
         self.benchmarks_file = os.path.join(self.results_dir, "epoch_benchmarks.json")
         self.stop_signal_file = os.path.join(self.results_dir, "stop_training.signal")
         self.loss_history_file = os.path.join(self.results_dir, "loss_history.json")
+        self.steps_file = os.path.join(self.results_dir, "steps.jsonl")
 
         self.halt_requested = False
 
@@ -98,6 +104,9 @@ class WebTelemetryCallback(TrainerCallback):
         self.last_step_time = time.time()
         self.step_durations: List[float] = []
         self.loss_history: List[Dict[str, Any]] = []
+        # steps.jsonl is the uncapped authority for the run's step history;
+        # the count is restored so resume progress stays monotonic.
+        self.step_count = run_state.step_count(self.results_dir)
         try:
             if os.path.exists(self.loss_history_file):
                 with open(self.loss_history_file, "r", encoding="utf-8") as f:
@@ -194,23 +203,11 @@ class WebTelemetryCallback(TrainerCallback):
         print("[TelemetryCallback] Training started. Initializing live telemetry stream...")
 
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        # 1. Check for web stop signal
-        if os.path.exists(self.stop_signal_file):
-            print("\n[TelemetryCallback] Stop signal received from Web Dashboard! Halting training...")
-            self.halt_requested = True
-            control.should_save = True
-            control.should_training_stop = True
-            try:
-                os.remove(self.stop_signal_file)
-            except OSError:
-                pass
-            return control
-
-        # 2. Timing calculation
+        # 1. Timing calculation
         now = time.time()
         step_dt = now - self.last_step_time
         self.last_step_time = now
-        
+
         self.step_durations.append(step_dt)
         if len(self.step_durations) > 50:
             self.step_durations.pop(0)
@@ -219,14 +216,21 @@ class WebTelemetryCallback(TrainerCallback):
         remaining_steps = max(0, state.max_steps - state.global_step)
         eta_seconds = int(remaining_steps * avg_step_dt)
 
-        # 3. Extract latest logged values
+        # 2. Extract latest logged values. ``loss`` is carried forward between
+        # logging points; ``loss_step`` names the step that produced it.
         latest_loss = None
+        latest_loss_step = None
         latest_lr = None
         if state.log_history:
             for entry in reversed(state.log_history):
-                if "loss" in entry:
+                if latest_loss is None and "loss" in entry:
                     latest_loss = float(entry["loss"])
-                if "learning_rate" in entry:
+                    entry_step = entry.get("step")
+                    if isinstance(entry_step, (int, float)) and not isinstance(entry_step, bool):
+                        latest_loss_step = int(entry_step)
+                    else:
+                        latest_loss_step = state.global_step
+                if latest_lr is None and "learning_rate" in entry:
                     latest_lr = float(entry["learning_rate"])
                 if latest_loss is not None and latest_lr is not None:
                     break
@@ -238,9 +242,10 @@ class WebTelemetryCallback(TrainerCallback):
                 "epoch": round(state.epoch or 0.0, 2),
                 "lr": latest_lr
             })
+            # 500-point cap is only for the chart; steps.jsonl below is uncapped.
             self._write_json(self.loss_history_file, self.loss_history[-500:])
 
-        # 4. Save live snapshot
+        # 3. Save live snapshot
         telemetry_payload = {
             "status": "training",
             "step": state.global_step,
@@ -255,7 +260,80 @@ class WebTelemetryCallback(TrainerCallback):
             "updated_at": now
         }
         self._write_telemetry(telemetry_payload)
+
+        # 4. Persist this optimizer step. Recorded before consuming a stop
+        # signal so the halting step still appears in the run ledger.
+        self._append_step_record(
+            state,
+            now=now,
+            avg_step_dt=avg_step_dt,
+            eta_seconds=eta_seconds,
+            latest_loss=latest_loss,
+            latest_loss_step=latest_loss_step,
+            latest_lr=latest_lr,
+        )
+
+        # 5. Check for web stop signal
+        if os.path.exists(self.stop_signal_file):
+            print("\n[TelemetryCallback] Stop signal received from Web Dashboard! Halting training...")
+            self.halt_requested = True
+            control.should_save = True
+            control.should_training_stop = True
+            try:
+                os.remove(self.stop_signal_file)
+            except OSError:
+                pass
+
         return control
+
+    def _append_step_record(
+        self,
+        state: TrainerState,
+        *,
+        now: float,
+        avg_step_dt: float,
+        eta_seconds: int,
+        latest_loss: Optional[float],
+        latest_loss_step: Optional[int],
+        latest_lr: Optional[float],
+    ) -> None:
+        """Append one ``steps.jsonl`` line and refresh run progress."""
+        run_state.append_step(self.results_dir, {
+            "step": state.global_step,
+            "epoch": round(state.epoch or 0.0, 2),
+            "loss": latest_loss,
+            "loss_step": latest_loss_step,
+            "learning_rate": latest_lr,
+            "speed_s_per_step": round(avg_step_dt, 3),
+            "elapsed_seconds": int(now - self.start_time),
+            "eta_seconds": eta_seconds,
+            "attempt": self.attempt,
+        })
+        self.step_count += 1
+        if self.run_dir and (self.step_count % 100 == 0):
+            self._set_run_progress(
+                step=state.global_step,
+                step_count=self.step_count,
+                last_step_at=now,
+            )
+
+    def _set_run_progress(self, *, step: int, step_count: int, last_step_at: float) -> None:
+        """Refresh ``run.json`` progress, tolerating a plain ``--run_dir``."""
+        if not self.run_dir:
+            return
+        if run_state.load_run(self.run_dir) is None:
+            # A bare --run_dir without a ledger manifest has no progress target;
+            # step history still lives in steps.jsonl.
+            return
+        try:
+            run_state.set_progress(
+                self.run_dir,
+                step=step,
+                step_count=step_count,
+                last_step_at=last_step_at,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[TelemetryCallback] Warning: failed to update run progress: {exc}")
 
     def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model=None, **kwargs):
         """
@@ -568,6 +646,13 @@ class WebTelemetryCallback(TrainerCallback):
         print(f"[TelemetryCallback] Epoch {epoch_num} benchmarks saved to {self.benchmarks_file}")
 
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # Final progress flush: every 100-step update is best-effort, so the
+        # last partial interval must not be lost.
+        self._set_run_progress(
+            step=state.global_step,
+            step_count=self.step_count,
+            last_step_at=time.time(),
+        )
         self._write_telemetry({
             "status": "stopped" if self.halt_requested else "completed",
             "step": state.global_step,
