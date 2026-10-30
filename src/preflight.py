@@ -19,7 +19,9 @@ heavy training stack.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -30,6 +32,16 @@ PREFLIGHT_VERSION = "1"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _EVALUATE_SCRIPT = _REPO_ROOT / "scripts" / "evaluate_model.py"
+
+# Evaluator/metric code that must invalidate a cached baseline when it changes.
+# Dataset/model content or revisions are not pinned by the fingerprint; see the
+# design doc's cache-invalidation procedure before changing either.
+_CODE_HASH_FILES = (
+    _EVALUATE_SCRIPT,
+    _REPO_ROOT / "src" / "metrics.py",
+    _REPO_ROOT / "src" / "normalizer.py",
+    _REPO_ROOT / "src" / "preflight.py",
+)
 
 _PREFLIGHT_ROWS: Dict[str, Dict[str, Any]] = {
     "buzzasr_base": {
@@ -55,6 +67,29 @@ def _round_metric(value: Any) -> Optional[float]:
     if value is None:
         return None
     return round(float(value), 2)
+
+
+def _compute_code_hash() -> str:
+    """Return a SHA-256 over the evaluator and metric/normalization code.
+
+    The fingerprint must change whenever the code that produced the metrics
+    changes, or a stale cache could silently compare a run against a baseline
+    measured with different normalization or decoding logic.
+    """
+    digest = hashlib.sha256()
+    for path in _CODE_HASH_FILES:
+        try:
+            label = str(path.relative_to(_REPO_ROOT))
+        except ValueError:
+            label = str(path)
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def build_fingerprint(
@@ -83,6 +118,7 @@ def build_fingerprint(
         "telephony_profiles": sorted(str(profile) for profile in telephony_profiles),
         "telephony_use_ffmpeg": bool(telephony_use_ffmpeg),
         "eval_batch_size": int(eval_batch_size),
+        "code_hash": _compute_code_hash(),
     }
     fingerprint.update(dict(models))
     return fingerprint
@@ -108,7 +144,17 @@ def load_cached_preflight(
         return None
 
     models = data.get("models")
-    if not isinstance(models, dict) or "buzzasr_base" not in models:
+    if not isinstance(models, dict):
+        return None
+    buzzasr = models.get("buzzasr_base")
+    if not isinstance(buzzasr, dict):
+        return None
+    try:
+        clean_wer = float(buzzasr["normalized_wer"])
+        total_samples = int(buzzasr["total_samples"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(clean_wer) or total_samples <= 0:
         return None
     return data
 
@@ -267,6 +313,7 @@ def _evaluate_preflight_model(
     Raises ``ValueError`` when the evaluation produced no usable samples, so a
     caller can retry or drop the model instead of caching a bogus baseline.
     """
+    output_dir = Path(output_dir).resolve()
     command = _build_evaluation_command(
         model_id=model_id,
         dataset_name=dataset_name,
@@ -287,14 +334,19 @@ def _evaluate_preflight_model(
     row = parse_evaluation_details(
         payload,
         name=meta["name"],
-        epoch=meta["epoch"].format(count=int(sample_count)),
+        epoch=meta["epoch"].format(count=0),
         source="preflight",
         is_reference=meta["is_reference"],
         phone_seed=phone_seed,
         phone_profiles=telephony_profiles,
     )
-    if int(row.get("total_samples") or 0) <= 0:
+    measured_samples = int(row.get("total_samples") or 0)
+    if measured_samples <= 0 or row.get("normalized_wer") is None:
         raise ValueError(f"{key} evaluation produced no usable samples")
+    # The requested count can differ from what the split actually contains
+    # (``0`` means full test; a short split may have fewer rows). Label with
+    # the parsed total so the report never claims rows that were not evaluated.
+    row["epoch"] = meta["epoch"].format(count=measured_samples)
     return row
 
 
@@ -326,7 +378,7 @@ def run_preflight(
         telephony_use_ffmpeg=telephony_use_ffmpeg,
         eval_batch_size=eval_batch_size,
     )
-    path = preflight_path(results_dir)
+    path = preflight_path(Path(results_dir).resolve())
     if not overwrite:
         cached = load_cached_preflight(path, fingerprint)
         if cached is not None:

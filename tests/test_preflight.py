@@ -37,12 +37,52 @@ def test_fingerprint_changes_with_sample_count_and_seed():
     assert a != b and a != c
 
 
+def test_fingerprint_includes_code_hash_and_tracks_code_changes(tmp_path, monkeypatch):
+    a = build_fingerprint(dataset_name="d", split="test", sample_count=1000,
+                          phone_seed=1234, telephony_profiles=["customer"],
+                          telephony_use_ffmpeg=True, eval_batch_size=16)
+    assert isinstance(a["code_hash"], str) and len(a["code_hash"]) == 64
+
+    code = tmp_path / "evaluate.py"
+    code.write_text("v1", encoding="utf-8")
+    monkeypatch.setattr("src.preflight._CODE_HASH_FILES", (code,))
+    first = build_fingerprint(dataset_name="d", split="test", sample_count=1000,
+                              phone_seed=1234, telephony_profiles=["customer"],
+                              telephony_use_ffmpeg=True, eval_batch_size=16)
+    code.write_text("v2", encoding="utf-8")
+    second = build_fingerprint(dataset_name="d", split="test", sample_count=1000,
+                               phone_seed=1234, telephony_profiles=["customer"],
+                               telephony_use_ffmpeg=True, eval_batch_size=16)
+    assert first["code_hash"] != second["code_hash"]
+
+
 def test_cached_preflight_requires_matching_fingerprint(tmp_path):
     fp = {"sample_count": 1000, "phone_seed": 1234}
     path = tmp_path / "preflight.json"
-    path.write_text(json.dumps({"fingerprint": fp, "models": {"buzzasr_base": {}}}))
+    path.write_text(json.dumps({
+        "fingerprint": fp,
+        "models": {"buzzasr_base": {"normalized_wer": 17.2, "total_samples": 1000}},
+    }))
     assert load_cached_preflight(path, fp)["fingerprint"] == fp
     assert load_cached_preflight(path, {**fp, "phone_seed": 1}) is None
+
+
+@pytest.mark.parametrize(
+    "buzzasr",
+    [
+        {},
+        {"normalized_wer": None, "total_samples": 1000},
+        {"normalized_wer": "not-a-number", "total_samples": 1000},
+        {"normalized_wer": 17.2, "total_samples": 0},
+        {"normalized_wer": 17.2},
+        "not-a-row",
+    ],
+)
+def test_cached_preflight_rejects_malformed_buzzasr_row(tmp_path, buzzasr):
+    fp = {"sample_count": 1000}
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps({"fingerprint": fp, "models": {"buzzasr_base": buzzasr}}))
+    assert load_cached_preflight(path, fp) is None
 
 
 def test_parse_evaluation_details_extracts_clean_and_phone():
@@ -174,3 +214,48 @@ def test_run_preflight_omits_whisper_on_empty_payload(tmp_path, monkeypatch):
     assert "whisper_v3" not in result["models"]
     on_disk = json.loads(preflight_path(tmp_path).read_text())
     assert "whisper_v3" not in on_disk["models"]
+
+
+def _run_with_measured_total(tmp_path, monkeypatch, requested, measured):
+    def fake_run(cmd, check, cwd):
+        out = Path(cmd[cmd.index("--output_dir") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        payload = _fake_details(cmd[cmd.index("--base_model") + 1])
+        payload["metrics"]["total_samples"] = measured
+        (out / "evaluation_details.json").write_text(json.dumps(payload))
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    return run_preflight(results_dir=tmp_path, dataset_name="d", split="test",
+                         sample_count=requested, phone_seed=1234,
+                         telephony_profiles=["customer"], telephony_use_ffmpeg=True,
+                         eval_batch_size=16)
+
+
+def test_preflight_label_uses_parsed_count_for_full_run(tmp_path, monkeypatch):
+    result = _run_with_measured_total(tmp_path, monkeypatch, requested=0, measured=2149)
+    assert result["models"]["buzzasr_base"]["epoch"] == "BuzzASR Base (preflight, 2,149)"
+
+
+def test_preflight_label_uses_actual_short_split_count(tmp_path, monkeypatch):
+    result = _run_with_measured_total(tmp_path, monkeypatch, requested=1000, measured=873)
+    assert result["models"]["buzzasr_base"]["epoch"] == "BuzzASR Base (preflight, 873)"
+
+
+def test_run_preflight_resolves_relative_results_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    output_dirs = []
+
+    def fake_run(cmd, check, cwd):
+        out = Path(cmd[cmd.index("--output_dir") + 1])
+        output_dirs.append(out)
+        out.mkdir(parents=True, exist_ok=True)
+        payload = _fake_details(cmd[cmd.index("--base_model") + 1])
+        (out / "evaluation_details.json").write_text(json.dumps(payload))
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    run_preflight(results_dir=Path("relative-results"), dataset_name="d", split="test",
+                  sample_count=1000, phone_seed=1234,
+                  telephony_profiles=["customer"], telephony_use_ffmpeg=True,
+                  eval_batch_size=16)
+    assert output_dirs and all(path.is_absolute() for path in output_dirs)
+    assert (tmp_path / "relative-results" / "baselines" / "preflight.json").is_file()

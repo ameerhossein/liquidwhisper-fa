@@ -113,24 +113,44 @@ def collect_reports(output_dir: Path, results_dir: Path) -> Dict[str, Path]:
 
 
 def load_metrics_summary(output_dir: Path) -> Dict[str, object]:
-    """Best-effort WER summary for the model card; {} when no report yet."""
+    """Best-effort WER summary for the model card; {} when no report yet.
+
+    Null/missing metrics are omitted so the card falls back to ``n/a`` instead
+    of publishing ``None`` (deltas are deliberately null when no matching
+    baseline exists).
+    """
     try:
         rep = json.loads((output_dir / "final_evaluation_report.json").read_text(encoding="utf-8"))
         m = rep.get("final_full_test_metrics", {}) or {}
-        return {
+        summary = {
             "normalized_wer": m.get("normalized_wer"),
             "normalized_cer": m.get("normalized_cer"),
             "formal_wer": m.get("formal_wer"),
             "informal_wer": m.get("informal_wer"),
             "delta_vs_whisper_v3": m.get("delta_vs_whisper_v3"),
             "delta_vs_buzzasr_base": m.get("delta_vs_buzzasr_base"),
+            "delta_phone_vs_buzzasr_base": m.get("delta_phone_vs_buzzasr_base"),
             "total_test_samples": rep.get("total_test_samples"),
         }
+        return {key: value for key, value in summary.items() if value is not None}
     except Exception:
         return {}
 
 
 # ---------------------------------------------------------------- model card
+
+def _metric_or_na(value: object) -> object:
+    return "n/a" if value is None else value
+
+
+def _delta_or_na(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):+.2f} pp"
+    except (TypeError, ValueError):
+        return str(value)
+
 
 def build_model_card(
     kind: str,
@@ -139,8 +159,8 @@ def build_model_card(
     dataset_name: str,
     metrics: Dict[str, object],
 ) -> str:
-    wer = metrics.get("normalized_wer", "n/a")
-    cer = metrics.get("normalized_cer", "n/a")
+    wer = _metric_or_na(metrics.get("normalized_wer"))
+    cer = _metric_or_na(metrics.get("normalized_cer"))
     lines = [
         "---",
         "language: fa",
@@ -166,9 +186,13 @@ def build_model_card(
         "## Metrics (full test split, normalized)",
         "",
         f"- WER: {wer} | CER: {cer}",
-        f"- formal WER: {metrics.get('formal_wer', 'n/a')} | informal WER: {metrics.get('informal_wer', 'n/a')}",
-        f"- Δ vs Whisper Large v3: {metrics.get('delta_vs_whisper_v3', 'n/a')} | Δ vs BuzzASR base: {metrics.get('delta_vs_buzzasr_base', 'n/a')}",
-        f"- test samples: {metrics.get('total_test_samples', 'n/a')}",
+        f"- formal WER: {_metric_or_na(metrics.get('formal_wer'))} | informal WER: {_metric_or_na(metrics.get('informal_wer'))}",
+        (
+            "- Δ vs BuzzASR base: "
+            f"clean {_delta_or_na(metrics.get('delta_vs_buzzasr_base'))} | "
+            f"phone {_delta_or_na(metrics.get('delta_phone_vs_buzzasr_base'))}"
+        ),
+        f"- test samples: {_metric_or_na(metrics.get('total_test_samples'))}",
         "",
     ]
     if kind == "adapter":

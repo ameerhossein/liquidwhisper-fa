@@ -1,7 +1,7 @@
 # Automatic preflight baseline — design
 
-**Date:** 2026-10-30  
-**Status:** Approved (2026-10-30)  
+**Date:** 2026-10-30
+**Status:** Approved (2026-10-30)
 **Scope:** Run a mandatory, cached base-model benchmark before training, delete
 the hardcoded baseline values, and show measured WER deltas in the epoch matrix
 and web cockpit.
@@ -53,7 +53,8 @@ preflight:
 The preflight and epoch benchmark must use:
 
 - the same `test` split and the **first 1,000 rows** (`select(range(1000))`),
-- clean audio from the same dataset version,
+- clean audio from the same dataset rows resolved within the run (the dataset
+  revision itself is not pinned; see cache invalidation),
 - `telephony_profiles=["customer"]`,
 - the same `phone_seed` (default `1234`),
 - the same `telephony_use_ffmpeg` setting,
@@ -155,6 +156,23 @@ The BuzzASR baseline is the base model **without** the LoRA adapter.
 `configs/baselines.json` is deleted. No production module may carry fallback
 baseline metrics. The local demo may keep its own **simulated demo baseline**
 constant, clearly labeled as fake and never read by training or the server.
+
+## Cache invalidation and versioning
+
+The fingerprint automatically covers the dataset name/split/sample count,
+phone profile/seed/ffmpeg settings, eval batch size, base model ids, and a
+SHA-256 content hash of `scripts/evaluate_model.py`, `src/metrics.py`,
+`src/normalizer.py`, and `src/preflight.py`. Editing any of that evaluator or
+metric code invalidates the cache on the next run.
+
+Dataset/model revisions and model weights are **not** pinned by the
+fingerprint. When dataset content/revision or a base model's weights/revision
+changes, invalidate the cache deliberately:
+
+1. bump `PREFLIGHT_VERSION` in `src/preflight.py`;
+2. delete `results/baselines/preflight.json` (and the per-model
+   `results/baselines/preflight/` outputs), or pass `--overwrite_preflight`;
+3. let the next training run measure a fresh baseline.
 
 ## Benchmark records and deltas
 

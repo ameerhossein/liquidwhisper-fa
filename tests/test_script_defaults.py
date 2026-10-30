@@ -53,6 +53,31 @@ def test_train_lora_parser_matches_fast_l40s_defaults(monkeypatch):
     assert args.telephony_prob == 0.5
 
 
+@pytest.mark.parametrize("value", ["-1", "10001"])
+def test_preflight_samples_out_of_range_is_rejected(monkeypatch, value):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import parse_args
+
+    monkeypatch.setattr(
+        sys, "argv", ["train_lora.py", f"--preflight_samples={value}"]
+    )
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+@pytest.mark.parametrize("value", ["0", "10000"])
+def test_preflight_samples_bounds_are_accepted(monkeypatch, value):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import parse_args
+
+    monkeypatch.setattr(
+        sys, "argv", ["train_lora.py", f"--preflight_samples={value}"]
+    )
+    assert parse_args().preflight_samples == int(value)
+
+
 def test_l40s_config_matches_fast_defaults():
     import yaml
     path = ROOT / "configs" / "l40s_train_config.yaml"
@@ -76,11 +101,13 @@ def test_run_train_script_matches_fast_defaults():
         "--eval_steps 1000",
         "--save_steps 1000",
         "--max_benchmark_samples 1000",
-        "--preflight_samples 1000",
         "--telephony_prob 0.5",
         "--no-gradient_checkpointing",
     ):
         assert expected in text
+    # Preflight follows --max_benchmark_samples instead of duplicating the
+    # count, so overriding the benchmark size cannot leave a 1,000-row preflight.
+    assert "--preflight_samples" not in text
 
 
 def test_web_ui_eval_default_is_1000():

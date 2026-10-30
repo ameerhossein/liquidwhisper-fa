@@ -318,10 +318,7 @@ function updateBenchmarks(list) {
     return;
   }
 
-  const baseline =
-    list.find((r) => r.is_baseline && !r.is_reference && /BuzzASR/i.test(r.epoch || "")) ||
-    list.find((r) => r.is_baseline && !r.is_reference) ||
-    null;
+  const baseline = findBuzzBaseline(list);
   const baselineWer =
     baseline && baseline.normalized_wer != null && !isNaN(Number(baseline.normalized_wer))
       ? Number(baseline.normalized_wer)
@@ -330,15 +327,9 @@ function updateBenchmarks(list) {
     baseline && baseline.phone_normalized_wer != null && !isNaN(Number(baseline.phone_normalized_wer))
       ? Number(baseline.phone_normalized_wer)
       : null;
-  const comparable = (row) =>
-    baseline != null &&
-    baseline.total_samples != null &&
-    row.total_samples != null &&
-    row.total_samples === baseline.total_samples;
+  const comparable = (row) => benchmarkComparable(row, baseline);
 
-  const checkpoints = list.filter((r) => !r.is_baseline && r.normalized_wer != null);
-  const best = checkpoints.length ? Math.min(...checkpoints.map((r) => Number(r.normalized_wer))) : null;
-  const scaleMax = Math.max(1, ...list.map((r) => Number(r.normalized_wer) || 0)) * 1.08;
+  const { best, scaleMax } = computeBenchmarkScale(list, baseline);
   const share = (v) => `${Math.min(100, Math.max(0, (v / scaleMax) * 100)).toFixed(2)}%`;
 
   el.benchmarkTbody.innerHTML = list
@@ -350,7 +341,7 @@ function updateBenchmarks(list) {
           ? Number(row.phone_normalized_wer)
           : null;
       const isBaseline = !!row.is_baseline;
-      const isBest = !isBaseline && best !== null && hasWer && Math.abs(wer - best) < 0.001;
+      const isBest = isBestBenchmarkRow(row, best, baseline);
 
       const rowClass = isBaseline ? "is-baseline" : isBest ? "is-best" : "";
       const barClass = isBaseline ? "is-base" : isBest ? "is-best" : "";

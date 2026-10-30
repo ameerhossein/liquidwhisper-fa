@@ -33,7 +33,7 @@ try:
 except Exception:
     pass
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Mapping, Optional
 import torch
 import evaluate
 from transformers import (
@@ -143,6 +143,8 @@ def parse_args():
     # Trainer only checks this after data prep and model load.
     if args.save_steps % args.eval_steps != 0:
         parser.error(f"save_steps ({args.save_steps}) must be a multiple of eval_steps ({args.eval_steps}).")
+    if args.preflight_samples is not None and not (0 <= args.preflight_samples <= 10000):
+        parser.error("--preflight_samples must be between 0 and 10000 (0 = full test).")
     if not args.gradient_checkpointing and args.batch_size > 8:
         print("Warning: batch_size > 8 without gradient checkpointing may run out of VRAM on a 48 GB GPU.")
     return args
@@ -770,10 +772,53 @@ def main():
 
 
 def _format_delta(value: Optional[float]) -> str:
-    """Format a WER delta, or an explicit marker when no baseline matches."""
+    """Format a WER delta in percentage points, with an explicit no-baseline marker."""
     if value is None:
         return "n/a (no matching full-test baseline)"
-    return f"{value:+.2f}%"
+    return f"{value:+.2f} pp"
+
+
+def _format_epoch_delta(value: Optional[float]) -> str:
+    """Format one epoch-table delta cell (``--`` when no baseline matches)."""
+    if value is None:
+        return "--"
+    return f"{value:+.2f} pp"
+
+
+def _normalize_epoch_benchmarks(
+    epoch_benchmarks: Any,
+    baseline: Optional[Mapping[str, Any]],
+) -> list:
+    """Return report-safe epoch rows with measured, re-gated deltas.
+
+    Stored ``delta_vs_buzzasr`` fields are never trusted: older runs may carry
+    deltas against a removed hardcoded baseline. Baseline rows are included
+    only when they came from the measured preflight, and every checkpoint row's
+    deltas are recomputed against the current baseline, which yields ``None``
+    when the sample counts differ.
+    """
+    if not isinstance(epoch_benchmarks, list):
+        return []
+
+    rows = []
+    for raw in epoch_benchmarks:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("is_baseline") and raw.get("source") != "preflight":
+            continue
+        row = dict(raw)
+        if row.get("is_baseline"):
+            row["delta_vs_buzzasr"] = None
+            row["delta_phone_vs_buzzasr"] = None
+        else:
+            row.update(compute_deltas(
+                row.get("normalized_wer"),
+                row.get("phone_normalized_wer"),
+                row.get("total_samples"),
+                baseline,
+            ))
+        rows.append(row)
+    return rows
 
 
 def _run_post_training_evaluation(
@@ -996,6 +1041,10 @@ def _run_post_training_evaluation(
     )
     delta_vs_buzzasr = deltas["delta_vs_buzzasr"]
     delta_phone_vs_buzzasr = deltas["delta_phone_vs_buzzasr"]
+    # Re-gate epoch rows against the current measured baseline. Never publish
+    # stored deltas from an older run, and drop legacy baseline rows from runs
+    # before the measured preflight existed.
+    report_epoch_benchmarks = _normalize_epoch_benchmarks(epoch_benchmarks, buzz)
 
     final_report = {
         "dataset_name": dataset_name,
@@ -1022,7 +1071,7 @@ def _run_post_training_evaluation(
             "sample_count": buzz.get("total_samples"),
             "evaluated_samples": total_samples,
         },
-        "all_epoch_benchmarks": epoch_benchmarks,
+        "all_epoch_benchmarks": report_epoch_benchmarks,
         "trainer_state_summary": epoch_training_summary,
     }
 
@@ -1064,16 +1113,14 @@ def _run_post_training_evaluation(
         "",
     ]
 
-    if epoch_benchmarks:
+    if report_epoch_benchmarks:
         md_lines.append("| Epoch | Samples | Norm WER (%) | Phone WER (%) | Norm CER (%) | Formal WER (%) | Informal WER (%) | $\\Delta$ clean vs base | $\\Delta$ phone vs base |")
         md_lines.append("|---|---|---|---|---|---|---|---|---|")
-        for ep in epoch_benchmarks:
+        for ep in report_epoch_benchmarks:
             phone_wer = ep.get("phone_normalized_wer")
             phone_str = f"{phone_wer:.2f}%" if phone_wer is not None else "--"
-            clean_delta = ep.get("delta_vs_buzzasr")
-            phone_delta = ep.get("delta_phone_vs_buzzasr")
-            clean_delta_str = "--" if clean_delta is None else f"{clean_delta:+.2f}%"
-            phone_delta_str = "--" if phone_delta is None else f"{phone_delta:+.2f}%"
+            clean_delta_str = _format_epoch_delta(ep.get("delta_vs_buzzasr"))
+            phone_delta_str = _format_epoch_delta(ep.get("delta_phone_vs_buzzasr"))
             md_lines.append(
                 f"| {ep.get('epoch', 'N/A')} | {ep.get('total_samples', '-')} | "
                 f"{ep.get('normalized_wer', 0.0):.2f}% | {phone_str} | {ep.get('normalized_cer', 0.0):.2f}% | "

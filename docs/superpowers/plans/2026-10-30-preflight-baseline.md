@@ -99,16 +99,16 @@ def test_compute_deltas_requires_matching_sample_count():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`
 Expected: FAIL because `src.preflight` does not exist.
 
 - [ ] **Step 3: Implement the pure helpers in `src/preflight.py`**
 
-`build_fingerprint` returns a plain dict with every argument normalized: `preflight_version`, profiles sorted, `sample_count` and `eval_batch_size` as `int`, `telephony_use_ffmpeg` as `bool`, and the model mapping copied. `load_cached_preflight` returns the parsed dict only when `data["fingerprint"] == dict(fingerprint)` and `data["models"]["buzzasr_base"]` exists. `parse_evaluation_details` reads `payload["metrics"]` and optional `payload["phone_metrics"]`, rounds metrics to two decimals, and copies `phone_seed`/`phone_profiles`. `compute_deltas` returns `None` deltas unless `baseline["total_samples"] == total_samples`; clean delta subtracts `baseline["normalized_wer"]`, phone delta subtracts `baseline["phone_normalized_wer"]` when both are non-null.
+`build_fingerprint` returns a plain dict with every argument normalized: `preflight_version`, profiles sorted, `sample_count` and `eval_batch_size` as `int`, `telephony_use_ffmpeg` as `bool`, the model mapping copied, and `code_hash` set to a SHA-256 content hash of `scripts/evaluate_model.py`, `src/metrics.py`, `src/normalizer.py`, and `src/preflight.py` (bump `PREFLIGHT_VERSION` and clear the cache when dataset/model content changes; see the spec). `load_cached_preflight` returns the parsed dict only when `data["fingerprint"] == dict(fingerprint)` and `data["models"]["buzzasr_base"]` has a numeric `normalized_wer` and positive `total_samples`. `parse_evaluation_details` reads `payload["metrics"]` and optional `payload["phone_metrics"]`, rounds metrics to two decimals, and copies `phone_seed`/`phone_profiles`. `compute_deltas` returns `None` deltas unless `baseline["total_samples"] == total_samples`; clean delta subtracts `baseline["normalized_wer"]`, phone delta subtracts `baseline["phone_normalized_wer"]` when both are non-null.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -206,7 +206,7 @@ def test_run_preflight_omits_whisper_on_failure(tmp_path, monkeypatch):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`
 Expected: FAIL because `run_preflight` and `preflight_path` do not exist.
 
 - [ ] **Step 3: Implement `run_preflight`**
@@ -224,7 +224,7 @@ Add `--telephony_use_ffmpeg` only when true; otherwise `--no-telephony_use_ffmpe
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_preflight.py -q`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -259,12 +259,12 @@ assert args.preflight_samples is None
 assert cfg["training"]["max_benchmark_samples"] == 1000
 assert cfg["training"]["preflight_samples"] == 1000
 assert "--max_benchmark_samples 1000" in run_train_text
-assert "--preflight_samples 1000" in run_train_text
+assert "--preflight_samples" not in run_train_text  # follows the benchmark count
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_script_defaults.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_script_defaults.py -q`
 Expected: FAIL on `1000` vs the current `300`.
 
 - [ ] **Step 3: Add the flags and defaults**
@@ -278,7 +278,7 @@ parser.add_argument("--overwrite_preflight", "--overwrite-preflight",
                     action=argparse.BooleanOptionalAction, default=False)
 ```
 
-Change `--max_benchmark_samples` default to `1000`. Add `preflight_samples` and `overwrite_preflight` to `_apply_yaml_config`'s key map and boolean keys. Add `preflight_samples: 1000` to `configs/l40s_train_config.yaml` and change `max_benchmark_samples` to `1000`. Add `--max_benchmark_samples 1000` and `--preflight_samples 1000` to `run_train.sh`.
+Change `--max_benchmark_samples` default to `1000`. Add `preflight_samples` and `overwrite_preflight` to `_apply_yaml_config`'s key map and boolean keys. Add `preflight_samples: 1000` to `configs/l40s_train_config.yaml` and change `max_benchmark_samples` to `1000`. Add `--max_benchmark_samples 1000` to `run_train.sh` only; leave `--preflight_samples` unset so it follows the benchmark count.
 
 - [ ] **Step 4: Insert the preflight after data prep**
 
@@ -326,7 +326,7 @@ Remove `delta_vs_whisper`. In JSON, write `delta_vs_buzzasr_base`, `delta_phone_
 
 - [ ] **Step 6: Run the targeted tests**
 
-Run: `.venv/bin/python -m pytest tests/test_script_defaults.py tests/test_preflight.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_script_defaults.py tests/test_preflight.py -q`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -391,7 +391,7 @@ Add a third test where `results["total_samples"] == 2149` and assert both deltas
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_trainer_callbacks.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_trainer_callbacks.py -q`
 Expected: FAIL because the callback still reads `configs/baselines.json` and has no phone delta.
 
 - [ ] **Step 3: Implement the callback changes**
@@ -411,7 +411,7 @@ Remove `delta_vs_whisper`. Import `compute_deltas` from `src.preflight`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/test_trainer_callbacks.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_trainer_callbacks.py -q`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -475,7 +475,7 @@ Expose the module on the fixture (`client.mod = mod`) so the tests can call `get
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_server_train.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_server_train.py -q`
 Expected: FAIL because the server still uses `configs/baselines.json` and hardcoded rows.
 
 - [ ] **Step 3: Implement the server changes**
@@ -484,7 +484,7 @@ Delete `_HARDCODED_BASELINES` and `_load_shared_baselines`. Add `PREFLIGHT_FILE`
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/python -m pytest tests/test_server_train.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_server_train.py -q`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -534,7 +534,7 @@ def test_ui_has_no_hardcoded_baseline_fallbacks():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_web_ui_contract.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_web_ui_contract.py -q`
 Expected: FAIL on the old column labels and fallback constants.
 
 - [ ] **Step 3: Update the HTML**
@@ -561,10 +561,10 @@ Remove the two fallback constants and `findBaseline`. Add `benchmarkSubtitle` an
 
 - [ ] **Step 5: Verify syntax and run the UI contract tests**
 
-Run: `node --check server/static/app.js`  
+Run: `node --check server/static/app.js`
 Expected: no output, exit 0.
 
-Run: `.venv/bin/python -m pytest tests/test_web_ui_contract.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_web_ui_contract.py -q`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -605,7 +605,7 @@ def test_no_production_baseline_file_or_fallbacks():
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_script_defaults.py::test_no_production_baseline_file_or_fallbacks -q`  
+Run: `.venv/bin/python -m pytest tests/test_script_defaults.py::test_no_production_baseline_file_or_fallbacks -q`
 Expected: FAIL because `configs/baselines.json` still exists.
 
 - [ ] **Step 3: Remove the production baseline source**
@@ -614,7 +614,7 @@ Delete `configs/baselines.json` with `git rm`. In `scripts/demo_local.py`, repla
 
 - [ ] **Step 4: Update docs**
 
-Confirm Task 3 already set `max_benchmark_samples: 1000` and `preflight_samples: 1000` in `configs/l40s_train_config.yaml` and `run_train.sh`. Update `README.md`, `GUIDE.md`, and `PRODUCTION.md`:
+Confirm Task 3 already set `max_benchmark_samples: 1000` and `preflight_samples: 1000` in `configs/l40s_train_config.yaml`, and that `run_train.sh` passes only `--max_benchmark_samples 1000` (preflight follows it). Update `README.md`, `GUIDE.md`, and `PRODUCTION.md`:
 
 - preflight is mandatory and cached at `results/baselines/preflight.json`;
 - both preflight and epoch matrix use the first 1,000 test rows;
@@ -626,10 +626,10 @@ Confirm Task 3 already set `max_benchmark_samples: 1000` and `preflight_samples:
 
 - [ ] **Step 5: Run the no-hardcoded test and the full suite**
 
-Run: `.venv/bin/python -m pytest tests/test_script_defaults.py tests/test_normalizer_metrics.py -q`  
+Run: `.venv/bin/python -m pytest tests/test_script_defaults.py tests/test_normalizer_metrics.py -q`
 Expected: PASS.
 
-Run: `.venv/bin/python -m pytest -q`  
+Run: `.venv/bin/python -m pytest -q`
 Expected: all tests pass.
 
 - [ ] **Step 6: Commit**
@@ -645,24 +645,24 @@ git commit -m "refactor: remove hardcoded baselines; require preflight"
 
 - [ ] **Step 1: Run the full Python suite**
 
-Run: `.venv/bin/python -m pytest -q`  
+Run: `.venv/bin/python -m pytest -q`
 Expected: all tests pass.
 
 - [ ] **Step 2: Verify JS and shell syntax**
 
-Run: `node --check server/static/app.js`  
-Run: `bash -n run_train.sh`  
+Run: `node --check server/static/app.js`
+Run: `bash -n run_train.sh`
 Expected: both exit 0 with no output.
 
 - [ ] **Step 3: Verify no production baseline values remain**
 
-Run: `git grep -n "28\.5\|17\.2\|configs/baselines.json" -- src scripts server README.md GUIDE.md PRODUCTION.md configs ':!scripts/demo_local.py'`  
-Expected: no matches.
+Run: `git grep -n "28\.5\|17\.2\|configs/baselines.json" -- src scripts server configs ':!scripts/demo_local.py'`
+Expected: no matches. (Docs intentionally mention the removed `configs/baselines.json`, so the grep is scoped to production code.)
 
 - [ ] **Step 4: Inspect the final diff**
 
-Run: `git diff --check`  
-Run: `git status --short`  
+Run: `git diff --check`
+Run: `git status --short`
 Expected: clean whitespace check; only intended files changed.
 
 - [ ] **Step 5: Commit any verification fixes**

@@ -51,7 +51,6 @@ python scripts/train_lora.py \
     --eval_steps 1000 \
     --save_steps 1000 \
     --max_benchmark_samples 1000 \
-    --preflight_samples 1000 \
     --telephony_prob 0.5 \
     --no-gradient_checkpointing \
     --num_proc 4 \
