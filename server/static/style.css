@@ -391,6 +391,35 @@ th {
   background: var(--paper-deep);
 }
 
+.smoke-result {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius);
+  background: var(--paper-deep);
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.smoke-result.pass {
+  color: var(--firoozeh);
+  border-color: var(--firoozeh);
+}
+
+.smoke-result.fail {
+  color: var(--brick);
+  border-color: rgba(162, 64, 44, 0.45);
+}
+
+.smoke-result pre {
+  max-height: 220px;
+  margin: 8px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  font: 12px var(--font-mono);
+  color: var(--ink-2);
+}
+
 /* ==========================================================================
    Sections
    ========================================================================== */

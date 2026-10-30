@@ -335,3 +335,14 @@ def test_smoke_status_reports_running_after_start(client):
     assert client.post("/api/train/smoke", json={}).status_code == 200
     res = client.get("/api/train/smoke/status")
     assert res.json()["status"] == "running"
+
+
+def test_smoke_controls_are_present_in_static_ui():
+    html = (ROOT / "server" / "static" / "index.html").read_text(encoding="utf-8")
+    js = (ROOT / "server" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="btnSmoke"' in html
+    assert 'id="smokeResult"' in html
+    assert 'id="smokeStatus"' in html
+    assert 'id="smokeLog"' in html
+    assert "/api/train/smoke" in js
+    assert "/api/train/smoke/status" in js

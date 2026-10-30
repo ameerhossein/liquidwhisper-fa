@@ -24,6 +24,11 @@ const el = {
   btnStart: document.getElementById("btnStart"),
   btnStop: document.getElementById("btnStop"),
   btnFresh: document.getElementById("btnFresh"),
+  btnSmoke: document.getElementById("btnSmoke"),
+  smokeResult: document.getElementById("smokeResult"),
+  smokeStatus: document.getElementById("smokeStatus"),
+  smokeLogWrap: document.getElementById("smokeLogWrap"),
+  smokeLog: document.getElementById("smokeLog"),
   inputEpochs: document.getElementById("inputEpochs"),
   inputBatchSize: document.getElementById("inputBatchSize"),
   inputGradAccum: document.getElementById("inputGradAccum"),
@@ -44,6 +49,8 @@ let ws = null;
 let wsActive = false;
 let lossHistory = [];
 let renderedTicks = 0;
+let smokeRunning = false;
+let smokePollTimer = null;
 
 // Formatters
 
@@ -183,8 +190,9 @@ function updateTelemetry(tel) {
   el.statusDot.className = `dot dot-${state}`;
   el.statusLabel.textContent = STATE_LABELS[state];
 
-  el.btnStart.disabled = running;
-  el.btnFresh.disabled = running;
+  el.btnStart.disabled = running || smokeRunning;
+  el.btnFresh.disabled = running || smokeRunning;
+  el.btnSmoke.disabled = running || smokeRunning;
   el.btnStop.disabled = !running || state === "stopping";
 
   const gpu = tel.gpu || {};
@@ -513,6 +521,93 @@ async function fetchLogs() {
 
 // Controls
 
+function setSmokeResult(kind, text, logLines = []) {
+  el.smokeResult.hidden = kind === "idle";
+  el.smokeResult.className = `smoke-result ${kind}`;
+  el.smokeStatus.textContent = text;
+  const hasLog = logLines.length > 0;
+  el.smokeLogWrap.hidden = !hasLog;
+  el.smokeLog.textContent = hasLog ? logLines.join("\n") : "";
+  if (hasLog) el.smokeLogWrap.open = kind === "fail";
+}
+
+function scheduleSmokePoll(delay = 2000) {
+  if (smokePollTimer) clearTimeout(smokePollTimer);
+  smokePollTimer = setTimeout(pollSmokeStatus, delay);
+}
+
+async function pollSmokeStatus() {
+  if (smokePollTimer) {
+    clearTimeout(smokePollTimer);
+    smokePollTimer = null;
+  }
+  try {
+    const res = await fetch("/api/train/smoke/status");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.status === "running") {
+      smokeRunning = true;
+      setSmokeResult("running", "Smoke test running — 200 train / 50 eval samples.");
+      scheduleSmokePoll();
+      return;
+    }
+    smokeRunning = false;
+    if (data.status === "passed") {
+      setSmokeResult("pass", "Smoke test passed. Ready to start the full run.");
+    } else if (data.status === "failed") {
+      const exit = data.exit_code != null ? ` (exit ${data.exit_code})` : "";
+      setSmokeResult("fail", `Smoke test failed${exit}.`, data.log_tail || []);
+    } else {
+      setSmokeResult("idle", "");
+    }
+    pollTelemetryFallback();
+  } catch (e) {
+    smokeRunning = false;
+    setSmokeResult("fail", `Could not read smoke status: ${e}`);
+    pollTelemetryFallback();
+  }
+}
+
+async function startSmokeRun() {
+  if (smokeRunning) return;
+  smokeRunning = true;
+  el.btnSmoke.disabled = true;
+  el.btnStart.disabled = true;
+  el.btnFresh.disabled = true;
+  setSmokeResult("running", "Smoke test running — 200 train / 50 eval samples.");
+  try {
+    const res = await fetch("/api/train/smoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch_size: parseInt(el.inputBatchSize.value, 10) || 8,
+        grad_accum: parseInt(el.inputGradAccum.value, 10) || 4,
+        learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
+        gradient_checkpointing: el.inputGradCheckpoint.value === "on",
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let detail = text;
+      try {
+        const err = JSON.parse(text);
+        detail = err.detail || err.error || text || "Unknown error";
+      } catch {
+        // Keep raw text.
+      }
+      smokeRunning = false;
+      setSmokeResult("fail", `Could not start smoke test: ${detail}`);
+      pollTelemetryFallback();
+      return;
+    }
+    scheduleSmokePoll(0);
+  } catch (e) {
+    smokeRunning = false;
+    setSmokeResult("fail", `Could not start smoke test: ${e}`);
+    pollTelemetryFallback();
+  }
+}
+
 async function startRun(freshStart) {
   el.btnStart.disabled = true;
   el.btnFresh.disabled = true;
@@ -558,6 +653,7 @@ async function startRun(freshStart) {
 }
 
 el.btnStart.addEventListener("click", () => startRun(false));
+el.btnSmoke.addEventListener("click", startSmokeRun);
 
 el.btnFresh.addEventListener("click", () => {
   if (!confirm("Fresh start deletes existing checkpoints, the best adapter, reports and telemetry history before training. This cannot be undone. Continue?")) {
@@ -586,5 +682,6 @@ window.addEventListener("DOMContentLoaded", () => {
   setInterval(pollTelemetryFallback, 1000);
   fetchLogs();
   setInterval(fetchLogs, 2500);
+  pollSmokeStatus();
   new ResizeObserver(() => drawLoss()).observe(el.svgChart);
 });
