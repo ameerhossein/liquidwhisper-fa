@@ -91,7 +91,7 @@ _AMR_FALLBACK_COUNT = 0
 # Level/noise calibration fitted to the real noisy-line vs gated populations.
 MOBILE_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
 PSTN_TARGET_RMS_DB_RANGE = (-34.8, -23.5)
-CUSTOMER_TARGET_RMS_DB_RANGE = (-28.5, -21.5)
+CUSTOMER_TARGET_RMS_DB_RANGE = (-29.5, -22.5)
 # Deprecated alias for external callers that imported the gated constant.
 GATED_TARGET_RMS_DB_RANGE = CUSTOMER_TARGET_RMS_DB_RANGE
 

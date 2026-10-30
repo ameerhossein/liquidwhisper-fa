@@ -39,42 +39,16 @@
     "spec_roll95": 781.25
   },
   {
-    "group": "current_gated",
+    "group": "current_customer",
     "n": 230,
     "gated": "",
     "noisy": "",
-    "speech_rms_db": -21.62,
+    "speech_rms_db": -25.54,
     "noise_rms_db": -72.81,
-    "speech_frac": 0.62,
-    "hf_1_2k_rel_db": -27.72,
-    "hf_2_3k_rel_db": -39.84,
-    "spec_centroid": 493.2,
-    "spec_roll95": 687.5
-  },
-  {
-    "group": "current_mobile",
-    "n": 230,
-    "gated": "",
-    "noisy": "",
-    "speech_rms_db": -31.94,
-    "noise_rms_db": -52.03,
-    "speech_frac": 0.7,
-    "hf_1_2k_rel_db": -11.52,
-    "hf_2_3k_rel_db": -24.62,
-    "spec_centroid": 445.35,
-    "spec_roll95": 687.5
-  },
-  {
-    "group": "current_pstn",
-    "n": 230,
-    "gated": "",
-    "noisy": "",
-    "speech_rms_db": -31.07,
-    "noise_rms_db": -49.25,
-    "speech_frac": 0.72,
-    "hf_1_2k_rel_db": -10.63,
-    "hf_2_3k_rel_db": -21.34,
-    "spec_centroid": 448.6,
-    "spec_roll95": 718.75
+    "speech_frac": 0.65,
+    "hf_1_2k_rel_db": -14.75,
+    "hf_2_3k_rel_db": -30.38,
+    "spec_centroid": 483.21,
+    "spec_roll95": 648.44
   }
 ]

@@ -334,6 +334,29 @@ Do not add `transformers`/AST to `requirements.txt`; this is offline analysis on
 - Add the manifest CSVs and the report correction.
 - Run the validation plan and report the before/after table.
 
+## Final calibration (2026-10-30)
+
+The fitted peaking gains are:
+
+```python
+CUSTOMER_EQ_GAINS_DB = {
+    315.0: -4.46, 400.0: 3.81, 500.0: 2.49, 630.0: 0.87,
+    800.0: -0.90, 1250.0: 2.28, 1600.0: 2.46, 2000.0: -2.33,
+    2500.0: 0.91, 3150.0: -20.0,
+}
+CUSTOMER_EQ_Q_BY_BAND = {3150.0: 3.0}
+```
+
+`CUSTOMER_TARGET_RMS_DB_RANGE` was widened/shifted to `(-29.5, -22.5)` so
+the generated median lands on −25.5 dBFS (the original range produced −24.6).
+
+Final 46-voice × 5-seed medians: active speech **−25.5 dBFS**, noise floor
+**−72.8 dBFS**, centroid **483 Hz**, roll95 **648 Hz**, HF 1–2k **−14.8 dB**,
+HF 2–3.4k **−30.4 dB**, speech fraction **0.65**. The full 46-voice × 5-seed
+1/3-octave check is within ±2 dB at every band 315–3150 Hz. Listening is the
+remaining perceptual gate; the A/B kit was generated but has not been judged
+by a Persian listener yet.
+
 ## Open questions
 
 None blocking. The 9% answered quiet-noisy calls are intentionally left out of the single profile for v1; if they matter later, add a low-level noise variant rather than changing the customer default.

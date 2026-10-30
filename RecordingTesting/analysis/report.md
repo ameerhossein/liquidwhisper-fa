@@ -755,16 +755,16 @@ nearly flat 630–2500 Hz region. Final 46-voice × 3-seed fit:
 
 | Hz | Target | Before (`gated`) | After (`customer`) |
 |---:|---:|---:|---:|
-| 315 | +4.5 | +9.3 | +4.5 |
+| 315 | +4.5 | +9.3 | +4.6 |
 | 400 | +13.0 | +8.7 | +12.4 |
 | 500 | +13.0 | +9.0 | +12.2 |
 | 630 | +9.4 | +7.5 | +8.8 |
-| 800 | +3.8 | +3.2 | +3.4 |
-| 1250 | −1.7 | −3.6 | −2.1 |
+| 800 | +3.8 | +3.2 | +3.5 |
+| 1250 | −1.7 | −3.6 | −2.0 |
 | 1600 | −3.7 | −5.0 | −4.0 |
-| 2000 | −12.3 | −10.7 | −12.7 |
-| 2500 | −13.8 | −12.0 | −14.6 |
-| 3150 | −19.8 | −11.2 | −18.6 |
+| 2000 | −12.3 | −10.7 | −12.6 |
+| 2500 | −13.8 | −12.0 | −14.4 |
+| 3150 | −19.8 | −11.2 | −18.5 |
 
 All 315–3150 Hz residuals are within ±2 dB. The 3150 Hz band needs a wider
 (Q≈3) peaking filter because it sits against the 3400 Hz band edge. The
@@ -772,3 +772,13 @@ customer chain has no line-noise bed, dropouts, or AMR; `mobile` and `pstn`
 remain explicit legacy profiles only. Reproduce the fit with
 `RecordingTesting/analysis/fit_customer_eq.py` and the target with
 `answered_customer_bands.csv` / `answered_customer_manifest.csv`.
+
+
+Final multi-voice medians (46 voices × seeds 1–5): active speech **−25.5
+dBFS**, noise floor **−72.8 dBFS**, centroid **483 Hz**, roll95 **648 Hz**,
+HF 1–2k **−14.8 dB**, HF 2–3.4k **−30.4 dB**, speech fraction **0.65**. All
+primary 1/3-octave targets are within ±2 dB; the broadband HF 2–3.4k figure
+is 2.9 dB darker than its target, which is secondary to the 1/3-octave fit.
+The 125–160 Hz bands remain band-edge context and are not reproduced (the
+300 Hz high-pass is intentional). Listening is still pending; the generated
+A/B kit is the perceptual gate.
