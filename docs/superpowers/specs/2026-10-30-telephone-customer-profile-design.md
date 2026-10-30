@@ -71,11 +71,37 @@ Landline customers are **out of scope** for this profile: they are 2.6% of the O
 
 Read:
 
-- `gated` has the right noise floor, gating, A-law storage, and rolloff; it is **4 dB too loud** and **12–13 dB too dark** in the 1–3.4 kHz region.
-- `mobile` has a high-band tilt close to the target, but its level is **6 dB too quiet** and its noise floor **19 dB too noisy**. It models a noisy extension, not a customer.
-- The correct profile is therefore **gated structure + a substantially brighter 1–3.4 kHz response**, not a tuned `mobile` and not the current `gated` unchanged.
+- `gated` has the right noise floor, gating, A-law storage, and rolloff; it is **4 dB too loud**.
+- The broadband `HF 1–2k` / `HF 2–3.4k` figures look like a 12–13 dB high-band deficit, but that metric normalizes to the **0.3–1 kHz sum**, which is dominated by the low-frequency peak. The 1/3-octave loud-frame fit tells a more precise story: `gated` is already close from **630–2500 Hz**; the real gaps are low-frequency and band-edge shaping, not a uniformly dark high band.
+- `mobile` matches some broadband ratios, but it is the wrong channel on level and noise.
+- The correct profile is **gated structure + a measured 1/3-octave correction**, not a tuned `mobile` and not a uniform high-shelf boost.
 
-Centroid and rolloff are **not fit targets**. The current gated centroid (493 Hz) and roll95 (688 Hz) are already inside the answered-speech IQR (450–545 Hz, 563–1,094 Hz). A brighter high band may raise the centroid, but the EQ fit is driven by the 1/3-octave bands; if the two pull in different directions, the 1/3-octave HF fit wins.
+### 1/3-octave loud-frame target vs current gated
+
+Measured with the same `gated_spectrum_check.py` method: 67 answered customer files vs 46 clean voices × 5 seeds through the current gated chain. Values are dB relative to 1 kHz.
+
+| Hz | Target | Current `gated` | Delta (target − current) |
+|---:|---:|---:|---:|
+| 125 | −23.7 | −37.2 | **+13.5** |
+| 160 | −17.6 | −30.0 | **+12.4** |
+| 200 | −6.6 | −8.3 | +1.7 |
+| 250 | −5.4 | −3.5 | −1.9 |
+| 315 | +4.5 | +9.3 | **−4.8** |
+| 400 | +13.0 | +8.7 | **+4.3** |
+| 500 | +13.0 | +9.0 | **+4.0** |
+| 630 | +9.4 | +7.5 | +1.9 |
+| 800 | +3.8 | +3.2 | +0.6 |
+| 1000 | 0.0 | 0.0 | 0.0 |
+| 1250 | −1.7 | −3.6 | +1.9 |
+| 1600 | −3.7 | −5.0 | +1.3 |
+| 2000 | −12.3 | −10.7 | −1.6 |
+| 2500 | −13.8 | −12.0 | −1.8 |
+| 3150 | −19.8 | −11.2 | **−8.6** |
+| 4000 | −27.0 | −29.4 | +2.4 |
+
+The in-band correction is therefore: **restore low-frequency energy (125–160, 400–500 Hz), cut 315 Hz, cut 3150 Hz, and leave 630–2500 Hz nearly unchanged.** Bands below 315 Hz and at 4000 Hz are band-edge context; the primary fit is 315–3150 Hz.
+
+Centroid and rolloff are **not fit targets**. The current gated centroid (493 Hz) and roll95 (688 Hz) are already inside the answered-speech IQR (450–545 Hz, 563–1,094 Hz). The low-frequency correction and the 315/3150 cuts should move the centroid toward 459 Hz. The 1/3-octave fit is authoritative; if the broadband `hf_1_2k_rel_db`/`hf_2_3k_rel_db` figures cannot both be matched, keep the 1/3-octave fit and treat the broadband figures as secondary.
 
 ---
 
@@ -152,10 +178,10 @@ Replace the gated constants with customer equivalents:
 Do **not** hard-code a +13 dB shelf from the table. Fit the filter empirically:
 
 1. Recompute the answered-only loud-frame 1/3-octave PSD relative to 1 kHz for the 67-file calibration set.
-2. Compare to the current `simulate_customer` output on the same clean-voice set.
-3. Start from the current gated chain, remove or reduce the 4 dB low shelf at 500 Hz, and add a high shelf / 1/3-octave correction in the 1–3.4 kHz region.
-4. Iterate until the synth median is within **±2 dB per 1/3-octave band from 1–3.4 kHz** and the broadband metrics are within the target IQR.
-5. Validate on held-out voices; reject filters that overfit one speaker or sound unnaturally bright.
+2. Compare to the current `simulate_customer` output on the same clean-voice set (start with the delta table above).
+3. Start from the current gated chain. Implement a cascade of 1/3-octave peaking filters at the measured bands: **boost 400–500 Hz, cut 315 Hz, cut 3150 Hz, leave 630–2500 Hz nearly flat**. For 125–250 Hz, use a gentler high-pass or a capped low-frequency shelf if the centroid needs it; do not apply the full +13 dB below 200 Hz without listening. Do **not** add a uniform high shelf.
+4. Iterate until the synth median is within **±2 dB per 1/3-octave band from 315–3150 Hz**. The 125–250 Hz and 4000 Hz bands are secondary; the broadband `hf_1_2k_rel_db`/`hf_2_3k_rel_db` figures are secondary and may not both match.
+5. Validate on held-out voices; reject filters that overfit one speaker or sound unnaturally bright/boomy.
 
 The existing `RecordingTesting/analysis/gated_spectrum_check.py` is the starting point; it must learn a `--content-manifest` filter so music-only files are excluded.
 
@@ -192,6 +218,8 @@ Do not add `transformers`/AST to `requirements.txt`; this is offline analysis on
 - Module docstring: replace the 70/15/15 default description with the single `customer` default; document the music-contamination correction.
 - Rename `GATED_PROFILES`/`GATED_TARGET_RMS_DB_RANGE` to `CUSTOMER_*`.
 - Rename `simulate_gated` to `simulate_customer`; keep `simulate_gated` as a deprecated wrapper.
+- Add `CUSTOMER_EQ_GAINS_DB: dict[float, float]` (the 1/3-octave peaking gains) and `apply_customer_eq(wav8k, gains_db=CUSTOMER_EQ_GAINS_DB, sr=PHONE_SR) -> np.ndarray`, applied after `bandpass_narrowband` and before level calibration.
+- `simulate_customer(..., eq_gains_db: Optional[Mapping[float, float]] = None)`: `None` uses `CUSTOMER_EQ_GAINS_DB`; `{}` disables the EQ for the fit script's baseline measurement.
 - `DEFAULT_PROFILES = ("customer",)`; `DEFAULT_PROFILE_WEIGHTS = {"customer": 1.0}`.
 - `simulate_telephone`: map `customer`, `gated`, `clean` to `simulate_customer`; keep `mobile`/`pstn` branches.
 - `degrade_for_eval_profiled`: map `clean`/`gated` to `customer`; default profiles one.
@@ -271,10 +299,9 @@ Do not add `transformers`/AST to `requirements.txt`; this is offline analysis on
 1. **Target fit:** Run `multi_voice_check.py` on the 46 clean voices with `customer`. Compare medians to the 67-file target:
    - Active RMS within ±1 dB of −25.6.
    - Noise floor within ±2 dB of −71.3 **or inside the target IQR (−72.0 … −69.0)**. The current gated chain measures −72.8, which is 1.5 dB below the median and 0.8 dB below the IQR; that is acceptable for v1 and no noise source is added.
-   - HF 1–2 kHz within ±2 dB of −15.1.
-   - HF 2–3.4 kHz within ±2 dB of −27.5.
+   - HF 1–2 kHz and HF 2–3.4 kHz are **secondary**; report them, but do not chase them at the expense of the 1/3-octave fit.
    - Centroid/roll95 inside the target IQR (450–545 Hz, 563–1,094 Hz). Do not chase the medians.
-2. **Spectral fit:** Re-run the 1/3-octave loud-frame comparison on answered-only files; every band 1–3.4 kHz within ±2 dB. This is the authoritative fit.
+2. **Spectral fit (authoritative):** Re-run the 1/3-octave loud-frame comparison on answered-only files; every band **315–3150 Hz** within ±2 dB. The 125–250 Hz and 4000 Hz bands are secondary.
 3. **Format:** A-law grid fraction 1.00, 8 kHz native levels ≤256, 16 kHz output length preserved.
 4. **Gating:** Speech fraction **0.60–0.75** on the reference set. The 0.70 target is content-dependent (the real files' IQR is 0.70–0.70, not a typo); the current gated chain is 0.62 [0.53–0.68] on 46 voices, and retuning the gate is **not** part of this change. No gate clicks (boundary discontinuity no worse than the real answered files).
 5. **Determinism:** Same seed → identical output; different seeds → expected variation.
@@ -291,7 +318,7 @@ Do not add `transformers`/AST to `requirements.txt`; this is offline analysis on
 |---|---|
 | 67-file calibration set is small / one call centre | Use the in-repo 36 mobile + Outside 31 mobile; validate on held-out days/voices; target medians and IQRs, not exact curves. |
 | AST labels are model-derived and may mislabel some speech/music | Spot-check 20 files by listening; keep the manifest editable; do not use labels at runtime. |
-| A +13 dB high-band correction sounds unnatural | Fit 1/3-octave gains, cap individual shelf gains, validate with multi-voice and listening. |
+| A large low-frequency correction (125–160 Hz) sounds boomy, or a 3150 Hz cut sounds dull | Cap individual peaking gains, treat 125–250 Hz as secondary, validate with multi-voice and listening; keep 630–2500 Hz nearly unchanged. |
 | Level range too wide/narrow | Start with the target IQR; tighten if the generated level distribution is too spread. |
 | Existing reports/tests assume 70/15/15 | Update in the same change; keep legacy explicit profiles for old analyses. |
 | `gated` alias hides the semantic change | Document that `gated` now means the recalibrated customer chain; update docs and report. |
