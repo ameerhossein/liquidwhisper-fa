@@ -51,13 +51,13 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--phone_eval", "--phone-eval", action=argparse.BooleanOptionalAction, default=True, help="Also evaluate on phone-simulated copy (gated/MCI/Irancell/TCI) for dual clean+phone report")
     parser.add_argument("--phone_seed", type=int, default=1234, help="Deterministic seed for phone-simulated eval")
-    parser.add_argument("--telephony_profiles", type=str, default="gated,mobile,pstn", help="Comma-separated phone profiles for eval")
+    parser.add_argument("--telephony_profiles", type=str, default="customer", help="Comma-separated phone profiles for eval (default: customer; legacy gated,mobile,pstn accepted)")
     parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB codec in phone eval when available; G.711 A-law storage is always exact")
     return parser.parse_args()
 
 
 def _parse_profiles(value: str):
-    return [p.strip() for p in str(value or "").split(",") if p.strip()] or ["gated", "mobile", "pstn"]
+    return [p.strip() for p in str(value or "").split(",") if p.strip()] or ["customer"]
 
 
 def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
