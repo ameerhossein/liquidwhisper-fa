@@ -6,6 +6,7 @@ records the command instead. Benchmark tests only read files under tmp_path.
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -155,3 +156,76 @@ def test_benchmark_fallback_rows_are_tagged_preflight(client, tmp_path, monkeypa
     persisted = json.loads(bench.read_text())
     assert persisted and all(r["source"] == "preflight" for r in persisted)
     assert client.get("/api/benchmarks").json() == rows
+
+
+def _write_smoke_attempt(client, *, exit_code=None, adapter=True, log_lines=()):
+    out = Path(client.mod._smoke_output_dir())
+    if adapter:
+        adapter_dir = out / "best_adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    client.mod.SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    client.mod.SMOKE_ATTEMPT_FILE.write_text("{}", encoding="utf-8")
+    client.mod.smoke_last_exit_code = exit_code
+    if log_lines:
+        client.mod.SMOKE_LOG_FILE.write_text("\n".join(log_lines), encoding="utf-8")
+
+
+def test_smoke_status_is_idle_before_any_attempt(client):
+    res = client.get("/api/train/smoke/status")
+    assert res.status_code == 200
+    assert res.json()["status"] == "idle"
+
+
+def test_smoke_status_reports_running_from_live_pid(client):
+    client.mod.SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    client.mod.SMOKE_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    res = client.get("/api/train/smoke/status")
+    assert res.status_code == 200
+    assert res.json()["status"] == "running"
+    assert res.json()["running"] is True
+
+
+def test_smoke_status_passes_on_zero_exit_and_adapter(client):
+    _write_smoke_attempt(client, exit_code=0, adapter=True)
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "passed"
+    assert res.json()["adapter_exists"] is True
+
+
+def test_smoke_status_passes_after_restart_when_adapter_exists(client):
+    _write_smoke_attempt(client, exit_code=None, adapter=True)
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "passed"
+
+
+def test_smoke_status_fails_on_nonzero_exit_even_with_adapter(client):
+    _write_smoke_attempt(client, exit_code=1, adapter=True)
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "failed"
+    assert res.json()["exit_code"] == 1
+
+
+def test_smoke_status_fails_when_adapter_is_missing(client):
+    _write_smoke_attempt(client, exit_code=0, adapter=False)
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "failed"
+    assert res.json()["adapter_exists"] is False
+
+
+def test_smoke_status_fails_when_attempt_has_no_result(client):
+    _write_smoke_attempt(client, exit_code=None, adapter=False)
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "failed"
+
+
+def test_smoke_status_includes_log_tail_on_failure(client):
+    _write_smoke_attempt(
+        client,
+        exit_code=1,
+        adapter=False,
+        log_lines=["loading model", "RuntimeError: out of memory"],
+    )
+    res = client.get("/api/train/smoke/status")
+    assert res.json()["status"] == "failed"
+    assert res.json()["log_tail"][-1] == "RuntimeError: out of memory"

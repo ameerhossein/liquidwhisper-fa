@@ -94,6 +94,14 @@ connected_websockets: List[WebSocket] = []
 PID_FILE = RESULTS_DIR / "training.pid"
 last_exit_code: Optional[int] = None
 halt_requested = False
+SMOKE_DIR_NAME = "smoke-test"
+SMOKE_RESULTS_DIR = RESULTS_DIR / SMOKE_DIR_NAME
+SMOKE_LOG_FILE = SMOKE_RESULTS_DIR / "training_live.log"
+SMOKE_PID_FILE = SMOKE_RESULTS_DIR / "training.pid"
+SMOKE_ATTEMPT_FILE = SMOKE_RESULTS_DIR / "smoke_attempt.json"
+smoke_process: Optional[subprocess.Popen] = None
+smoke_log_fd = None
+smoke_last_exit_code: Optional[int] = None
 ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
@@ -190,6 +198,66 @@ def _training_running() -> bool:
     except Exception:
         pass
     return False
+
+
+def _abs_output_path(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else BASE_DIR / p
+
+
+def _smoke_output_dir() -> str:
+    base = Path(_default_output_dir())
+    return _sanitize_output_dir(str(base.parent / SMOKE_DIR_NAME))
+
+
+def _close_smoke_log_fd() -> None:
+    global smoke_log_fd
+    try:
+        if smoke_log_fd is not None:
+            try:
+                smoke_log_fd.flush()
+            except Exception:
+                pass
+            try:
+                smoke_log_fd.close()
+            except Exception:
+                pass
+    finally:
+        smoke_log_fd = None
+
+
+def _smoke_running() -> bool:
+    global smoke_process, smoke_last_exit_code
+    if smoke_process is not None:
+        code = smoke_process.poll()
+        if code is None:
+            return True
+        smoke_last_exit_code = code
+        smoke_process = None
+        _close_smoke_log_fd()
+        try:
+            SMOKE_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        if SMOKE_PID_FILE.exists():
+            pid = int(SMOKE_PID_FILE.read_text(encoding="utf-8").strip() or "0")
+            if _is_process_running(pid):
+                return True
+            SMOKE_PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return False
+
+
+def _read_log_tail(path: Path, tail: int = 30) -> List[str]:
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [line.rstrip() for line in f.readlines()[-tail:]]
+    except Exception:
+        return []
 
 
 def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any]:
@@ -405,6 +473,42 @@ async def get_status():
     telemetry["process_running"] = is_running
     telemetry["gpu"] = telemetry.get("gpu") or get_gpu_info()
     return telemetry
+
+
+@app.get("/api/train/smoke/status")
+async def get_smoke_status():
+    running = _smoke_running()
+    try:
+        output_dir = _smoke_output_dir()
+        adapter_exists = (
+            _abs_output_path(output_dir) / "best_adapter" / "adapter_config.json"
+        ).is_file()
+    except Exception:
+        output_dir = ""
+        adapter_exists = False
+
+    attempt_exists = SMOKE_ATTEMPT_FILE.is_file()
+    if running:
+        status = "running"
+    elif not attempt_exists:
+        status = "idle"
+    elif smoke_last_exit_code == 0 and adapter_exists:
+        status = "passed"
+    elif smoke_last_exit_code is None and adapter_exists:
+        status = "passed"
+    else:
+        status = "failed"
+
+    payload: Dict[str, Any] = {
+        "status": status,
+        "running": running,
+        "exit_code": smoke_last_exit_code,
+        "output_dir": output_dir,
+        "adapter_exists": adapter_exists,
+    }
+    if status == "failed":
+        payload["log_tail"] = _read_log_tail(SMOKE_LOG_FILE)
+    return payload
 
 
 def _drop_stale_baselines(rows: Any) -> List[Dict[str, Any]]:
