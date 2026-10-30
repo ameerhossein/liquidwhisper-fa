@@ -119,3 +119,39 @@ def test_benchmarks_endpoint_drops_unmeasured_baselines(client, tmp_path, monkey
     rows = client.get("/api/benchmarks").json()
     assert not any(r.get("is_baseline") for r in rows)
     assert any(r.get("epoch") == "Epoch 1" for r in rows)
+
+
+def test_websocket_drops_unmeasured_baselines(client, tmp_path, monkeypatch):
+    bench = tmp_path / "epoch_benchmarks.json"
+    bench.write_text(json.dumps([
+        {"epoch": "Old hardcoded base", "is_baseline": True, "normalized_wer": 17.2},
+        {"epoch": "Epoch 1", "is_baseline": False, "normalized_wer": 15.0},
+    ]))
+    monkeypatch.setattr(client.mod, "BENCHMARKS_FILE", bench)
+    monkeypatch.setattr(client.mod, "get_gpu_info", lambda: {})
+    with client.websocket_connect("/ws/live") as ws:
+        payload = ws.receive_json()
+    rows = payload["benchmarks"]
+    assert not any(r.get("is_baseline") for r in rows)
+    assert any(r.get("epoch") == "Epoch 1" for r in rows)
+
+
+def test_benchmark_fallback_rows_are_tagged_preflight(client, tmp_path, monkeypatch):
+    bench = tmp_path / "epoch_benchmarks.json"
+    bench.write_text(json.dumps([
+        {"epoch": "Old hardcoded base", "is_baseline": True, "normalized_wer": 17.2},
+    ]))
+    preflight = tmp_path / "baselines" / "preflight.json"
+    preflight.parent.mkdir(parents=True)
+    preflight.write_text(json.dumps({"models": {
+        "buzzasr_base": {"epoch": "BuzzASR Base (preflight, 1,000)",
+                         "total_samples": 1000, "normalized_wer": 17.2,
+                         "phone_normalized_wer": 24.1},
+    }}))
+    monkeypatch.setattr(client.mod, "BENCHMARKS_FILE", bench)
+    monkeypatch.setattr(client.mod, "PREFLIGHT_FILE", preflight)
+    rows = client.get("/api/benchmarks").json()
+    assert rows and rows[0]["source"] == "preflight"
+    persisted = json.loads(bench.read_text())
+    assert persisted and all(r["source"] == "preflight" for r in persisted)
+    assert client.get("/api/benchmarks").json() == rows

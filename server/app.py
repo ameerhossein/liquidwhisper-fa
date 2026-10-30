@@ -114,13 +114,18 @@ def _load_preflight_benchmarks() -> List[Dict[str, Any]]:
         row = models.get(key)
         if not isinstance(row, dict) or not row:
             continue
-        rows.append({
+        merged = {
             "epoch_number": 0,
             "type": "baseline",
             "is_baseline": True,
             "canary_transcriptions": [],
             **row,
-        })
+        }
+        # The cache is the measured preflight by definition; force the source
+        # so a row can never be mistaken for a legacy hardcoded baseline and
+        # filtered out on the next read.
+        merged["source"] = "preflight"
+        rows.append(merged)
     return rows
 
 
@@ -402,23 +407,39 @@ async def get_status():
     return telemetry
 
 
+def _drop_stale_baselines(rows: Any) -> List[Dict[str, Any]]:
+    """Keep every row except legacy baselines with no measured preflight source.
+
+    Old hardcoded/config rows are ``is_baseline`` but carry no ``source``;
+    showing them would present numbers we cannot reproduce.
+    """
+    if not isinstance(rows, list):
+        return []
+    return [
+        row for row in rows
+        if not (
+            isinstance(row, dict)
+            and row.get("is_baseline")
+            and row.get("source") != "preflight"
+        )
+    ]
+
+
+def _get_benchmark_rows(*, persist_defaults: bool = False) -> List[Dict[str, Any]]:
+    """Return benchmark rows shared by the REST endpoint and the live socket."""
+    rows = _drop_stale_baselines(read_json_safely(BENCHMARKS_FILE, None))
+    if rows:
+        return rows
+    rows = get_default_benchmarks()
+    if rows and persist_defaults:
+        with open(BENCHMARKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+    return rows
+
+
 @app.get("/api/benchmarks")
 async def get_benchmarks():
-    data = read_json_safely(BENCHMARKS_FILE, None)
-    if isinstance(data, list) and data:
-        # Drop legacy baseline rows that carry no measured preflight source
-        # (old hardcoded/config rows would show numbers we cannot reproduce).
-        filtered = [
-            row for row in data
-            if not (isinstance(row, dict) and row.get("is_baseline") and row.get("source") != "preflight")
-        ]
-        if filtered:
-            return filtered
-    data = get_default_benchmarks()
-    if data:
-        with open(BENCHMARKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    return data
+    return _get_benchmark_rows(persist_defaults=True)
 
 
 @app.get("/api/loss-history")
@@ -652,7 +673,7 @@ async def websocket_telemetry(websocket: WebSocket):
         while True:
             # Poll status, telemetry and send to client (1s cadence to save bandwidth)
             telemetry = read_json_safely(TELEMETRY_FILE, {})
-            benchmarks = read_json_safely(BENCHMARKS_FILE, get_default_benchmarks())
+            benchmarks = _get_benchmark_rows()
             loss_hist = read_json_safely(LOSS_HISTORY_FILE, [])
 
             is_running = _training_running()
