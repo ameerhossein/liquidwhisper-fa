@@ -63,8 +63,9 @@ from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding
 from src.data import PersianASRDataPipeline, persian_label_ids
 from src.trainer_callbacks import WebTelemetryCallback, _resolve_infer_dtype, _should_autocast
-from src.preflight import compute_deltas, run_preflight
+from src.preflight import compute_deltas, preflight_path, run_preflight
 from src import paths as _managed_paths
+from src import run_state
 
 
 def _default_output_dir() -> str:
@@ -90,6 +91,7 @@ def parse_args():
     parser.add_argument("--dataset_name", type=str, default="shekar-ai/Neyshekar", help="Dataset identifier")
     parser.add_argument("--output_dir", type=str, default=_default_output_dir(), help="Output directory for checkpoints (default: /workspace/... on RunPod, else outputs/...)")
     parser.add_argument("--results_dir", type=str, default=None, help="Telemetry/benchmark directory (default: /workspace/stt-outputs/results on RunPod, else results/). Env ASR_RESULTS_DIR also works.")
+    parser.add_argument("--run_dir", type=str, default=None, help="Persistent run directory for the cockpit/CLI run ledger (optional).")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Limit train samples (smoke test)")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Limit eval samples")
 
@@ -118,7 +120,10 @@ def parse_args():
                         help="Preflight rows; default follows --max_benchmark_samples (0 = full test).")
     parser.add_argument("--overwrite_preflight", "--overwrite-preflight",
                         action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--preflight_cache_dir", type=str, default=None,
+                        help="Shared fingerprint-keyed preflight cache directory (default: results_dir).")
     parser.add_argument("--run_post_test_eval", "--run-post-test-eval", action=argparse.BooleanOptionalAction, default=True, help="Run full test evaluation on best model post-training and save report")
+    parser.add_argument("--post_eval_only", action=argparse.BooleanOptionalAction, default=False, help="Run only the post-training evaluation from the existing adapter (cockpit resume).")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
     parser.add_argument("--telephony_prob", type=float, default=0.5, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed default).")
@@ -337,6 +342,75 @@ def _resolve_output_dir(raw: str) -> str:
     return _managed_paths.resolve_output_dir(raw)
 
 
+def _json_safe(value):
+    """Return an argparse value that ``json.dump`` can serialize."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _copy_preflight_to_run(run_dir: Path, cache_dir: Path) -> Path:
+    """Copy the shared preflight cache into the run for provenance."""
+    return run_state.write_preflight_copy(
+        Path(run_dir), preflight_path(Path(cache_dir))
+    )
+
+
+def _mark_run_stage(
+    run_dir: Optional[str | Path],
+    name: str,
+    status: str,
+    detail: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Record one stage transition, or no-op for a plain CLI run."""
+    if not run_dir:
+        return None
+    return run_state.set_stage(run_dir, name, status, detail=detail)
+
+
+def _mark_run_status(
+    run_dir: Optional[str | Path], status: str, **fields: Any
+) -> Optional[Dict[str, Any]]:
+    """Record the overall run status, or no-op for a plain CLI run."""
+    if not run_dir:
+        return None
+    return run_state.set_status(run_dir, status, **fields)
+
+
+def _record_trainer_args(run_dir, args) -> Optional[Dict[str, Any]]:
+    """Persist the full effective argparse namespace on ``run.json``."""
+    if not run_dir:
+        return None
+    raw = dict(args) if isinstance(args, Mapping) else vars(args)
+    trainer_args = {str(key): _json_safe(value) for key, value in raw.items()}
+    return run_state.update_run(
+        run_dir, lambda run: {**run, "trainer_args": trainer_args}
+    )
+
+
+def _halt_run(run_dir, results_dir: str, stage: str) -> None:
+    """Mark a cooperative halt: the active stage stops and later stages skip."""
+    try:
+        index = run_state.STAGES.index(stage)
+    except ValueError:
+        index = 0
+    for later in run_state.STAGES[index + 1:]:
+        _mark_run_stage(run_dir, later, "skipped")
+    # Mark the halted stage last so current_stage points at what was stopped.
+    _mark_run_stage(run_dir, stage, "stopped", detail="halt requested")
+    _mark_run_status(run_dir, "stopped")
+    try:
+        os.remove(os.path.join(results_dir, "stop_training.signal"))
+    except OSError:
+        pass
+
+
 def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) -> None:
     """Delete prior run state so --fresh_start truly starts clean.
 
@@ -377,12 +451,14 @@ def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) ->
     except Exception as e:
         print(f"Warning: fresh-start output cleanup failed: {e}")
     try:
-        for name in ("loss_history.json",):
-            # NOTE: do NOT delete live_telemetry.json / training_live.log here.
-            # The web server creates both for the *current* run just before
-            # spawning this trainer; deleting them orphans the server's open
-            # log fd (stdout goes to an unlinked inode) so /api/logs reports
-            # "Log buffer empty" while training is actually running.
+        for name in ("loss_history.json", "steps.jsonl", "events.jsonl"):
+            # steps/events belong to the run ledger; a fresh CLI run must not
+            # append to an old run's history. NOTE: do NOT delete
+            # live_telemetry.json / training_live.log here. The web server
+            # creates both for the *current* run just before spawning this
+            # trainer; deleting them orphans the server's open log fd (stdout
+            # goes to an unlinked inode) so /api/logs reports "Log buffer
+            # empty" while training is actually running.
             try:
                 t = rdir / name
                 if t.is_file():
@@ -460,6 +536,19 @@ def main():
     if bool(getattr(args, "fresh_start", False)):
         _clear_previous_state(args.output_dir, results_dir=args.results_dir)
 
+    run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
+    if run_dir is not None:
+        # Persist the full effective namespace before any stage work so Resume
+        # can recreate the exact LoRA/scheduler/telephony settings.
+        _record_trainer_args(run_dir, args)
+        _mark_run_status(run_dir, "running")
+
+    stop_signal = os.path.join(args.results_dir, "stop_training.signal")
+    if os.path.exists(stop_signal):
+        print("Stop signal found before data preparation; halting run.")
+        _halt_run(run_dir, args.results_dir, "preflight")
+        return
+
     print("=======================================================")
     print(" Persian ASR Fine-Tuning: BuzzASR + Neyshekar LoRA")
     print(f" Base Model:      {args.base_model}")
@@ -473,110 +562,162 @@ def main():
     print(f" Preprocess procs:{args.num_proc}")
     print("=======================================================\n")
 
-    # 1. Load Processor (CPU-only; safe before fork).
-    print(f"Loading processor for '{args.base_model}'...")
-    processor = WhisperProcessor.from_pretrained(args.base_model)
-    normalizer = PersianTextNormalizer()
-
-    # 2. Prepare Data BEFORE any CUDA init / model load.
-    # datasets.map(num_proc>1) forks workers. Forking after CUDA init or with
-    # the multi-GB model resident deadlocks/bloats workers (observed: 4 forked
-    # workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58244).
-    # Feature extraction + tokenization need only the processor, so prep runs
-    # first (train gets phone augmentation, eval stays clean).
-    label_prefix_ids, label_eos_id = _label_format(args.base_model)
-    train_pipeline = PersianASRDataPipeline(
-        processor=processor,
-        dataset_name=args.dataset_name,
-        normalizer=normalizer,
-        num_proc=args.num_proc,
-        telephony_prob=float(getattr(args, "telephony_prob", 0.0) or 0.0),
-        telephony_profiles=args.telephony_profiles,
-        telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
-        telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
-        label_prefix_ids=label_prefix_ids,
-        label_eos_id=label_eos_id,
-    )
-    eval_pipeline = PersianASRDataPipeline(
-        processor=processor,
-        dataset_name=args.dataset_name,
-        normalizer=normalizer,
-        num_proc=args.num_proc,
-        telephony_prob=0.0,
-        label_prefix_ids=label_prefix_ids,
-        label_eos_id=label_eos_id,
-    )
-
-    # HF cache was routed to the big disk at import time (see top of file,
-    # src/cache.py). Re-log here since output_dir/results are set up by now;
-    # checkpoints stay on /workspace (persistent), caches stay ephemeral.
+    # The preflight stage owns pre-training setup (processor, dataset
+    # preparation, cached feature loads). A failure here must be attributed to
+    # this stage rather than leaving the run with no responsible stage.
+    _mark_run_stage(run_dir, "preflight", "running", detail="preparing datasets")
     try:
-        from src.cache import log_cache_space as _log_cache_space
+        # 1. Load Processor (CPU-only; safe before fork).
+        print(f"Loading processor for '{args.base_model}'...")
+        processor = WhisperProcessor.from_pretrained(args.base_model)
+        normalizer = PersianTextNormalizer()
 
-        _log_cache_space("HF cache")
-    except Exception:
-        pass
+        # 2. Prepare Data BEFORE any CUDA init / model load.
+        # datasets.map(num_proc>1) forks workers. Forking after CUDA init or
+        # with the multi-GB model resident deadlocks/bloats workers (observed: 4
+        # forked workers stuck at 0% CPU, ~5GB RSS each, bar frozen at 0/58244).
+        # Feature extraction + tokenization need only the processor, so prep
+        # runs first (train gets phone augmentation, eval stays clean).
+        label_prefix_ids, label_eos_id = _label_format(args.base_model)
+        train_pipeline = PersianASRDataPipeline(
+            processor=processor,
+            dataset_name=args.dataset_name,
+            normalizer=normalizer,
+            num_proc=args.num_proc,
+            telephony_prob=float(getattr(args, "telephony_prob", 0.0) or 0.0),
+            telephony_profiles=args.telephony_profiles,
+            telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
+            telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+            label_prefix_ids=label_prefix_ids,
+            label_eos_id=label_eos_id,
+        )
+        eval_pipeline = PersianASRDataPipeline(
+            processor=processor,
+            dataset_name=args.dataset_name,
+            normalizer=normalizer,
+            num_proc=args.num_proc,
+            telephony_prob=0.0,
+            label_prefix_ids=label_prefix_ids,
+            label_eos_id=label_eos_id,
+        )
 
-    raw_train = None
-    raw_eval = None
-    raw_test = None
-    train_dataset = None
-    eval_dataset = None
-    prep_cache_dir = (getattr(args, "prep_cache_dir", None) or "").strip() or _default_prep_cache_dir(args.output_dir)
-    reuse_prep = bool(getattr(args, "reuse_prep", True))
-    overwrite_prep = bool(getattr(args, "overwrite_prep_cache", False))
-    print(f" Prep Cache Dir:  {prep_cache_dir} (reuse={reuse_prep}, overwrite={overwrite_prep})")
-    try:
-        os.makedirs(prep_cache_dir, exist_ok=True)
-    except Exception:
-        pass
-    train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), float(getattr(args, "telephony_prob", 0.0) or 0.0))
-    eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), 0.0)
-    if reuse_prep and not overwrite_prep:
-        train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
-        eval_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "validation"), eval_fp)
-        if train_dataset is not None and float(getattr(args, "telephony_prob", 0.0) or 0.0) > 0:
-            print("Note: reused train prep freezes phone augmentation to the cached draw; "
-                  "use --overwrite_prep_cache for a fresh random draw.")
-    need_train = train_dataset is None
-    need_eval = eval_dataset is None
+        # HF cache was routed to the big disk at import time (see top of file,
+        # src/cache.py). Re-log here since output_dir/results are set up by
+        # now; checkpoints stay on /workspace (persistent), caches ephemeral.
+        try:
+            from src.cache import log_cache_space as _log_cache_space
 
-    if need_train or need_eval or args.run_epoch_benchmark:
-        raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples) if need_train else None
-        raw_eval = eval_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples) if need_eval else None
-        if args.run_epoch_benchmark:
-            print("Loading full test benchmark split for end-of-epoch evaluation...")
-            raw_test = eval_pipeline.load_raw_dataset(split="test")
+            _log_cache_space("HF cache")
+        except Exception:
+            pass
 
-    if need_train:
-        assert raw_train is not None
-        train_dataset = train_pipeline.prepare_dataset_split(raw_train)
-        _save_prep_cache(train_dataset, os.path.join(prep_cache_dir, "train"), train_fp)
-    if need_eval:
-        assert raw_eval is not None
-        eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
-        _save_prep_cache(eval_dataset, os.path.join(prep_cache_dir, "validation"), eval_fp)
-    assert train_dataset is not None and eval_dataset is not None
+        raw_train = None
+        raw_eval = None
+        raw_test = None
+        train_dataset = None
+        eval_dataset = None
+        prep_cache_dir = (getattr(args, "prep_cache_dir", None) or "").strip() or _default_prep_cache_dir(args.output_dir)
+        reuse_prep = bool(getattr(args, "reuse_prep", True))
+        overwrite_prep = bool(getattr(args, "overwrite_prep_cache", False))
+        print(f" Prep Cache Dir:  {prep_cache_dir} (reuse={reuse_prep}, overwrite={overwrite_prep})")
+        try:
+            os.makedirs(prep_cache_dir, exist_ok=True)
+        except Exception:
+            pass
+        train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), float(getattr(args, "telephony_prob", 0.0) or 0.0))
+        eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), 0.0)
+        if reuse_prep and not overwrite_prep:
+            train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
+            eval_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "validation"), eval_fp)
+            if train_dataset is not None and float(getattr(args, "telephony_prob", 0.0) or 0.0) > 0:
+                print("Note: reused train prep freezes phone augmentation to the cached draw; "
+                      "use --overwrite_prep_cache for a fresh random draw.")
+        need_train = train_dataset is None
+        need_eval = eval_dataset is None
+
+        if need_train or need_eval or args.run_epoch_benchmark:
+            raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples) if need_train else None
+            raw_eval = eval_pipeline.load_raw_dataset(split="validation", max_samples=args.max_eval_samples) if need_eval else None
+            if args.run_epoch_benchmark:
+                print("Loading full test benchmark split for end-of-epoch evaluation...")
+                raw_test = eval_pipeline.load_raw_dataset(split="test")
+
+        if need_train:
+            assert raw_train is not None
+            train_dataset = train_pipeline.prepare_dataset_split(raw_train)
+            _save_prep_cache(train_dataset, os.path.join(prep_cache_dir, "train"), train_fp)
+        if need_eval:
+            assert raw_eval is not None
+            eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
+            _save_prep_cache(eval_dataset, os.path.join(prep_cache_dir, "validation"), eval_fp)
+        assert train_dataset is not None and eval_dataset is not None
+    except Exception as exc:
+        print(f"Preflight data preparation failed: {exc}", file=sys.stderr)
+        _mark_run_stage(run_dir, "preflight", "failed",
+                        detail=f"data preparation failed: {exc}")
+        _mark_run_status(run_dir, "failed", failed_stage="preflight",
+                         last_error=str(exc))
+        raise
 
     # Mandatory measured baseline: reuse a matching cache or evaluate BuzzASR
     # (and Whisper) on exactly the same rows the epoch benchmark will use.
     # Runs after datasets.map prep and before the model/CUDA load so the
     # subprocess evaluation sees an idle GPU.
+    _mark_run_stage(run_dir, "preflight", "running", detail="measuring baseline")
     preflight_count = args.preflight_samples
     if preflight_count is None:
         preflight_count = args.max_benchmark_samples
-    preflight = run_preflight(
-        results_dir=Path(args.results_dir),
-        dataset_name=args.dataset_name,
-        split="test",
-        sample_count=int(preflight_count or 0),
-        phone_seed=int(args.phone_seed),
-        telephony_profiles=args.telephony_profiles,
-        telephony_use_ffmpeg=bool(args.telephony_use_ffmpeg),
-        eval_batch_size=int(args.eval_batch_size),
-        overwrite=bool(args.overwrite_preflight),
+    cache_dir = (
+        Path(args.preflight_cache_dir)
+        if getattr(args, "preflight_cache_dir", None)
+        else Path(args.results_dir)
     )
-    baseline_benchmark = preflight["models"]
+    try:
+        preflight = run_preflight(
+            results_dir=Path(args.results_dir),
+            cache_dir=cache_dir,
+            dataset_name=args.dataset_name,
+            split="test",
+            sample_count=int(preflight_count or 0),
+            phone_seed=int(args.phone_seed),
+            telephony_profiles=args.telephony_profiles,
+            telephony_use_ffmpeg=bool(args.telephony_use_ffmpeg),
+            eval_batch_size=int(args.eval_batch_size),
+            overwrite=bool(args.overwrite_preflight),
+            should_stop=lambda: os.path.exists(stop_signal),
+        )
+        if run_dir is not None:
+            _copy_preflight_to_run(run_dir, cache_dir)
+    except RuntimeError as exc:
+        if str(exc) == "halt requested":
+            print("Stop signal received during preflight; halting run.")
+            _halt_run(run_dir, args.results_dir, "preflight")
+            return
+        _mark_run_stage(run_dir, "preflight", "failed",
+                        detail=f"baseline measurement failed: {exc}")
+        _mark_run_status(run_dir, "failed", failed_stage="preflight",
+                         last_error=str(exc))
+        raise
+    except Exception as exc:
+        _mark_run_stage(run_dir, "preflight", "failed",
+                        detail=f"baseline measurement failed: {exc}")
+        _mark_run_status(run_dir, "failed", failed_stage="preflight",
+                         last_error=str(exc))
+        raise
+
+    baseline_models = preflight.get("models") or {}
+    measured_samples = int(
+        (baseline_models.get("buzzasr_base") or {}).get("total_samples")
+        or preflight_count
+        or 0
+    )
+    _mark_run_stage(
+        run_dir,
+        "preflight",
+        "completed",
+        detail=("cache hit" if preflight.get("cached") else f"measured, n={measured_samples}"),
+    )
+    baseline_benchmark = baseline_models
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -633,6 +774,7 @@ def main():
     metrics_calculator = ASRMetricsCalculator(normalizer=normalizer)
 
     callbacks = []
+    telemetry_cb = None
     if args.enable_telemetry:
         telemetry_cb = WebTelemetryCallback(
             output_dir=args.output_dir,
@@ -742,7 +884,22 @@ def main():
         print(f"\nResuming training from: {resume_ckpt}")
     else:
         print("\nStarting training loop (fresh)...")
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    _mark_run_stage(run_dir, "training", "running")
+    try:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+    except Exception as exc:
+        _mark_run_stage(run_dir, "training", "failed",
+                        detail=f"training failed: {exc}")
+        _mark_run_status(run_dir, "failed", failed_stage="training",
+                         last_error=str(exc))
+        raise
+
+    halted = bool(telemetry_cb is not None and getattr(telemetry_cb, "halt_requested", False))
+    if halted:
+        print("\nTraining halted by user request; skipping post-training evaluation.")
+        _halt_run(run_dir, args.results_dir, "training")
+    else:
+        _mark_run_stage(run_dir, "training", "completed")
 
     # 10. Save Best Adapter & Processor
     best_save_path = os.path.join(args.output_dir, "best_adapter")
@@ -751,27 +908,45 @@ def main():
     processor.save_pretrained(best_save_path)
     print("Done saving best adapter.")
 
+    if halted:
+        return
+
     # 11. Run Full Post-Training Test Benchmark & Generate Final Report
     if args.run_post_test_eval:
         print("\n=======================================================")
         print(" Running Post-Training Full Benchmark on Complete Test Set...")
         print("=======================================================")
-        _run_post_training_evaluation(
-            model=trainer.model,
-            processor=processor,
-            metrics_calculator=metrics_calculator,
-            normalizer=normalizer,
-            dataset_name=args.dataset_name,
-            output_dir=args.output_dir,
-            results_dir=args.results_dir,
-            eval_batch_size=args.eval_batch_size,
-            trainer_state=trainer.state,
-            baseline_benchmark=baseline_benchmark,
-            phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
-            phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
-            telephony_profiles=args.telephony_profiles,
-            telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
-        )
+        _mark_run_stage(run_dir, "post_eval", "running")
+        try:
+            _run_post_training_evaluation(
+                model=trainer.model,
+                processor=processor,
+                metrics_calculator=metrics_calculator,
+                normalizer=normalizer,
+                dataset_name=args.dataset_name,
+                output_dir=args.output_dir,
+                results_dir=args.results_dir,
+                eval_batch_size=args.eval_batch_size,
+                trainer_state=trainer.state,
+                baseline_benchmark=baseline_benchmark,
+                phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
+                phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
+                telephony_profiles=args.telephony_profiles,
+                telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+            )
+        except Exception as exc:
+            _mark_run_stage(run_dir, "post_eval", "failed",
+                            detail=f"post-eval failed: {exc}")
+            _mark_run_status(run_dir, "failed", failed_stage="post_eval",
+                             last_error=str(exc))
+            raise
+        _mark_run_stage(run_dir, "post_eval", "completed")
+    else:
+        _mark_run_stage(run_dir, "post_eval", "skipped")
+
+    # Overall completion requires training completed and post-eval
+    # completed/skipped; merge is tracked separately and never blocks this.
+    _mark_run_status(run_dir, "completed")
 
 
 def _format_delta(value: Optional[float]) -> str:

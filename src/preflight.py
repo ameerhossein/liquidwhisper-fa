@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 PREFLIGHT_VERSION = "1"
 
@@ -353,6 +353,7 @@ def _evaluate_preflight_model(
 def run_preflight(
     *,
     results_dir: Path,
+    cache_dir: Optional[Path] = None,
     dataset_name: str,
     split: str,
     sample_count: int,
@@ -361,13 +362,22 @@ def run_preflight(
     telephony_use_ffmpeg: bool,
     eval_batch_size: int,
     overwrite: bool = False,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Return a cached or freshly measured preflight baseline.
 
-    BuzzASR is the comparison anchor, so a failed or empty BuzzASR run is
-    retried once and then raises. Whisper is optional: failures are warned
-    about and its row is omitted. The unified JSON is written atomically so a
-    crash can never leave a half-written cache behind.
+    The cache lives under ``cache_dir`` when given (the cockpit shares one
+    fingerprint-keyed cache across runs) and falls back to ``results_dir`` for
+    existing CLI callers. BuzzASR is the comparison anchor, so a failed or
+    empty BuzzASR run is retried once and then raises. Whisper is optional:
+    failures are warned about and its row is omitted. The unified JSON is
+    written atomically so a crash can never leave a half-written cache behind.
+
+    ``should_stop`` is polled before the cache lookup and before every model
+    attempt (including retries); when it returns true the run is halted with
+    ``RuntimeError("halt requested")`` instead of starting another expensive
+    evaluation. The returned mapping carries an ephemeral ``cached`` flag so
+    the trainer can record a cache hit versus a fresh measurement.
     """
     fingerprint = build_fingerprint(
         dataset_name=dataset_name,
@@ -378,11 +388,13 @@ def run_preflight(
         telephony_use_ffmpeg=telephony_use_ffmpeg,
         eval_batch_size=eval_batch_size,
     )
-    path = preflight_path(Path(results_dir).resolve())
+    path = preflight_path(Path(cache_dir or results_dir).resolve())
+    if should_stop and should_stop():
+        raise RuntimeError("halt requested")
     if not overwrite:
         cached = load_cached_preflight(path, fingerprint)
         if cached is not None:
-            return cached
+            return {**cached, "cached": True}
 
     preflight_dir = path.parent / "preflight"
     preflight_dir.mkdir(parents=True, exist_ok=True)
@@ -395,6 +407,8 @@ def run_preflight(
         row: Optional[Dict[str, Any]] = None
         last_error: Optional[BaseException] = None
         for _ in range(attempts):
+            if should_stop and should_stop():
+                raise RuntimeError("halt requested")
             try:
                 row = _evaluate_preflight_model(
                     key=key,
@@ -428,4 +442,4 @@ def run_preflight(
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     tmp_path.replace(path)
-    return result
+    return {**result, "cached": False}

@@ -22,6 +22,30 @@ from src.preflight import (
     run_preflight,
 )
 
+PREFLIGHT_KWARGS = dict(
+    dataset_name="d",
+    split="test",
+    sample_count=1000,
+    phone_seed=1234,
+    telephony_profiles=["customer"],
+    telephony_use_ffmpeg=True,
+    eval_batch_size=16,
+)
+
+
+def _matching_cache(tmp_path: Path) -> Path:
+    """Write a valid cached preflight whose fingerprint matches PREFLIGHT_KWARGS."""
+    cache_dir = tmp_path / "cache"
+    path = preflight_path(cache_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "fingerprint": build_fingerprint(**PREFLIGHT_KWARGS),
+        "models": {
+            "buzzasr_base": {"normalized_wer": 17.2, "total_samples": 1000},
+        },
+    }))
+    return cache_dir
+
 
 def test_fingerprint_changes_with_sample_count_and_seed():
     a = build_fingerprint(dataset_name="d", split="test", sample_count=1000,
@@ -141,13 +165,16 @@ def test_run_preflight_writes_unified_json_and_reuses_cache(tmp_path, monkeypatc
                            telephony_profiles=["customer"], telephony_use_ffmpeg=True,
                            eval_batch_size=16)
     assert preflight_path(tmp_path).exists()
+    assert result["cached"] is False
     assert result["models"]["buzzasr_base"]["phone_normalized_wer"] == 24.1
     assert result["models"]["whisper_v3"]["is_reference"] is True
     assert len(calls) == 2
-    run_preflight(results_dir=tmp_path, dataset_name="d", split="test",
-                  sample_count=1000, phone_seed=1234,
-                  telephony_profiles=["customer"], telephony_use_ffmpeg=True,
-                  eval_batch_size=16)
+    cached = run_preflight(results_dir=tmp_path, dataset_name="d", split="test",
+                           sample_count=1000, phone_seed=1234,
+                           telephony_profiles=["customer"], telephony_use_ffmpeg=True,
+                           eval_batch_size=16)
+    assert cached["cached"] is True
+    assert cached["fingerprint"] == result["fingerprint"]
     assert len(calls) == 2
 
 
@@ -259,3 +286,80 @@ def test_run_preflight_resolves_relative_results_dir(tmp_path, monkeypatch):
                   eval_batch_size=16)
     assert output_dirs and all(path.is_absolute() for path in output_dirs)
     assert (tmp_path / "relative-results" / "baselines" / "preflight.json").is_file()
+
+
+def test_run_preflight_uses_explicit_cache_dir(tmp_path, monkeypatch):
+    results_dir = tmp_path / "results"
+    cache_dir = _matching_cache(tmp_path)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("a cache hit must not run an evaluation")
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    result = run_preflight(results_dir=results_dir, cache_dir=cache_dir, **PREFLIGHT_KWARGS)
+
+    assert result["cached"] is True
+    assert result["models"]["buzzasr_base"]["normalized_wer"] == 17.2
+    assert calls == []
+    assert not preflight_path(results_dir).exists()
+
+
+def test_run_preflight_writes_fresh_result_to_explicit_cache_dir(tmp_path, monkeypatch):
+    results_dir = tmp_path / "results"
+    cache_dir = tmp_path / "cache"
+
+    def fake_run(cmd, check, cwd):
+        out = Path(cmd[cmd.index("--output_dir") + 1])
+        out.mkdir(parents=True)
+        (out / "evaluation_details.json").write_text(
+            json.dumps(_fake_details(cmd[cmd.index("--base_model") + 1]))
+        )
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    result = run_preflight(results_dir=results_dir, cache_dir=cache_dir, **PREFLIGHT_KWARGS)
+
+    assert result["cached"] is False
+    assert preflight_path(cache_dir).is_file()
+    assert not preflight_path(results_dir).exists()
+
+
+def test_run_preflight_stops_before_first_model(tmp_path, monkeypatch):
+    calls = []
+    subprocess_calls = []
+
+    def stop():
+        calls.append(1)
+        return True
+
+    def fake_run(*args, **kwargs):
+        subprocess_calls.append(args)
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="halt requested"):
+        run_preflight(results_dir=tmp_path, should_stop=stop, **PREFLIGHT_KWARGS)
+
+    assert calls
+    assert subprocess_calls == []
+
+
+def test_run_preflight_stops_before_retry(tmp_path, monkeypatch):
+    attempts = []
+    checks = []
+
+    def stop():
+        checks.append(1)
+        # initial check + first BuzzASR attempt are allowed; the retry is not.
+        return len(checks) >= 3
+
+    def fake_run(cmd, check, cwd):
+        attempts.append(cmd)
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr("src.preflight.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="halt requested"):
+        run_preflight(results_dir=tmp_path, should_stop=stop, **PREFLIGHT_KWARGS)
+
+    assert len(attempts) == 1
+    assert not preflight_path(tmp_path).exists()
