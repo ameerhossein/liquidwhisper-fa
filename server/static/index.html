@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
   <div class="page">
@@ -93,9 +93,21 @@
         <div class="config-actions">
           <button id="btnStop" type="button" class="btn btn-halt" disabled>Halt run</button>
           <button id="btnFresh" type="button" class="btn btn-fresh">Fresh start</button>
+          <button id="btnSmoke" type="button" class="btn btn-fresh"
+                  title="Run a 200-sample, 1-epoch check in an isolated directory; does not affect this run">
+            Smoke test
+          </button>
           <button id="btnStart" type="button" class="btn btn-primary">Start run</button>
         </div>
       </form>
+
+      <div id="smokeResult" class="smoke-result" hidden>
+        <p id="smokeStatus"></p>
+        <details id="smokeLogWrap" hidden>
+          <summary>Show smoke test log</summary>
+          <pre id="smokeLog"></pre>
+        </details>
+      </div>
 
       <section class="section">
         <div class="section-head">
@@ -204,6 +216,6 @@
   </div>
 
   <script src="/static/benchmark_view.js?v=1"></script>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

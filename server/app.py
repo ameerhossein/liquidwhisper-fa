@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import signal
+import shutil
 import subprocess
 import asyncio
 from pathlib import Path
@@ -94,6 +95,10 @@ connected_websockets: List[WebSocket] = []
 PID_FILE = RESULTS_DIR / "training.pid"
 last_exit_code: Optional[int] = None
 halt_requested = False
+SMOKE_DIR_NAME = "smoke-test"
+smoke_process: Optional[subprocess.Popen] = None
+smoke_log_fd = None
+smoke_last_exit_code: Optional[int] = None
 ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
@@ -190,6 +195,133 @@ def _training_running() -> bool:
     except Exception:
         pass
     return False
+
+
+def _abs_output_path(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else BASE_DIR / p
+
+
+def _smoke_output_dir() -> str:
+    production = _abs_output_path(
+        _managed_paths.resolve_output_dir(_default_output_dir())
+    ).resolve()
+    candidates = [
+        Path(_default_output_dir()).parent / SMOKE_DIR_NAME,
+        BASE_DIR / "outputs" / SMOKE_DIR_NAME,
+        BASE_DIR / "outputs" / f"{SMOKE_DIR_NAME}-check",
+    ]
+    for candidate in candidates:
+        effective = _managed_paths.resolve_output_dir(str(candidate))
+        if _abs_output_path(effective).resolve() != production:
+            return _sanitize_output_dir(effective)
+    raise HTTPException(
+        status_code=400,
+        detail="Smoke output would collide with the production output; "
+               "set ASR_OUTPUT_DIR to a different directory.",
+    )
+
+
+def _smoke_results_dir() -> Path:
+    production = _default_results_dir().resolve()
+    candidates = [
+        RESULTS_DIR / SMOKE_DIR_NAME,
+        BASE_DIR / "results" / SMOKE_DIR_NAME,
+        BASE_DIR / "results" / f"{SMOKE_DIR_NAME}-check",
+    ]
+    for candidate in candidates:
+        effective = Path(_managed_paths.resolve_results_dir(str(candidate)))
+        if not effective.is_absolute():
+            effective = BASE_DIR / effective
+        effective = effective.resolve()
+        if effective != production:
+            return effective
+    raise HTTPException(
+        status_code=400,
+        detail="Smoke results would collide with production results; "
+               "set ASR_RESULTS_DIR to a different directory.",
+    )
+
+
+def _smoke_log_file() -> Path:
+    return _smoke_results_dir() / "training_live.log"
+
+
+def _smoke_pid_file() -> Path:
+    return _smoke_results_dir() / "training.pid"
+
+
+def _smoke_attempt_file() -> Path:
+    return _smoke_results_dir() / "smoke_attempt.json"
+
+
+def _record_smoke_result(exit_code: int) -> None:
+    try:
+        path = _smoke_attempt_file()
+        data = read_json_safely(path, {})
+        if not isinstance(data, dict):
+            data = {}
+        data["exit_code"] = int(exit_code)
+        data["finished_at"] = time.time()
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _close_smoke_log_fd() -> None:
+    global smoke_log_fd
+    try:
+        if smoke_log_fd is not None:
+            try:
+                smoke_log_fd.flush()
+            except Exception:
+                pass
+            try:
+                smoke_log_fd.close()
+            except Exception:
+                pass
+    finally:
+        smoke_log_fd = None
+
+
+def _smoke_running() -> bool:
+    global smoke_process, smoke_last_exit_code
+    if smoke_process is not None:
+        code = smoke_process.poll()
+        if code is None:
+            return True
+        smoke_last_exit_code = code
+        smoke_process = None
+        _close_smoke_log_fd()
+        _record_smoke_result(code)
+        try:
+            _smoke_pid_file().unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        pid_file = _smoke_pid_file()
+        if pid_file.exists():
+            pid = int(pid_file.read_text(encoding="utf-8").strip() or "0")
+            if _is_process_running(pid):
+                return True
+            pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return False
+
+
+def _read_log_tail(path: Path, tail: int = 30) -> List[str]:
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return [line.rstrip() for line in f.readlines()[-tail:]]
+    except Exception:
+        return []
+
+
+def _any_training_running() -> bool:
+    return _training_running() or _smoke_running()
 
 
 def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any]:
@@ -407,6 +539,76 @@ async def get_status():
     return telemetry
 
 
+@app.get("/api/train/smoke/status")
+async def get_smoke_status():
+    running = _smoke_running()
+    adapter_path = None
+    try:
+        output_dir = _smoke_output_dir()
+        adapter_path = (
+            _abs_output_path(output_dir) / "best_adapter" / "adapter_config.json"
+        )
+        adapter_exists = adapter_path.is_file()
+    except Exception:
+        output_dir = ""
+        adapter_exists = False
+
+    try:
+        attempt = read_json_safely(_smoke_attempt_file(), {})
+    except Exception:
+        attempt = {}
+    attempt_exists = isinstance(attempt, dict) and bool(attempt)
+    persisted_exit = attempt.get("exit_code") if attempt_exists else None
+    effective_exit = (
+        smoke_last_exit_code if smoke_last_exit_code is not None else persisted_exit
+    )
+
+    adapter_is_new = False
+    if adapter_exists and adapter_path is not None:
+        started_at = attempt.get("started_at") if attempt_exists else None
+        try:
+            adapter_is_new = (
+                started_at is None
+                or adapter_path.stat().st_mtime >= float(started_at) - 1.0
+            )
+        except Exception:
+            adapter_is_new = False
+
+    reason = None
+    if running:
+        status = "running"
+    elif not attempt_exists:
+        status = "idle"
+    elif effective_exit == 0 and adapter_exists:
+        status = "passed"
+    elif effective_exit is None and adapter_exists and adapter_is_new:
+        status = "passed"
+    else:
+        status = "failed"
+        if effective_exit is not None and effective_exit != 0:
+            reason = "nonzero_exit"
+        elif effective_exit == 0 and not adapter_exists:
+            reason = "missing_adapter"
+        else:
+            reason = "ended_without_result"
+
+    payload: Dict[str, Any] = {
+        "status": status,
+        "running": running,
+        "exit_code": effective_exit,
+        "output_dir": output_dir,
+        "adapter_exists": adapter_exists,
+    }
+    if reason:
+        payload["reason"] = reason
+    if status == "failed":
+        try:
+            payload["log_tail"] = _read_log_tail(_smoke_log_file())
+        except Exception:
+            payload["log_tail"] = []
+    return payload
+
+
 def _drop_stale_baselines(rows: Any) -> List[Dict[str, Any]]:
     """Keep every row except legacy baselines with no measured preflight source.
 
@@ -459,24 +661,164 @@ async def get_logs(tail: int = 150):
         return {"logs": [f"Error reading log file: {e}"]}
 
 
+@app.post("/api/train/smoke")
+async def start_smoke_test(config: Dict[str, Any] = None):
+    global smoke_process, smoke_log_fd, smoke_last_exit_code
+
+    _check_auth(config)
+    _check_audio_backend_or_400()
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+
+    config = config or {}
+    try:
+        batch_i = int(config.get("batch_size", 8))
+        accum_i = int(config.get("grad_accum", 4))
+        lr_f = float(config.get("learning_rate", 1e-4))
+        eval_bs_i = int(config.get("eval_batch_size", 16))
+        num_proc_i = int(config.get("num_proc", 8))
+        tele_f = float(config.get("telephony_prob", 0.5))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="batch_size/grad_accum/eval_batch_size/num_proc must be integers; "
+                   "learning_rate/telephony_prob numeric.",
+        )
+    if not (1 <= batch_i <= 64):
+        raise HTTPException(status_code=400, detail="batch_size must be 1..64.")
+    if not (1 <= accum_i <= 16):
+        raise HTTPException(status_code=400, detail="grad_accum must be 1..16.")
+    if not (1e-7 <= lr_f <= 1e-2):
+        raise HTTPException(status_code=400, detail="learning_rate must be 1e-7..1e-2.")
+    if not (1 <= eval_bs_i <= 64):
+        raise HTTPException(status_code=400, detail="eval_batch_size must be 1..64.")
+    if not (1 <= num_proc_i <= 16):
+        raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
+    if not (0.0 <= tele_f <= 1.0):
+        raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
+
+    ckpt_raw = config.get("gradient_checkpointing", False)
+    gradient_ckpt = (
+        str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(ckpt_raw, str)
+        else bool(ckpt_raw)
+    )
+    if batch_i > 8 and not gradient_ckpt:
+        raise HTTPException(
+            status_code=400,
+            detail="batch_size above 8 needs gradient_checkpointing on; "
+                   "without it batch 16 runs out of memory on a 48 GB GPU.",
+        )
+
+    dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
+    if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
+        raise HTTPException(status_code=400, detail="Invalid dataset_name.")
+
+    output_dir = _smoke_output_dir()
+    smoke_results_dir = _smoke_results_dir()
+    smoke_results_dir.mkdir(parents=True, exist_ok=True)
+    _abs_output_path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # A new attempt must never inherit a previous pass.
+    adapter_dir = _abs_output_path(output_dir) / "best_adapter"
+    shutil.rmtree(adapter_dir, ignore_errors=True)
+    if adapter_dir.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Could not remove the previous smoke adapter; refusing to start.",
+        )
+    _smoke_pid_file().unlink(missing_ok=True)
+    _smoke_attempt_file().parent.mkdir(parents=True, exist_ok=True)
+    _smoke_attempt_file().write_text(
+        json.dumps({"started_at": time.time()}), encoding="utf-8"
+    )
+    smoke_last_exit_code = None
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "scripts" / "train_lora.py"),
+        "--base_model", "BuzzASR/persian",
+        "--dataset_name", dataset_name,
+        "--output_dir", output_dir,
+        "--results_dir", str(smoke_results_dir),
+        "--epochs", "1",
+        "--batch_size", str(batch_i),
+        "--grad_accum", str(accum_i),
+        "--learning_rate", str(lr_f),
+        "--eval_batch_size", str(eval_bs_i),
+        "--max_train_samples", "200",
+        "--max_eval_samples", "50",
+        "--max_benchmark_samples", "25",
+        "--preflight_samples", "25",
+        "--num_proc", str(num_proc_i),
+        "--telephony_prob", str(tele_f),
+        "--warmup_steps", "2",
+        "--eval_steps", "5",
+        "--save_steps", "5",
+        "--enable_telemetry",
+        "--run_epoch_benchmark",
+        "--no-run-post-test-eval",
+        "--fresh_start",
+        "--no-auto_resume",
+        "--gradient_checkpointing" if gradient_ckpt else "--no-gradient_checkpointing",
+    ]
+
+    _close_smoke_log_fd()
+    smoke_log_fd = open(_smoke_log_file(), "w", encoding="utf-8")
+    smoke_log_fd.write(f"=== Smoke test launched at {time.ctime()} ===\n")
+    smoke_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
+    smoke_log_fd.flush()
+
+    try:
+        smoke_process = subprocess.Popen(
+            cmd,
+            stdout=smoke_log_fd,
+            stderr=subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            preexec_fn=os.setsid if sys.platform != "win32" else None,
+        )
+    except Exception as e:
+        try:
+            smoke_log_fd.write(f"\n!!! Failed to launch smoke test: {e}\n")
+            smoke_log_fd.flush()
+        except Exception:
+            pass
+        _close_smoke_log_fd()
+        smoke_process = None
+        raise HTTPException(status_code=500, detail=f"Failed to launch smoke test: {e}")
+
+    try:
+        _smoke_pid_file().write_text(str(smoke_process.pid), encoding="utf-8")
+    except Exception as e:
+        try:
+            os.killpg(os.getpgid(smoke_process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                smoke_process.terminate()
+            except Exception:
+                pass
+        _close_smoke_log_fd()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to record smoke PID: {e}"
+        )
+
+    return {
+        "status": "started",
+        "mode": "smoke",
+        "pid": smoke_process.pid,
+        "output_dir": output_dir,
+        "results_dir": str(smoke_results_dir),
+    }
+
+
 @app.post("/api/train/start")
 async def start_training(config: Dict[str, Any] = None):
     global training_process, training_log_fd, last_exit_code, halt_requested
     _check_auth(config)
     _check_audio_backend_or_400()
-    if training_process is not None and training_process.poll() is None:
-        raise HTTPException(status_code=400, detail="Training is already currently running.")
-    # Recover from PID file after restart.
-    try:
-        if PID_FILE.exists():
-            pid = int(PID_FILE.read_text(encoding="utf-8").strip() or "0")
-            if _is_process_running(pid):
-                raise HTTPException(status_code=400, detail=f"Training already running (pid {pid}).")
-            PID_FILE.unlink(missing_ok=True)
-    except HTTPException:
-        raise
-    except Exception:
-        pass
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
 
     config = config or {}
     try:
@@ -525,6 +867,16 @@ async def start_training(config: Dict[str, Any] = None):
     dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
+    try:
+        smoke_output = _abs_output_path(_smoke_output_dir()).resolve()
+        smoke_results = _smoke_results_dir().resolve()
+    except Exception:
+        smoke_output = None
+        smoke_results = None
+    if smoke_output is not None and _abs_output_path(output_dir).resolve() == smoke_output:
+        raise HTTPException(status_code=400, detail="output_dir must not be the smoke-test directory.")
+    if smoke_results is not None and _abs_output_path(results_dir).resolve() == smoke_results:
+        raise HTTPException(status_code=400, detail="results_dir must not be the smoke-test directory.")
     # Resume controls: default auto-resume ON so pod restarts continue from
     # persistent-volume checkpoints. Send {"fresh_start": true} for clean run,
     # or {"resume_from_checkpoint": "<path|last>"} to force a checkpoint.
