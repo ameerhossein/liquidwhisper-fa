@@ -3,11 +3,12 @@
 
 Outputs a self-contained folder with an ``index.html`` player and WAV files:
 
-1. **Paired, same sentence** - clean source, real MCI/Irancell recording,
-   simulated mobile, real TCI recording, simulated PSTN, simulated gated.
-   These three pairs are the only real network recordings with known source
-   clips.  Levels are matched on active speech so timbre, bandlimit and noise
-   are what you hear, not loudness.
+1. **Paired, same sentence** - clean source, legacy synth mobile/PSTN,
+   simulated mobile/PSTN, simulated gated.  These six `FakePhoneCalls` files
+   are **not** real carrier recordings; they are older synth outputs with
+   known source clips.  This section compares the current simulator to that
+   legacy baseline.  Levels are matched on active speech so timbre, bandlimit
+   and noise are what you hear, not loudness.
 2. **Gated, different content** - real gated call-center excerpts vs simulated
    gated clips.  There are no transcripts and no clean counterparts for the
    real gated calls, so this is a perceptual check, not a paired WER test.
@@ -208,10 +209,13 @@ def render_html(cards: Sequence[Dict[str, object]],
         '<p class="card warn">All clips are level-matched on active speech to '
         f"{TARGET_ACTIVE_DB:.0f} dBFS (max gain {MAX_LEVEL_GAIN_DB:.0f} dB), "
         "so differences are timbre, bandlimit, noise, dropouts and gating, "
-        "not playback loudness. Listen on the same device and volume.</p>",
-        "<h2>1. Paired recordings: same sentence, real vs simulated</h2>",
-        "<p>These are the only real network recordings with known clean "
-        "sources. Compare real and simulated <em>within</em> each card.</p>",
+        "not playback loudness. Listen on the same device and volume. "
+        "The six paired files are <strong>legacy synth</strong>, not real "
+        "carrier recordings.</p>",
+        "<h2>1. Paired same sentence: legacy synth vs current synth</h2>",
+        "<p>These six files are <strong>legacy synth outputs</strong>, not real "
+        "carrier recordings. Compare the legacy and current simulator outputs "
+        "<em>within</em> each card; this is not a real-network validation.</p>",
     ]
     for card in cards:
         transcript = html.escape(str(card.get("transcript", "")))
@@ -276,8 +280,9 @@ def render_html(cards: Sequence[Dict[str, object]],
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--real-dir", type=Path,
+        "--legacy-dir", type=Path,
         default=ROOT / "RecordingTesting" / "telephone_clips" / "FakePhoneCalls",
+        help="Legacy synth outputs, not real carrier recordings.",
     )
     parser.add_argument(
         "--call-dir", type=Path,
@@ -323,8 +328,8 @@ def main() -> None:
     paired_bases = set()
     pairs: Dict[str, Dict[str, object]] = {}
 
-    for real_path in sorted(args.real_dir.glob("*.wav")):
-        info = parse_fake(real_path)
+    for legacy_path in sorted(args.legacy_dir.glob("*.wav")):
+        info = parse_fake(legacy_path)
         if info is None:
             continue
         clean_path = (
@@ -332,7 +337,7 @@ def main() -> None:
             / f"clip{info['clip']}_id{info['id']}.wav"
         )
         if not clean_path.is_file():
-            print(f"SKIP {real_path.name}: clean source not found")
+            print(f"SKIP {legacy_path.name}: clean source not found")
             continue
         base = str(info["base"])
         paired_bases.add(base)
@@ -340,9 +345,9 @@ def main() -> None:
             "base": base,
             "clean_path": clean_path,
             "transcript": transcripts.get(str(info["transcript_key"]), ""),
-            "real": {},
+            "legacy": {},
         })
-        pair["real"][str(info["profile"])] = real_path
+        pair["legacy"][str(info["profile"])] = legacy_path
 
     for base in sorted(pairs):
         pair = pairs[base]
@@ -354,15 +359,15 @@ def main() -> None:
             ("Clean source (16 kHz)", clean, clean_sr, "clean",
              "fullband source, not telephone", str(clean_path)),
         ]
-        real_paths = pair["real"]
+        legacy_paths = pair["legacy"]
         for profile in ("mobile", "pstn"):
-            if profile not in real_paths:
+            if profile not in legacy_paths:
                 continue
-            real_path = Path(real_paths[profile])
-            real, real_sr = read_audio(real_path)
+            legacy_path = Path(legacy_paths[profile])
+            legacy, legacy_sr = read_audio(legacy_path)
             variants.append((
-                f"Real {profile.upper()} network", real, real_sr,
-                f"real_{profile}", "actual recorded call", str(real_path),
+                f"Legacy synth {profile.upper()}", legacy, legacy_sr,
+                f"legacy_{profile}", "older synth output", str(legacy_path),
             ))
         for profile in ("mobile", "pstn", "gated"):
             sim = simulate_telephone(
@@ -462,8 +467,9 @@ def main() -> None:
         "Open `index.html` in a browser. All clips are level-matched on",
         f"active speech to {TARGET_ACTIVE_DB:.0f} dBFS.",
         "",
-        "- `paired/`: same-sentence clean, real mobile/PSTN, simulated",
-        "  mobile/PSTN/gated. This is the valid paired comparison.",
+        "- `paired/`: same-sentence clean, legacy synth mobile/PSTN, current",
+        "  synth mobile/PSTN/gated. This compares current vs legacy synth, not",
+        "  real networks.",
         "- `gated_real/`: real gated call-center excerpts (no transcripts).",
         "- `gated_sim/`: simulated gated clips with different content.",
         "",

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""Paired real-vs-simulated telephone WER smoke test.
+"""Paired legacy-synth vs current-synth telephone WER smoke test.
 
-The three ``FakePhoneCalls`` recordings are real MCI/Irancell and TCI network
-recordings of known Neyshekar source clips.  Their filenames map back to the
-clean source and to the gold transcript:
+IMPORTANT: the six ``FakePhoneCalls`` files are **not** real carrier
+recordings.  The repository's own analysis labels them "Synth mobile" /
+"Synth PSTN" and describes them as single utterances passed through an older
+telephone simulator.  Their filenames are labels, not carrier evidence.
 
-    spk_25692_clip0_id1_mobile-MCI-Irancell.wav
-    -> clean:      fa_clips/spk_25692/clip0_id1.wav
-    -> transcript: neyshekar_transcripts.json["25692_1"]
+This script runs one ASR model on the clean source, the legacy synth output,
+and several seeded current-simulator outputs for the same content.  It
+measures whether the current simulator is harsher or easier than the legacy
+baseline; it does **not** validate either against a real network.
 
-This script runs one ASR model on the clean source, the real network
-recording, and several seeded simulator outputs for the same content.  The
-paired design is the point: corpus-level WER differences are not confounded by
-different speakers or sentences.
-
-The 77 real gated call-center recordings in ``RealRecordedPhoneCalls`` have no
-transcripts, so they cannot produce a real-gated WER row.  Use
-``make_listening_kit.py`` for the gated perceptual check.  If transcripts
+A true real-vs-simulated WER is not possible from this corpus: the 107 real
+call-center recordings have no transcripts, and the 77 gated real recordings
+have no clean counterparts.  If human transcripts for the real gated calls
 become available, pass ``--real-gated-manifest`` to add a ``real_gated`` row.
 
 Usage:
@@ -56,16 +53,16 @@ FAKE_RE = re.compile(
 )
 CONDITION_ORDER = [
     "clean",
-    "real_mobile",
+    "legacy_mobile",
     "sim_mobile",
-    "real_pstn",
+    "legacy_pstn",
     "sim_pstn",
     "sim_gated",
     "real_gated",
 ]
 
 
-def parse_fake_name(path: Path) -> Optional[Dict[str, object]]:
+def parse_legacy_name(path: Path) -> Optional[Dict[str, object]]:
     match = FAKE_RE.match(path.name)
     if not match:
         return None
@@ -126,18 +123,18 @@ def level_match(audio: np.ndarray, sr: int, target_db: float,
     return out, float(gain_db)
 
 
-def collect_pairs(real_dir: Path, clips_dir: Path,
+def collect_pairs(legacy_dir: Path, clips_dir: Path,
                   transcripts: Dict[str, str]) -> List[Dict[str, object]]:
     pairs = []
-    for path in sorted(real_dir.glob("*.wav")):
-        info = parse_fake_name(path)
+    for path in sorted(legacy_dir.glob("*.wav")):
+        info = parse_legacy_name(path)
         if info is None:
             continue
         clean = clips_dir / f"spk_{info['speaker']}" / f"clip{info['clip']}_id{info['id']}.wav"
         text = transcripts.get(str(info["transcript_key"]))
         pairs.append({
             **info,
-            "real_path": path,
+            "legacy_path": path,
             "clean_path": clean,
             "text": text,
             "ok": clean.is_file() and bool(text),
@@ -176,7 +173,7 @@ def build_rows(pairs: Iterable[Dict[str, object]], clips_dir: Path,
 
     for pair in pairs:
         if not pair["ok"]:
-            print(f"SKIP {pair['real_path'].name}: missing clean source or transcript")
+            print(f"SKIP {pair['legacy_path'].name}: missing clean source or transcript")
             continue
         base = str(pair["base"])
         paired_bases.add(base)
@@ -186,9 +183,11 @@ def build_rows(pairs: Iterable[Dict[str, object]], clips_dir: Path,
             seen_clean.add(base)
             add_row("clean", base, 0, str(pair["clean_path"]),
                     clean, clean_sr, ref)
-        real, real_sr = read_audio(Path(pair["real_path"]), target_sr=16000)
-        add_row(f"real_{pair['profile']}", base, 0, str(pair["real_path"]),
-                real, real_sr, ref)
+        legacy, legacy_sr = read_audio(
+            Path(pair["legacy_path"]), target_sr=16000
+        )
+        add_row(f"legacy_{pair['profile']}", base, 0,
+                str(pair["legacy_path"]), legacy, legacy_sr, ref)
         for profile in profiles:
             for seed in seeds:
                 key = (base, profile, int(seed))
@@ -287,17 +286,17 @@ def summarize(rows: Sequence[Dict[str, object]], metrics: ASRMetricsCalculator,
 
     deltas = {}
     for profile in ("mobile", "pstn"):
-        real = conditions.get(f"real_{profile}")
+        legacy = conditions.get(f"legacy_{profile}")
         sim = conditions.get(f"sim_{profile}")
-        if real and sim:
+        if legacy and sim:
             deltas[profile] = {
-                "sim_minus_real_mean_clip_wer_zwnj_space": (
+                "sim_minus_legacy_mean_clip_wer_zwnj_space": (
                     sim["mean_clip_wer_zwnj_space"]
-                    - real["mean_clip_wer_zwnj_space"]
+                    - legacy["mean_clip_wer_zwnj_space"]
                 ),
-                "sim_minus_real_corpus_wer_zwnj_space": (
+                "sim_minus_legacy_corpus_wer_zwnj_space": (
                     sim["corpus_wer_zwnj_space"]
-                    - real["corpus_wer_zwnj_space"]
+                    - legacy["corpus_wer_zwnj_space"]
                 ),
             }
     return {"conditions": conditions, "deltas": deltas}
@@ -360,24 +359,30 @@ def write_outputs(rows: Sequence[Dict[str, object]], summary: Dict[str, object],
             f"{data['corpus_cer']:.2f}% |"
         )
     if summary["deltas"]:
-        lines += ["", "Simulator minus real (positive = simulator harder):"]
+        lines += ["", "Current synth minus legacy synth "
+                  "(positive = current synth harder):"]
         for profile, data in summary["deltas"].items():
             lines.append(
                 f"- **{profile}**: mean clip WER "
-                f"{data['sim_minus_real_mean_clip_wer_zwnj_space']:+.2f} pp; "
+                f"{data['sim_minus_legacy_mean_clip_wer_zwnj_space']:+.2f} pp; "
                 f"corpus WER "
-                f"{data['sim_minus_real_corpus_wer_zwnj_space']:+.2f} pp"
+                f"{data['sim_minus_legacy_corpus_wer_zwnj_space']:+.2f} pp"
             )
     lines += [
         "",
-        "The source clips come from the Neyshekar **train** split (the only split",
-        "with matching real network recordings), so absolute WER is not a",
-        "held-out benchmark. Use the paired real-vs-simulated deltas.",
+        "The six `FakePhoneCalls` files are **legacy synth outputs**, not real",
+        "carrier recordings. This table compares the current simulator to that",
+        "older synth baseline; it does **not** validate either against a real",
+        "network.",
         "",
-        "Real gated call-center recordings have no transcripts in the repo, so",
-        "they are not in this WER table. Use `make_listening_kit.py` for the",
-        "gated listening pass; add `--real-gated-manifest` if human transcripts",
-        "become available.",
+        "The source clips come from the Neyshekar **train** split (the only split",
+        "with matching clean sources and legacy outputs), so absolute WER is not",
+        "a held-out benchmark. Use the paired current-vs-legacy deltas.",
+        "",
+        "A true real-vs-sim WER needs real recordings with transcripts: the 107",
+        "real call-center files have none, and the 77 real gated calls have no",
+        "clean counterparts. Real gated transcripts can be supplied with",
+        "`--real-gated-manifest`.",
         "",
     ]
     (output_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
@@ -469,8 +474,9 @@ def transcribe(model, processor, audio: np.ndarray, device: str, dtype,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--real-dir", type=Path,
+        "--legacy-dir", type=Path,
         default=ROOT / "RecordingTesting" / "telephone_clips" / "FakePhoneCalls",
+        help="Legacy synth outputs to compare against current synth.",
     )
     parser.add_argument(
         "--clips-dir", type=Path,
@@ -519,14 +525,14 @@ def main() -> None:
         return
 
     transcripts = load_transcripts(args.transcripts)
-    pairs = collect_pairs(args.real_dir, args.clips_dir, transcripts)
+    pairs = collect_pairs(args.legacy_dir, args.clips_dir, transcripts)
     if not pairs:
-        raise SystemExit(f"No matching real/clean pairs under {args.real_dir}")
+        raise SystemExit(f"No matching legacy/clean pairs under {args.legacy_dir}")
     for pair in pairs:
         status = "ok" if pair["ok"] else "MISSING"
         print(
             f"{pair['base']:<24} {pair['profile']:<6} {status} "
-            f"real={pair['real_path'].name}"
+            f"legacy={pair['legacy_path'].name}"
         )
     if args.list_only:
         return
@@ -583,7 +589,7 @@ def main() -> None:
         "use_ffmpeg": bool(args.use_ffmpeg),
         "level_match": bool(args.level_match),
         "target_active_dbfs": float(args.target_active_dbfs),
-        "real_dir": str(args.real_dir),
+        "legacy_dir": str(args.legacy_dir),
         "clips_dir": str(args.clips_dir),
         "transcripts": str(args.transcripts),
         "elapsed_s": round(time.time() - started, 1),
@@ -602,14 +608,14 @@ def main() -> None:
     print("* ZWNJ->space diagnostic normalization")
     for profile, data in summary["deltas"].items():
         print(
-            f"sim - real {profile:<7} mean clip WER* "
-            f"{data['sim_minus_real_mean_clip_wer_zwnj_space']:+.2f} pp "
-            f"(corpus* {data['sim_minus_real_corpus_wer_zwnj_space']:+.2f} pp)"
+            f"sim - legacy {profile:<7} mean clip WER* "
+            f"{data['sim_minus_legacy_mean_clip_wer_zwnj_space']:+.2f} pp "
+            f"(corpus* {data['sim_minus_legacy_corpus_wer_zwnj_space']:+.2f} pp)"
         )
     print(f"\nWrote {args.output_dir / 'summary.md'}")
     print(
-        "NOTE: real gated call-center recordings have no transcripts in the "
-        "repo; no real_gated WER row is reported."
+        "NOTE: the six FakePhoneCalls are legacy synth, not real network "
+        "recordings; this does not validate against real carriers."
     )
 
 
