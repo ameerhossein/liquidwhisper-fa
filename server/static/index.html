@@ -101,7 +101,8 @@
         <div class="section-head">
           <div>
             <h2>Normalized WER</h2>
-            <p>Held-out test split, 2,149 recordings. Lower is better.</p>
+            <p id="benchmarkSubtitle">Held-out test split. Lower is better.</p>
+            <p id="benchmarkSummary" class="muted"></p>
           </div>
           <p class="legend"><span class="legend-line"></span>BuzzASR base</p>
         </div>
@@ -110,14 +111,14 @@
             <thead>
               <tr>
                 <th scope="col">Checkpoint</th>
-                <th scope="col">Normalized WER</th>
-                <th scope="col" class="num">vs Whisper v3</th>
-                <th scope="col" class="num">vs BuzzASR base</th>
-                <th scope="col" class="num" title="Normalized WER on phone-simulated audio (MCI/Irancell mobile + TCI PSTN)">Phone WER</th>
+                <th scope="col">Clean WER</th>
+                <th scope="col" class="num">Δ clean vs base</th>
+                <th scope="col" class="num">Phone WER</th>
+                <th scope="col" class="num">Δ phone vs base</th>
                 <th scope="col" class="num opt">CER</th>
                 <th scope="col" class="num opt">Formal</th>
                 <th scope="col" class="num opt">Informal</th>
-                <th scope="col" class="num opt" title="WER after replacing ZWNJ with a space">ZWNJ → space</th>
+                <th scope="col" class="num opt">ZWNJ → space</th>
               </tr>
             </thead>
             <tbody id="benchmarkTbody">

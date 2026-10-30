@@ -5,8 +5,6 @@
  */
 
 const DEFAULT_EPOCHS = 4;
-const WHISPER_WER_FALLBACK = 28.5;
-const BUZZASR_WER_FALLBACK = 17.2;
 const numberFormat = new Intl.NumberFormat("en-US");
 
 const el = {
@@ -33,6 +31,8 @@ const el = {
   inputEvalSteps: document.getElementById("inputEvalSteps"),
   inputLearningRate: document.getElementById("inputLearningRate"),
   benchmarkTbody: document.getElementById("benchmarkTbody"),
+  benchmarkSubtitle: document.getElementById("benchmarkSubtitle"),
+  benchmarkSummary: document.getElementById("benchmarkSummary"),
   canaryContainer: document.getElementById("canaryContainer"),
   consoleBox: document.getElementById("consoleBox"),
   svgChart: document.getElementById("svgChart"),
@@ -68,10 +68,17 @@ function formatPct(value) {
 
 function formatDelta(value) {
   if (value == null || isNaN(value)) return `<span class="muted">—</span>`;
-  if (Math.abs(value) < 0.005) return `<span class="delta flat">0.00 pts</span>`;
+  if (Math.abs(value) < 0.005) return `<span class="delta flat">0.00 pp</span>`;
   const sign = value < 0 ? "−" : "+";
   const cls = value < 0 ? "good" : "bad";
-  return `<span class="delta ${cls}">${sign}${Math.abs(value).toFixed(2)} pts</span>`;
+  return `<span class="delta ${cls}">${sign}${Math.abs(value).toFixed(2)} pp</span>`;
+}
+
+function formatPp(value) {
+  if (value == null || isNaN(value)) return "";
+  if (Math.abs(value) < 0.005) return "0.00 pp";
+  const sign = value < 0 ? "−" : "+";
+  return `${sign}${Math.abs(value).toFixed(2)} pp`;
 }
 
 function escapeHtml(str) {
@@ -300,35 +307,64 @@ function drawLoss() {
 
 // Benchmark ladder
 
-function findBaseline(list, pattern, fallback) {
-  const row = list.find((r) => r.is_baseline && pattern.test(r.epoch || ""));
-  return row && row.normalized_wer != null ? Number(row.normalized_wer) : fallback;
-}
-
 function updateBenchmarks(list) {
-  if (!Array.isArray(list) || list.length === 0) return;
+  if (!Array.isArray(list)) return;
+
+  if (list.length === 0) {
+    el.benchmarkTbody.innerHTML = `
+      <tr><td colspan="9" class="empty-cell">No measured baseline yet. Start a run to generate the preflight.</td></tr>`;
+    el.benchmarkSummary.textContent = "";
+    el.benchmarkSubtitle.textContent = "Held-out test split. Lower is better.";
+    return;
+  }
+
+  const baseline =
+    list.find((r) => r.is_baseline && !r.is_reference && /BuzzASR/i.test(r.epoch || "")) ||
+    list.find((r) => r.is_baseline && !r.is_reference) ||
+    null;
+  const baselineWer =
+    baseline && baseline.normalized_wer != null && !isNaN(Number(baseline.normalized_wer))
+      ? Number(baseline.normalized_wer)
+      : null;
+  const baselinePhone =
+    baseline && baseline.phone_normalized_wer != null && !isNaN(Number(baseline.phone_normalized_wer))
+      ? Number(baseline.phone_normalized_wer)
+      : null;
+  const comparable = (row) =>
+    baseline != null &&
+    baseline.total_samples != null &&
+    row.total_samples != null &&
+    row.total_samples === baseline.total_samples;
 
   const checkpoints = list.filter((r) => !r.is_baseline && r.normalized_wer != null);
   const best = checkpoints.length ? Math.min(...checkpoints.map((r) => Number(r.normalized_wer))) : null;
-  const whisper = findBaseline(list, /Whisper/i, WHISPER_WER_FALLBACK);
-  const buzz = findBaseline(list, /BuzzASR/i, BUZZASR_WER_FALLBACK);
-  const scaleMax = Math.max(whisper, ...list.map((r) => Number(r.normalized_wer) || 0)) * 1.08;
+  const scaleMax = Math.max(1, ...list.map((r) => Number(r.normalized_wer) || 0)) * 1.08;
   const share = (v) => `${Math.min(100, Math.max(0, (v / scaleMax) * 100)).toFixed(2)}%`;
 
   el.benchmarkTbody.innerHTML = list
     .map((row) => {
-      const wer = Number(row.normalized_wer) || 0;
+      const hasWer = row.normalized_wer != null && !isNaN(Number(row.normalized_wer));
+      const wer = hasWer ? Number(row.normalized_wer) : 0;
+      const phone =
+        row.phone_normalized_wer != null && !isNaN(Number(row.phone_normalized_wer))
+          ? Number(row.phone_normalized_wer)
+          : null;
       const isBaseline = !!row.is_baseline;
-      const isBest = !isBaseline && best !== null && Math.abs(wer - best) < 0.001;
-      const isWhisper = /Whisper/i.test(row.epoch || "");
-      const isBuzz = /BuzzASR/i.test(row.epoch || "");
+      const isBest = !isBaseline && best !== null && hasWer && Math.abs(wer - best) < 0.001;
 
       const rowClass = isBaseline ? "is-baseline" : isBest ? "is-best" : "";
       const barClass = isBaseline ? "is-base" : isBest ? "is-best" : "";
       const tag = isBaseline
-        ? `<span class="tag">Baseline</span>`
+        ? `<span class="tag">${row.is_reference ? "Reference" : "Baseline"}</span>`
         : isBest
           ? `<span class="tag tag-best">Best</span>`
+          : "";
+
+      const cleanDelta = comparable(row) && hasWer && baselineWer != null ? wer - baselineWer : null;
+      const phoneDelta = comparable(row) && phone != null && baselinePhone != null ? phone - baselinePhone : null;
+      const baseMark =
+        baselineWer != null && hasWer
+          ? `<span class="bar-ref" style="left:${share(baselineWer)}"></span>`
           : "";
 
       return `
@@ -337,15 +373,15 @@ function updateBenchmarks(list) {
           <td class="wer">
             <div class="wer-inner">
               <div class="bar ${barClass}">
-                <span class="bar-fill" style="width:${share(wer)}"></span>
-                <span class="bar-ref" style="left:${share(buzz)}"></span>
+                <span class="bar-fill" style="width:${hasWer ? share(wer) : "0%"}"></span>
+                ${baseMark}
               </div>
-              <span class="wer-value">${wer.toFixed(2)}%</span>
+              <span class="wer-value">${hasWer ? `${wer.toFixed(2)}%` : "—"}</span>
             </div>
           </td>
-          <td class="num">${isWhisper ? formatDelta(null) : formatDelta(wer - whisper)}</td>
-          <td class="num">${isBuzz ? formatDelta(null) : formatDelta(wer - buzz)}</td>
+          <td class="num">${formatDelta(cleanDelta)}</td>
           <td class="num">${formatPct(row.phone_normalized_wer)}</td>
+          <td class="num">${formatDelta(phoneDelta)}</td>
           <td class="num opt">${formatPct(row.normalized_cer)}</td>
           <td class="num opt">${formatPct(row.formal_wer)}</td>
           <td class="num opt">${formatPct(row.informal_wer)}</td>
@@ -353,6 +389,33 @@ function updateBenchmarks(list) {
         </tr>`;
     })
     .join("");
+
+  const sampleCount = baseline && baseline.total_samples != null ? Number(baseline.total_samples) : NaN;
+  el.benchmarkSubtitle.textContent =
+    Number.isFinite(sampleCount) && sampleCount > 0
+      ? `Held-out test split, ${numberFormat.format(sampleCount)}-recording benchmark subset. Lower is better.`
+      : "Held-out test split. Lower is better.";
+
+  const phoneRows = list.filter(
+    (r) =>
+      !r.is_baseline &&
+      comparable(r) &&
+      r.phone_normalized_wer != null &&
+      !isNaN(Number(r.phone_normalized_wer))
+  );
+  const bestPhoneRow = phoneRows.length
+    ? phoneRows.reduce((a, b) => (Number(b.phone_normalized_wer) < Number(a.phone_normalized_wer) ? b : a))
+    : null;
+
+  if (bestPhoneRow && baselinePhone != null) {
+    const bestPhone = Number(bestPhoneRow.phone_normalized_wer);
+    const delta = ` (${formatPp(bestPhone - baselinePhone)})`;
+    el.benchmarkSummary.textContent = `Phone WER ${baselinePhone.toFixed(2)}% → ${bestPhone.toFixed(2)}%${delta}`;
+  } else if (!baseline) {
+    el.benchmarkSummary.textContent = "No measured baseline yet. Start a run to generate the preflight.";
+  } else {
+    el.benchmarkSummary.textContent = "";
+  }
 
   const latest = [...list]
     .reverse()
