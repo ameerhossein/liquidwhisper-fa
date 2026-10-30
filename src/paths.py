@@ -4,6 +4,7 @@ Single source of truth for persistent-volume-aware defaults:
 - output_dir  (checkpoints + best_adapter + final reports)
 - results_dir (telemetry / benchmarks / logs)
 - merged_dir  (standalone merged model output)
+- runs_dir    (one self-contained directory per cockpit/CLI run)
 
 Precedence everywhere: explicit arg/ENV wins, then /workspace if present,
 else repo-local fallback. This lets the committed /workspace default work
@@ -38,6 +39,9 @@ RESULTS_DIR_LOCAL = "results"
 
 MERGED_DIR_PERSISTENT = "/workspace/stt-outputs/buzzasr-persian-merged"
 MERGED_DIR_LOCAL = "models/buzzasr-persian-fine-tuned"
+
+RUNS_DIR_PERSISTENT = "/workspace/stt-outputs/results/runs"
+RUNS_DIR_LOCAL = "results/runs"
 
 
 def _env(name: str) -> str:
@@ -83,6 +87,14 @@ def default_merged_dir() -> str:
     return MERGED_DIR_LOCAL
 
 
+def default_runs_dir() -> str:
+    """Default root for one directory per cockpit/CLI run."""
+    env = _env("ASR_RUNS_DIR")
+    if env:
+        return env
+    return str(Path(default_results_dir()) / "runs")
+
+
 def _fallback_if_persistent_missing(raw: str, local: str, label: str) -> str:
     """Fall back to repo-local dir when a /workspace|/runpod-volume root is absent."""
     try:
@@ -111,6 +123,11 @@ def resolve_results_dir(raw: Optional[str] = None) -> str:
 def resolve_merged_dir(raw: Optional[str] = None) -> str:
     raw = (raw or "").strip() or default_merged_dir()
     return _fallback_if_persistent_missing(raw, MERGED_DIR_LOCAL, "merged")
+
+
+def resolve_runs_dir(raw: Optional[str] = None) -> str:
+    raw = (raw or "").strip() or default_runs_dir()
+    return _fallback_if_persistent_missing(raw, RUNS_DIR_LOCAL, "runs")
 
 
 def resolve_adapter_dir(output_dir: Optional[str] = None, adapter_path: Optional[str] = None) -> str:

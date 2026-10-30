@@ -136,3 +136,29 @@ def test_no_production_baseline_file_or_fallbacks():
                 "server/static/app.js", "scripts/train_lora.py"):
         text = (ROOT / rel).read_text(encoding="utf-8")
         assert "28.5" not in text and "17.2" not in text
+
+
+def test_runs_dir_env_wins(monkeypatch, tmp_path):
+    from src import paths
+
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path / "runs"))
+    assert paths.resolve_runs_dir(None) == str(tmp_path / "runs")
+
+
+def test_runs_dir_follows_results_dir(monkeypatch, tmp_path):
+    from src import paths
+
+    monkeypatch.delenv("ASR_RUNS_DIR", raising=False)
+    monkeypatch.setenv("ASR_RESULTS_DIR", str(tmp_path / "results"))
+    expected = str(tmp_path / "results" / "runs")
+    assert paths.default_runs_dir() == expected
+    assert paths.resolve_runs_dir(None) == expected
+
+
+def test_runs_dir_explicit_argument_wins(monkeypatch, tmp_path):
+    from src import paths
+
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path / "env-runs"))
+    assert paths.resolve_runs_dir(str(tmp_path / "explicit")) == str(
+        tmp_path / "explicit"
+    )
