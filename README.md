@@ -149,7 +149,7 @@ tmux new -s train_asr
 * `--learning_rate 1e-4`: Optimal for LoRA.
 * `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).
-* `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows (`0` = full 2,149-sample test set).
+* `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows. Set both to `0` (`--preflight_samples 0 --max_benchmark_samples 0`) for the full 2,149-sample test set; keep them aligned.
 * `--no-enable-telemetry / --no-run-epoch-benchmark`: disable live telemetry or epoch eval.
 * Training keeps punctuation in targets; eval strips it for standardized WER (intentional, see `src/data.py`).
 * CPU inference runs without autocast (CUDA-only AMP); >30s audio is truncated to 30s, <0.5s filtered.
@@ -163,8 +163,9 @@ Launch the zero-dependency web interface on port 7860 (compatible with RunPod HT
 Features available in your browser:
 - Start/stop training directly from the UI.
 - Real-time VRAM allocation, loss curve, learning rate, and ETA.
-- Automatic **Epoch Benchmark Comparison Matrix** (default 1,000-row subset per epoch, the same rows as the preflight; `--max_benchmark_samples 0` for all 2,149 test recordings). Deltas are `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), against the measured BuzzASR preflight baseline; rows evaluated on a different sample count show `—`.
+- Automatic **Epoch Benchmark Comparison Matrix** (default 1,000-row subset per epoch, the same rows as the preflight; use `--preflight_samples 0 --max_benchmark_samples 0` for all 2,149 test recordings, keeping both aligned). Deltas are `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), against the measured BuzzASR preflight baseline; rows evaluated on a different sample count show `—`.
 - **Canary Persian Orthography Diff** showing ZWNJ and spoken contractions side-by-side.
+- The training pipeline's **final full-test report** performs the baseline comparison: it shows BuzzASR deltas only when a baseline was measured on the same full-test row count. With the default 1,000-row preflight it reports `n/a (no matching full-test baseline)` against the 2,149-row test split.
 - Note: the 2,149 test-sample count comes from the Neyshekar test split metadata; verify with `load_dataset("shekar-ai/Neyshekar", split="test")` if the dataset version changes.
 
 ---
@@ -184,12 +185,12 @@ python scripts/evaluate_model.py \
     --batch_size 16
 ```
 
-This generates:
+This standalone script prints metrics only:
 1. Overall Normalized WER & CER.
 2. Formal vs. Informal subset accuracy.
 3. Diagnostic analysis showing the top 5 worst transcription errors to inspect remaining phonetic or dialect edge cases.
 
-The final full-test report shows BuzzASR deltas only when a baseline was measured on the same full-test row count. With the default 1,000-row preflight it reports `n/a (no matching full-test baseline)` instead of a cross-sample comparison.
+Baseline deltas are produced by the training pipeline's final report (see Step 2), not by `evaluate_model.py`.
 
 ---
 

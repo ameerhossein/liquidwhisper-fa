@@ -30,14 +30,19 @@ except Exception:
 
 # Simulated local-demo values only; never read by training or the server.
 # Layout: (normalized WER, normalized CER, diagnostic WER, formal WER,
-#          informal WER) for Whisper (reference) then BuzzASR (authoritative).
+#          informal WER, phone normalized WER) for Whisper (reference) then
+#          BuzzASR (authoritative).
 DEMO_SIMULATED_BASELINES = (
-    28.50, 8.90, 26.10, 24.00, 36.80,  # Whisper Large v3, reference-only
-    17.20, 4.80, 15.90, 15.10, 22.40,  # BuzzASR Base, authoritative
+    28.50, 8.90, 26.10, 24.00, 36.80, 35.00,  # Whisper Large v3, reference-only
+    17.20, 4.80, 15.90, 15.10, 22.40, 24.10,  # BuzzASR Base, authoritative
 )
 
 _WHISPER_WER, _WHISPER_CER, _WHISPER_DIAG, _WHISPER_FORMAL, _WHISPER_INFORMAL, \
-    _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, _BUZZ_INFORMAL = DEMO_SIMULATED_BASELINES
+    _WHISPER_PHONE_WER, _BUZZ_WER, _BUZZ_CER, _BUZZ_DIAG, _BUZZ_FORMAL, \
+    _BUZZ_INFORMAL, _BUZZ_PHONE_WER = DEMO_SIMULATED_BASELINES
+
+# Simulated customer-channel phone WER per epoch (four demo epochs).
+DEMO_EPOCH_PHONE_WERS = (21.50, 18.20, 15.90, 14.60)
 
 DEMO_FAIL_AT_STEP = int(os.environ.get("DEMO_FAIL_AT_STEP", "0") or 0)
 
@@ -70,11 +75,13 @@ sim_benchmarks = [
         "epoch_number": 0,
         "type": "baseline",
         "is_baseline": True,
+        "is_reference": True,
         "normalized_wer": _WHISPER_WER,
         "normalized_cer": _WHISPER_CER,
         "diagnostic_wer": _WHISPER_DIAG,
         "formal_wer": _WHISPER_FORMAL,
         "informal_wer": _WHISPER_INFORMAL,
+        "phone_normalized_wer": _WHISPER_PHONE_WER,
         "delta_vs_whisper": 0.0,
         "total_samples": 2149,
         "canary_transcriptions": [
@@ -103,11 +110,13 @@ sim_benchmarks = [
         "epoch_number": 0,
         "type": "baseline",
         "is_baseline": True,
+        "is_reference": False,
         "normalized_wer": _BUZZ_WER,
         "normalized_cer": _BUZZ_CER,
         "diagnostic_wer": _BUZZ_DIAG,
         "formal_wer": _BUZZ_FORMAL,
         "informal_wer": _BUZZ_INFORMAL,
+        "phone_normalized_wer": _BUZZ_PHONE_WER,
         "delta_vs_whisper": round(_BUZZ_WER - _WHISPER_WER, 2),
         "total_samples": 2149,
         "canary_transcriptions": []
@@ -224,6 +233,7 @@ def simulation_worker():
 
             delta_whisper = round(metrics[0] - _WHISPER_WER, 2)
             delta_buzz = round(metrics[0] - _BUZZ_WER, 2)
+            phone_wer = DEMO_EPOCH_PHONE_WERS[epoch_idx - 1]
             sim_benchmarks.append({
                 "epoch": f"Epoch {epoch_idx}",
                 "epoch_number": epoch_idx,
@@ -234,8 +244,10 @@ def simulation_worker():
                 "diagnostic_wer": metrics[2],
                 "formal_wer": metrics[3],
                 "informal_wer": metrics[4],
+                "phone_normalized_wer": phone_wer,
                 "delta_vs_whisper": delta_whisper,
                 "delta_vs_buzzasr": delta_buzz,
+                "delta_phone_vs_buzzasr": round(phone_wer - _BUZZ_PHONE_WER, 2),
                 "total_samples": 2149,
                 "canary_transcriptions": canary_cards,
                 "timestamp": time.time()

@@ -91,7 +91,7 @@ The former `configs/` baseline file (`baselines.json`) is gone. Every training r
 
 - Both the preflight and the epoch benchmark matrix use the first 1,000 test rows by default (`--preflight_samples 1000 --max_benchmark_samples 1000`; `0` = full 2,149-row test split).
 - **BuzzASR/persian is the authoritative baseline; Whisper Large v3 is reference-only.** A failed Whisper preflight omits its row instead of inventing values or blocking training.
-- The measured preflight is cached at `$ASR_RESULTS_DIR/baselines/preflight.json`. A matching fingerprint (dataset, split, sample count, phone seed/profiles, telemetry encoding, eval batch size, model ids) reuses the cache across restarts; `--overwrite_preflight` forces re-measurement.
+- The measured preflight is cached at `$ASR_RESULTS_DIR/baselines/preflight.json`. A matching fingerprint (dataset, split, sample count, phone seed/profiles, telephony ffmpeg encoding, eval batch size, model ids) reuses the cache across restarts; `--overwrite_preflight` forces re-measurement.
 - Epoch deltas are displayed as `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), and only when the row and baseline have the same sample count.
 - The final full-test report shows no delta without a matching full-test baseline; the default 1,000-row preflight against the 2,149-row test split reports `n/a (no matching full-test baseline)`.
 - For smoke runs, pass matching small values so the comparison stays valid: `--preflight_samples 20 --max_benchmark_samples 20`.
