@@ -1,0 +1,80 @@
+[
+  {
+    "group": "real_mobile",
+    "n": 79,
+    "gated": 74,
+    "noisy": 5,
+    "speech_rms_db": -21.2,
+    "noise_rms_db": -71.83,
+    "speech_frac": 0.72,
+    "hf_1_2k_rel_db": -24.86,
+    "hf_2_3k_rel_db": -37.11,
+    "spec_centroid": 450.49,
+    "spec_roll95": 562.5
+  },
+  {
+    "group": "real_extension",
+    "n": 21,
+    "gated": 0,
+    "noisy": 21,
+    "speech_rms_db": -29.62,
+    "noise_rms_db": -49.85,
+    "speech_frac": 0.56,
+    "hf_1_2k_rel_db": -3.66,
+    "hf_2_3k_rel_db": -10.85,
+    "spec_centroid": 511.54,
+    "spec_roll95": 1531.25
+  },
+  {
+    "group": "real_landline",
+    "n": 5,
+    "gated": 3,
+    "noisy": 2,
+    "speech_rms_db": -30.93,
+    "noise_rms_db": -68.63,
+    "speech_frac": 0.65,
+    "hf_1_2k_rel_db": -13.55,
+    "hf_2_3k_rel_db": -22.66,
+    "spec_centroid": 502.06,
+    "spec_roll95": 781.25
+  },
+  {
+    "group": "current_gated",
+    "n": 230,
+    "gated": "",
+    "noisy": "",
+    "speech_rms_db": -21.62,
+    "noise_rms_db": -72.81,
+    "speech_frac": 0.62,
+    "hf_1_2k_rel_db": -27.72,
+    "hf_2_3k_rel_db": -39.84,
+    "spec_centroid": 493.2,
+    "spec_roll95": 687.5
+  },
+  {
+    "group": "current_mobile",
+    "n": 230,
+    "gated": "",
+    "noisy": "",
+    "speech_rms_db": -31.94,
+    "noise_rms_db": -52.03,
+    "speech_frac": 0.7,
+    "hf_1_2k_rel_db": -11.52,
+    "hf_2_3k_rel_db": -24.62,
+    "spec_centroid": 445.35,
+    "spec_roll95": 687.5
+  },
+  {
+    "group": "current_pstn",
+    "n": 230,
+    "gated": "",
+    "noisy": "",
+    "speech_rms_db": -31.07,
+    "noise_rms_db": -49.25,
+    "speech_frac": 0.72,
+    "hf_1_2k_rel_db": -10.63,
+    "hf_2_3k_rel_db": -21.34,
+    "spec_centroid": 448.6,
+    "spec_roll95": 718.75
+  }
+]

@@ -239,7 +239,7 @@ def render_html(cards: Sequence[Dict[str, object]],
         "gated calls have no transcripts and no clean counterparts. Judge the "
         "noise floor, bandlimit and gating character only, not word accuracy "
         "on identical content.</p>",
-        '<section class="card"><h3>Real gated calls (call-center recordings)</h3>',
+        '<section class="card"><h3>Real gated calls (call-center recordings, mostly mobile-originated)</h3>',
     ]
     for entry in gated_real:
         parts.append(audio_row(
@@ -419,7 +419,7 @@ def main() -> None:
             "duration_s": round(len(audio) / sr, 3),
             "gain_db": round(gain_db, 2),
             "source": str(path),
-            "note": "call-center recording; no transcript",
+            "note": "real gated call; mostly mobile-originated; no transcript",
         }
         gated_real.append(entry)
         manifest["gated_real"].append(entry)
@@ -470,7 +470,7 @@ def main() -> None:
         "- `paired/`: same-sentence clean, legacy synth mobile/PSTN, current",
         "  synth mobile/PSTN/gated. This compares current vs legacy synth, not",
         "  real networks.",
-        "- `gated_real/`: real gated call-center excerpts (no transcripts).",
+        "- `gated_real/`: real gated call-center excerpts, mostly mobile-originated\n  (no transcripts).",
         "- `gated_sim/`: simulated gated clips with different content.",
         "",
         "The gated section is perceptual only; it is not a WER comparison.",

@@ -652,11 +652,48 @@ Findings:
   The model is not perfect on these sentences, and the paired deltas are the
   useful quantity.
 
+### Caller-number cross-check
+
+The first field of each real filename is the caller number. Classifying
+Iranian mobile prefixes is a proxy for the customer's access network (not
+proof of which side was recorded), but it exposes a major confound:
+
+- **79/105** real calls have mobile caller numbers.
+- **74 of the 77 gated** calls are mobile-originated.
+- **21 of the 28 noisy** calls are internal extensions; only 5 are mobile.
+
+| group | n | gated | noisy | speech RMS | noise RMS | HF 1–2k | HF 2–3.4k | centroid | roll95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| real mobile | 79 | 74 | 5 | −21.2 | −71.8 | −24.9 | −37.1 | 450.5 | 562.5 |
+| real extension | 21 | 0 | 21 | −29.6 | −49.9 | −3.7 | −10.8 | 511.5 | 1531.2 |
+| real landline | 5 | 3 | 2 | −30.9 | −68.6 | −13.6 | −22.7 | 502.1 | 781.2 |
+| current gated | 230 | — | — | −21.6 | −72.8 | −27.7 | −39.8 | 493.2 | 687.5 |
+| current mobile | 230 | — | — | −31.9 | −52.0 | −11.5 | −24.6 | 445.4 | 687.5 |
+| current PSTN | 230 | — | — | −31.1 | −49.2 | −10.6 | −21.3 | 448.6 | 718.8 |
+
+The **gated** profile is the closest to the real mobile customers: speech
+level −21.6 vs −21.2 dBFS, noise floor −72.8 vs −71.8 dBFS, and 2–3 dB darker
+in the 1–3.4 kHz bands. The **mobile** profile is closer to the noisy
+extension population on level and noise floor (−31.9/−52.0 vs −29.6/−49.9),
+although its high band is still darker than the extensions’. The current
+“mobile” profile is therefore a **noisy-line condition**, not a model of the
+mobile-originated customers in this corpus. The gated profile is the relevant
+one for those customers.
+
+Reproduce:
+
+```bash
+python RecordingTesting/analysis/caller_class_check.py
+```
+
+This writes `RecordingTesting/analysis/caller_class_medians.csv` and `.json`.
+
 **What remains unknown:** whether the current mobile/PSTN profiles match
-real carrier difficulty. The only real audio in the repo is 107 call-center
-recordings: 77 gated/clean and 28 noisy-line. None has a transcript, and the
-77 gated files have no clean source counterparts. A true real-vs-sim WER is
-therefore not possible with the current corpus.
+real carrier difficulty. The real mobile customers are mostly in the gated
+subset, and the gated profile is the closest acoustic match; the mobile
+profile is a noisy-line condition. A true real-vs-sim WER is still impossible
+with the current corpus: the 107 real calls have no transcripts, and the 77
+gated files have no clean source counterparts.
 
 ### Listening pass
 
@@ -669,9 +706,9 @@ Output: `results/telephone_listening_kit/index.html`.
 - Three paired same-sentence cards: clean, legacy synth mobile/PSTN, current
   synth mobile/PSTN/gated. All are level-matched to −26 dBFS active speech.
   These compare current vs legacy synth, not real networks.
-- Six real gated call-center excerpts and six simulated gated clips from
-  distinct speakers. These are **not paired**; judge gating, noise floor and
-  bandlimit only.
+- Six real gated call-center excerpts (mostly mobile-originated) and six
+  simulated gated clips from distinct speakers. These are **not paired**;
+  judge gating, noise floor and bandlimit only.
 - The listening pass is subjective and needs a Persian listener; the WER
   table above is the objective current-vs-legacy check.
 

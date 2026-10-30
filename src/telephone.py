@@ -66,9 +66,15 @@ MOBILE_PROFILES = ("mobile",)
 PSTN_PROFILES = ("pstn",)
 GATED_PROFILES = ("gated",)
 DEFAULT_PROFILES = ("gated", "mobile", "pstn")
+# Channel-condition weights, not carrier shares. Caller-number analysis of
+# the 2026-10-22 corpus: 74/77 gated calls were mobile-originated; the noisy
+# subset was mostly internal extensions. "gated" is therefore the closer
+# mobile-customer condition, while "mobile" below is a noisy-line condition.
 DEFAULT_PROFILE_WEIGHTS = {"gated": 0.70, "mobile": 0.15, "pstn": 0.15}
 
 # Calibrated against the 2026-10-22 call corpus (see RecordingTesting/analysis).
+# Caveat: the SNR/level ranges were fitted to the noisy-line subset (mostly
+# internal extensions), not to the mobile-originated gated majority.
 MOBILE_SNR_DB_RANGE = (18.0, 33.0)
 PSTN_SNR_DB_RANGE = (19.5, 34.5)
 PSTN_HUM_DB_RANGE = (-60.0, -45.0)
@@ -780,6 +786,13 @@ def simulate_mobile(waveform: Union[np.ndarray, Sequence[float]],
     matches the recorder's 8-bit storage format.  The real corpus is stored
     as A-law, so its AMR mode is not directly observable; ``amr_bitrate``
     defaults to the conservative 7.4k and can be varied for diversity.
+
+    Calibration note: in the 2026-10-22 corpus, 74 of 77 gated real calls were
+    mobile-originated, while the noisy-line subset was mostly internal
+    extensions.  This profile's SNR/level ranges follow that noisy-line
+    subset, so treat it as a noisy-line condition, not as the dominant
+    mobile-customer channel; ``simulate_gated`` is the closer acoustic match
+    to the mobile customers in that corpus.
     """
     if sr != TARGET_SR:
         raise ValueError(f"simulate_mobile expects {TARGET_SR} Hz input, got {sr}.")
