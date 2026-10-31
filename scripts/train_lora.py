@@ -615,6 +615,7 @@ def _validate_cli_run_dir(run_dir: Path) -> None:
     a canonical run id, so the cockpit can list, resume, and merge it like any
     other run.
     """
+    run_dir = Path(run_dir).expanduser().resolve()
     runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
     if not run_state.run_id_valid(run_dir.name) or run_dir.parent != runs_root:
         print(
@@ -691,10 +692,11 @@ def _write_cli_pid(run_dir: Path) -> None:
 
 def _abort_cli_setup(run_dir: Path) -> None:
     """Close any attempt opened during CLI setup and drop the PID file."""
-    try:
-        run_state.finalize_attempt(run_dir, exit_code=1, reason="nonzero_exit")
-    except Exception as exc:
-        print(f"Warning: could not finalize run attempt: {exc}", file=sys.stderr)
+    if run_state.load_run(run_dir) is not None:
+        try:
+            run_state.finalize_attempt(run_dir, exit_code=1, reason="nonzero_exit")
+        except Exception as exc:
+            print(f"Warning: could not finalize run attempt: {exc}", file=sys.stderr)
     try:
         (Path(run_dir) / "training.pid").unlink(missing_ok=True)
     except OSError:
@@ -1011,7 +1013,6 @@ def _run_post_eval_only(args) -> None:
     _mark_run_status(
         run_dir, "completed", failed_stage=None, last_error=None
     )
-    _write_telemetry_status(results_dir, "completed")
 
 
 def main():
@@ -1492,13 +1493,15 @@ def _run_training(args, run_dir):
             return
     else:
         _mark_run_stage(run_dir, "post_eval", "skipped", detail=None)
+        _write_telemetry_status(args.results_dir, "completed")
 
     # Overall completion requires training completed and post-eval
     # completed/skipped; merge is tracked separately and never blocks this.
+    # The post-eval stage owns the terminal telemetry snapshot on the success
+    # path; the skipped branch writes its own above.
     _mark_run_status(
         run_dir, "completed", failed_stage=None, last_error=None
     )
-    _write_telemetry_status(args.results_dir, "completed")
 
 
 def _format_delta(value: Optional[float]) -> str:

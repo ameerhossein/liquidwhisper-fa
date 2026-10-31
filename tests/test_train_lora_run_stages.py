@@ -828,6 +828,35 @@ def test_main_setup_failure_finalizes_open_attempt(tmp_path, monkeypatch):
     assert not (run_dir.resolve() / "training.pid").exists()
 
 
+def test_validate_cli_run_dir_accepts_relative_path(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    # A future caller passing a relative path resolves against the same root.
+    train_lora._validate_cli_run_dir(Path(RUN_ID))
+    with pytest.raises(SystemExit):
+        train_lora._validate_cli_run_dir(Path("my-run"))
+
+
+def test_main_setup_failure_before_ledger_is_silent(tmp_path, monkeypatch, capsys):
+    train_lora = _train_lora()
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / RUN_ID
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
+    args = _canonical_args(tmp_path, run_dir)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+
+    def _boom(_run_dir, _args):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(train_lora, "_ensure_cli_run", _boom)
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        train_lora.main()
+
+    assert run_state.load_run(run_dir) is None
+    assert "could not finalize" not in capsys.readouterr().err
+
+
 def test_preflight_detail_update_preserves_started_at(tmp_path):
     train_lora = _train_lora()
     run_dir = _run(tmp_path)
@@ -846,9 +875,16 @@ def test_preflight_detail_update_preserves_started_at(tmp_path):
     assert _stages(run_dir)["preflight"]["started_at"] == first
 
 
-def test_mark_run_stage_without_preserve_refreshes_started_at(tmp_path):
+def test_mark_run_stage_without_preserve_refreshes_started_at(tmp_path, monkeypatch):
     train_lora = _train_lora()
     run_dir = _run(tmp_path)
+    clock = {"now": 1000.0}
+
+    def fake_time():
+        clock["now"] += 1.0
+        return clock["now"]
+
+    monkeypatch.setattr(run_state.time, "time", fake_time)
     train_lora._mark_run_stage(
         run_dir, "preflight", "running", detail="preparing datasets"
     )
@@ -856,7 +892,7 @@ def test_mark_run_stage_without_preserve_refreshes_started_at(tmp_path):
     train_lora._mark_run_stage(
         run_dir, "preflight", "running", detail="measuring baseline"
     )
-    assert _stages(run_dir)["preflight"]["started_at"] >= first
+    assert _stages(run_dir)["preflight"]["started_at"] > first
 
 
 def test_halt_run_rejects_unknown_stage(tmp_path):
