@@ -6,6 +6,7 @@ FastAPI application delivering:
 - Static UI delivery on Port 7860
 """
 
+import importlib.util
 import os
 import sys
 import json
@@ -36,6 +37,7 @@ except Exception:
     pass
 from src import paths as _managed_paths  # noqa: E402
 from src import run_state  # noqa: E402
+from src import hf_sync  # noqa: E402
 
 
 def _default_results_dir() -> Path:
@@ -118,6 +120,10 @@ training_process: Optional[subprocess.Popen] = None
 training_log_fd = None
 connected_websockets: List[WebSocket] = []
 PID_FILE = RESULTS_DIR / "training.pid"
+# HF restore child state. The status file is durable across page reloads and
+# server restarts; the log is the full child output.
+HF_RESTORE_STATUS_FILE = RUNS_DIR / "_hf_restore.status.json"
+HF_RESTORE_LOG_FILE = RUNS_DIR / "_hf_restore.log"
 last_exit_code: Optional[int] = None
 halt_requested = False
 SMOKE_DIR_NAME = "smoke-test"
@@ -141,6 +147,10 @@ merge_process: Optional[subprocess.Popen] = None
 merge_log_fd = None
 merge_run_id: Optional[str] = None
 training_run_id: Optional[str] = None
+hf_restore_process: Optional[subprocess.Popen] = None
+hf_restore_log_fd = None
+hf_restore_run_id: Optional[str] = None
+_hf_restore_last_state: str = "idle"
 _monitor_task: Optional[asyncio.Task] = None
 
 # Short TTL caches for the 1s status/WebSocket path. The full ledger scan
@@ -158,6 +168,11 @@ _LOG_EXCEPTION_WINDOW_SECONDS = 60.0
 _LOG_EXCEPTION_MAX_CONTEXTS = 128
 _DUPLICATE_WARN_TTL_SECONDS = 60.0
 _duplicate_warn_at: float = 0.0
+
+# Remote run listing cache: one list_repo_files/download scan per repo every
+# 30s, shared by every cockpit client.
+_HF_RUNS_CACHE_TTL_SECONDS = 30.0
+_hf_runs_cache: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
 
 
 def _load_preflight_benchmarks(
@@ -743,6 +758,8 @@ def _run_payload(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "storage": run_state.storage_info(RUNS_DIR),
             "process_running": False,
             "adapter_exists": False,
+            "hf": {},
+            "hf_sync": {},
         }
     paths = _run_paths(run)
     telemetry = read_json_safely(paths["telemetry_file"], {})
@@ -758,6 +775,8 @@ def _run_payload(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "storage": run_state.storage_info(RUNS_DIR),
         "process_running": _run_process_running(run),
         "adapter_exists": _run_adapter_exists(run),
+        "hf": run.get("hf") or {},
+        "hf_sync": read_json_safely(_run_dir(run) / "hf_sync.json", {}),
     }
 
 
@@ -769,6 +788,7 @@ async def _monitor_loop() -> None:
             # the ledger rescan (which only knows PID liveness).
             _training_running()
             _merge_running(force=True)
+            _hf_restore_running()
             _refresh_runs()
         except asyncio.CancelledError:
             raise
@@ -813,6 +833,7 @@ def _recover_runs_on_startup() -> None:
     steps = (
         ("startup training poll", _training_running),
         ("startup merge recovery", _forced_merge_scan),
+        ("startup HF restore recovery", _hf_restore_running),
         ("startup ledger refresh", _refresh_runs),
     )
     for context, step in steps:
@@ -1201,8 +1222,13 @@ def _merge_running(force: bool = False) -> bool:
 
 
 def _any_job_running() -> bool:
-    """Shared busy check: full run, smoke test, or merge."""
-    if _training_running() or _smoke_running() or _merge_running(force=True):
+    """Shared busy check: full run, smoke test, merge, or HF restore."""
+    if (
+        _training_running()
+        or _smoke_running()
+        or _merge_running(force=True)
+        or _hf_restore_running()
+    ):
         return True
     _refresh_runs()
     return _active_run() is not None
@@ -1211,6 +1237,285 @@ def _any_job_running() -> bool:
 def _any_training_running() -> bool:
     """Backward-compatible alias for :func:`_any_job_running`."""
     return _any_job_running()
+
+
+def _hf_restore_status_file() -> Path:
+    return HF_RESTORE_STATUS_FILE
+
+
+def _hf_restore_log_file() -> Path:
+    return HF_RESTORE_LOG_FILE
+
+
+def _hf_restore_status() -> Dict[str, Any]:
+    """The persisted restore status, or an idle placeholder when absent."""
+    data = read_json_safely(_hf_restore_status_file(), {})
+    return data if isinstance(data, dict) and data else {"state": "idle"}
+
+
+def _redact_secret_text(value: Any) -> str:
+    """Remove configured secrets from text returned to a cockpit client."""
+    text = str(value if value is not None else "")
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "ASR_COCKPIT_TOKEN"):
+        secret = os.environ.get(name, "")
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _write_hf_restore_status(payload: Dict[str, Any]) -> None:
+    """Atomically persist the restore status consumed by reloads/restarts."""
+    body = dict(payload)
+    body["updated_at"] = time.time()
+    path = _hf_restore_status_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(
+            json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _record_hf_restore_failure(run_id: str, message: str) -> None:
+    try:
+        _write_hf_restore_status(
+            {
+                "state": "failed",
+                "run_id": run_id,
+                "message": _redact_secret_text(message),
+                "pid": None,
+                "checkpoint_step": None,
+            }
+        )
+    except Exception:
+        pass
+
+
+def _close_hf_restore_log_fd() -> None:
+    global hf_restore_log_fd
+    try:
+        if hf_restore_log_fd is not None:
+            try:
+                hf_restore_log_fd.flush()
+            except Exception:
+                pass
+            try:
+                hf_restore_log_fd.close()
+            except Exception:
+                pass
+    finally:
+        hf_restore_log_fd = None
+
+
+def _hf_restore_running() -> bool:
+    """Poll the restore child and reconcile a stale persisted status.
+
+    After a restart there is no child handle, so progress is recovered from
+    the status file. A ``running`` status whose recorded PID is dead (or was
+    never recorded) becomes ``interrupted`` and stops blocking new work.
+    """
+    global hf_restore_process, hf_restore_run_id, _hf_restore_last_state
+    exited = False
+    if hf_restore_process is not None:
+        code = hf_restore_process.poll()
+        if code is None:
+            return True
+        hf_restore_process = None
+        hf_restore_run_id = None
+        _close_hf_restore_log_fd()
+        exited = True
+
+    status = _hf_restore_status()
+    state = str(status.get("state") or "idle")
+    if state == "running":
+        pid = status.get("pid")
+        try:
+            pid_int = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid_int = None
+        if pid_int is not None and _is_process_running(pid_int):
+            hf_restore_run_id = (
+                str(status.get("run_id") or "") or hf_restore_run_id
+            )
+            _hf_restore_last_state = "running"
+            return True
+
+        status["state"] = "interrupted"
+        if not status.get("message"):
+            status["message"] = (
+                "restore process is no longer running; the status was "
+                "left at 'running'"
+            )
+        try:
+            _write_hf_restore_status(status)
+        except Exception:
+            pass
+        state = "interrupted"
+
+    if exited:
+        # A completed restore adds a run directory; any terminal exit should
+        # make the next run-list scan see the final on-disk state.
+        _invalidate_refresh_cache()
+        _hf_restore_last_state = state
+    elif state != _hf_restore_last_state:
+        if state in ("completed", "failed", "interrupted"):
+            _invalidate_refresh_cache()
+        _hf_restore_last_state = state
+    return False
+
+
+def _start_hf_restore(
+    run_id: str,
+    repo: Optional[str] = None,
+    include_merged: bool = False,
+) -> Dict[str, Any]:
+    """Spawn ``scripts/hf_restore.py`` and persist its initial status."""
+    global hf_restore_process, hf_restore_log_fd, hf_restore_run_id
+    global _hf_restore_last_state
+
+    run_id = str(run_id or "").strip()
+    if not run_state.run_id_valid(run_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "invalid run id; expected YYYYMMDD-HHMMSS-<6 hex chars>."
+            ),
+        )
+
+    if _hf_restore_running():
+        raise HTTPException(
+            status_code=400, detail="A Hugging Face restore is already running."
+        )
+    if _any_job_running():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Training, smoke test, merge, or Hugging Face restore is "
+                "already running."
+            ),
+        )
+
+    run_dir = RUNS_DIR / run_id
+    try:
+        occupied = run_dir.exists() and (
+            not run_dir.is_dir() or any(run_dir.iterdir())
+        )
+    except OSError:
+        occupied = True
+    if occupied:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"local run directory already exists: {run_dir}; "
+                "remove it or choose another run"
+            ),
+        )
+
+    repo_id = str(repo or "").strip() or (
+        os.environ.get("ASR_HF_RUN_REPO", "") or ""
+    ).strip()
+    if not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "no Hugging Face repo configured; set ASR_HF_RUN_REPO or "
+                "pass repo"
+            ),
+        )
+    try:
+        hf_sync.validate_repo_id(repo_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    status_file = _hf_restore_status_file()
+    log_file = _hf_restore_log_file()
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+
+    _close_hf_restore_log_fd()
+    try:
+        hf_restore_log_fd = open(log_file, "w", encoding="utf-8")
+        hf_restore_log_fd.write(
+            f"=== Hugging Face restore launched at {time.ctime()} ===\n"
+        )
+        hf_restore_log_fd.write(f"Run: {run_id}\nRepo: {repo_id}\n\n")
+        hf_restore_log_fd.flush()
+    except OSError as exc:
+        _close_hf_restore_log_fd()
+        _record_hf_restore_failure(
+            run_id, f"Failed to open the restore log: {exc}"
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to open the restore log: {exc}"
+        ) from exc
+
+    cmd = [
+        sys.executable,
+        "-u",
+        "scripts/hf_restore.py",
+        "--run", run_id,
+        "--repo", repo_id,
+        "--runs-root", str(RUNS_DIR),
+        "--status-file", str(status_file),
+    ]
+    if include_merged:
+        cmd.append("--include-merged")
+
+    hf_restore_process = None
+    try:
+        hf_restore_process = subprocess.Popen(
+            cmd,
+            stdout=hf_restore_log_fd,
+            stderr=subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            start_new_session=True,
+        )
+    except Exception as exc:
+        try:
+            hf_restore_log_fd.write(
+                f"\n!!! Failed to launch the restore: {exc}\n"
+            )
+            hf_restore_log_fd.flush()
+        except Exception:
+            pass
+        _close_hf_restore_log_fd()
+        _record_hf_restore_failure(
+            run_id, f"Failed to launch the restore: {exc}"
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to launch the restore: {exc}"
+        ) from exc
+
+    hf_restore_run_id = run_id
+    _hf_restore_last_state = "running"
+    pid = hf_restore_process.pid
+    try:
+        _write_hf_restore_status(
+            {
+                "state": "running",
+                "run_id": run_id,
+                "message": f"Restoring {run_id} from {repo_id}",
+                "pid": pid,
+                "checkpoint_step": None,
+            }
+        )
+    except Exception as exc:
+        _terminate_child(pid)
+        hf_restore_process = None
+        hf_restore_run_id = None
+        _close_hf_restore_log_fd()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to record the restore status: {exc}",
+        ) from exc
+
+    return {"state": "running", "run_id": run_id}
 
 
 def _derive_status(
@@ -2645,6 +2950,90 @@ async def merge_run(run_id: str, config: Dict[str, Any] = None):
     return _start_merge(run_id)
 
 
+@app.post("/api/hf/restore")
+async def start_hf_restore(payload: Dict[str, Any] = None):
+    payload = payload or {}
+    _check_auth(payload)
+    return _start_hf_restore(
+        str(payload.get("run_id") or ""),
+        str(payload.get("repo") or "").strip() or None,
+        include_merged=_as_bool(payload.get("include_merged", False)),
+    )
+
+
+@app.get("/api/hf/restore/status")
+async def get_hf_restore_status():
+    _hf_restore_running()
+    status = _hf_restore_status()
+    data: Dict[str, Any] = {
+        "state": "idle",
+        "run_id": None,
+        "message": "",
+        "updated_at": None,
+    }
+    data.update(status)
+    data["message"] = _redact_secret_text(data.get("message"))
+    data["log_tail"] = [
+        _redact_secret_text(line)
+        for line in _read_log_tail(_hf_restore_log_file(), 40)
+    ]
+    return data
+
+
+@app.get("/api/hf/config")
+async def get_hf_config():
+    try:
+        enabled = importlib.util.find_spec("huggingface_hub") is not None
+    except Exception:
+        enabled = False
+    return {
+        "enabled": enabled,
+        "repo_id": (os.environ.get("ASR_HF_RUN_REPO", "") or "").strip(),
+        "runs_root": str(RUNS_DIR),
+    }
+
+
+@app.get("/api/hf/runs")
+async def list_hf_runs(repo: Optional[str] = None):
+    repo_id = str(repo or "").strip() or (
+        os.environ.get("ASR_HF_RUN_REPO", "") or ""
+    ).strip()
+    if not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "no Hugging Face repo configured; set ASR_HF_RUN_REPO or "
+                "pass repo"
+            ),
+        )
+    try:
+        hf_sync.validate_repo_id(repo_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        now = time.monotonic()
+    except Exception:
+        now = time.time()
+    cached = _hf_runs_cache.get(repo_id)
+    if cached is not None and (now - cached[0]) < _HF_RUNS_CACHE_TTL_SECONDS:
+        return {"runs": cached[1], "repo_id": repo_id}
+
+    try:
+        runs = hf_sync.list_remote_runs(hf_sync.make_api(), repo_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_redact_secret_text(
+                f"Could not list Hugging Face runs: {exc}"
+            )[:300],
+        ) from exc
+    if not isinstance(runs, list):
+        runs = list(runs or [])
+    _hf_runs_cache[repo_id] = (now, runs)
+    return {"runs": runs, "repo_id": repo_id}
+
+
 def _escalation_run(run_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
     if run_dir is None:
         return None
@@ -2841,6 +3230,10 @@ async def websocket_telemetry(websocket: WebSocket):
                 "steps": _steps_summary(run, telemetry),
                 "storage": run_state.storage_info(RUNS_DIR),
                 "adapter_exists": _run_adapter_exists(run),
+                "hf": (run or {}).get("hf") or {},
+                "hf_sync": read_json_safely(
+                    _run_dir(run) / "hf_sync.json", {}
+                ),
                 "timestamp": time.time()
             }
             await websocket.send_json(payload)
