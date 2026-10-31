@@ -68,13 +68,41 @@ Persistent by default (when `/workspace` exists):
 
 Ephemeral (re-downloaded / lost on restart):
 - `~/stt/.venv/`, repo-local `outputs/`, `results/`, `models/`
-- HF caches (base model + Neyshekar raw + `map` temps) and `prep_cache`
-  (prepared Arrows): auto-routed by `src/cache.py` to the roomiest disk
+- HF caches (base model + Neyshekar raw) and the **prep cache** (prepared Arrow
+  shards): auto-routed by `src/cache.py` to the roomiest disk
   (`~/.cache/huggingface`, `/tmp/hf_cache`), never `/workspace`.
-  Overrides: `ASR_HF_CACHE_DIR` / `HF_DATASETS_CACHE` / `ASR_PREP_CACHE_DIR`.
-  A template-default `HF_HOME` pointing at `/workspace` is overridden with
-  a warning (`ASR_HONOR_HF_HOME=1` keeps it).
+  Overrides: `ASR_HF_CACHE_DIR` / `HF_DATASETS_CACHE` / `ASR_PREP_CACHE_DIR`;
+  `--prep_cache_dir <output_dir>/prep_cache` keeps the prep cache on the
+  persistent volume. A template-default `HF_HOME` pointing at `/workspace` is
+  overridden with a warning (`ASR_HONOR_HF_HOME=1` keeps it).
 - Any merge output under `models/...` unless you point it at `/workspace`.
+
+### Prep cache (direct Arrow shards)
+
+`scripts/train_lora.py` maps prepared features directly into
+`<prep cache>/train` and `<prep cache>/validation` with
+`datasets.map(cache_file_name=...)`; there is no `Dataset.save_to_disk()`
+copy, so peak and steady state are the same size. The default paired train
+split is 116,488 rows and takes ~170 GB.
+
+A cache slot holds the Arrow shards plus `meta.json` (format `shards_v1`, the
+full fingerprint, ordered shard files with row counts/sizes, total rows, and
+the feature schema). Loading validates all of it and treats any mismatch as a
+miss. Publication maps into `<name>.staging-<pid>-<random>`, writes
+`meta.json` last, removes the old slot, and atomically renames the staging
+directory into place; a crash leaves only the staging directory, which the
+next attempt cleans up. Before the first map the trainer requires ~180 GB
+projected free space (current free plus the stale train cache it will remove)
+and aborts with a clear error otherwise. The ~250 GB RunPod overlay leaves
+headroom for raw audio/model weights (~25 GB on the same disk).
+
+Cache slots are keyed by the prep fingerprint (dataset, split, sample cap,
+telephony mode/prob/profiles/seed/ffmpeg, label ids), so switching modes
+re-preps. The validation slot is mode-independent and survives train-mode
+changes. Existing `save_to_disk` caches are not readable; the new fingerprint
+and `meta.json` format replace them on the first run. To keep both paired and
+disjoint train caches, use a different `--prep_cache_dir` (or
+`ASR_PREP_CACHE_DIR`) per mode; only one train slot exists per directory.
 
 Persistent merge:
 
@@ -100,6 +128,13 @@ Check: `echo $ASR_OUTPUT_DIR; ls -d /workspace/stt-outputs/buzzasr-neyshekar-lor
   It reuses the same run directory and original settings, auto-resumes from the
   checkpoint, and switches to `--post_eval_only` when training already
   completed but post-eval is still pending.
+- **Resume with the original telephony mode.** A checkpoint trained before
+  paired became the default (or any disjoint run) must resume with
+  `--telephony_mode disjoint` and the old epoch count (typically
+  `--epochs 4`), or start fresh with `--fresh_start`. The mode is part of the
+  prep fingerprint, so resuming an old run as paired re-preps different data
+  than the checkpoint saw. Cockpit Resume reuses the stored mode and injects
+  `disjoint` for legacy manifests that do not record one.
 - Only have `best_adapter`/merged? Start round 2 with merged as new base (use lower LR to avoid forgetting). Do not stack adapter-on-adapter:
   ```bash
   python scripts/train_lora.py \

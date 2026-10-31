@@ -140,12 +140,13 @@ source .venv/bin/activate
 | **Precision** | Native Bfloat16 (`bf16`) |
 | **LoRA Configuration** | $r=64$, $\alpha=128$, target: `q_proj, v_proj, k_proj, out_proj, fc1, fc2` |
 | **Batch Size** | 8 per device $\times$ 4 gradient accumulation = **32 effective batch size**, gradient checkpointing off |
-| **Telephony Mix** | 50% clean / 50% customer-channel simulation (`--telephony_prob 0.5`) |
+| **Telephony Mix** | Paired clean + phone (1:1, 2 epochs) |
 | **Optimizer** | `adamw_torch_fused` |
-| **Duration** | **~10 hours** for 4 epochs (estimated from benchmark step time; not yet measured end to end) |
+| **Duration** | **~10 hours** for 2 paired epochs (same optimizer steps as 4 disjoint epochs); prep is ~2× the disjoint prep (one-time) |
 | **Validation / Checkpoint** | Every 1,000 optimizer steps (`--eval_steps 1000 --save_steps 1000`) |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
 | **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |
+| **Prep Cache** | Direct Arrow shards + validated `meta.json` (fingerprint, shard rows/sizes, feature schema) in `prep_cache/train` and `prep_cache/validation`; paired train cache ≈ 170 GB steady/peak, ~180 GB free-space guard; no `save_to_disk` duplicate |
 | **Preflight Baseline** | Mandatory; cockpit runs cache at `<runs root>/_shared/baselines/preflight.json` (CLI default `$ASR_RESULTS_DIR/baselines/preflight.json`); first 1,000 test rows (BuzzASR authoritative, Whisper reference-only) |
 | **Epoch Benchmark** | 1,000-sample subset by default, matching the preflight (`--preflight_samples 0 --max_benchmark_samples 0` = full 2,149) |
 
@@ -155,6 +156,7 @@ Launch the web interface (port 7860, RunPod HTTP proxy compatible):
 ./runpod_web.sh
 ```
 Open your RunPod HTTP proxy URL in your browser to view:
+- **Training Data Selector:** choose paired clean + phone (default), disjoint 50/50, or clean only; the selector auto-fills 2/4/4 epochs respectively.
 - **Real-time Telemetry:** GPU VRAM allocation gauge, Loss curve, LR, and ETA.
 - **Epoch Benchmark Comparison Matrix:** Evaluates a 1,000-sample subset per epoch by default, matching the preflight rows (use `--preflight_samples 0 --max_benchmark_samples 0` for the complete 2,149-sample test split; keep both values aligned). It records normalized WER, CER, formal vs. informal breakdown, and `Δ clean vs base` / `Δ phone vs base` deltas in percentage points (pp) against the measured BuzzASR baseline.
 - **Canary Audio Inspector:** Live orthography comparison for ZWNJ and colloquial contractions.

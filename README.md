@@ -133,7 +133,7 @@ simulated UI and does not create ledger runs.
 
 * **Native Persian Tokenizer:** OpenAI's standard Whisper Large v3 uses a multilingual byte-level BPE tokenizer, taking 5–12 tokens per Persian word. `BuzzASR/persian` replaces this with a Persian BPE tokenizer (~3.3x compression), preventing looping hallucinations and speeding up generation.
 * **Neyshekar Dataset (v5/v6):** Provides ~80–100 hours of curated native Persian speech with strict **speaker-disjoint** and **text-disjoint** splits, containing both formal Persian and ~25–35% colloquial/informal Persian.
-* **Full BF16 LoRA on L40S:** With 48 GB VRAM, training runs in full 16-bit precision without 4-bit quantization latency, taking ~3 to 5 hours for 4 epochs with fused AdamW and SDPA attention.
+* **Full BF16 LoRA on L40S:** With 48 GB VRAM, training runs in full 16-bit precision without 4-bit quantization latency, taking ~3 to 5 hours for the default 2 paired epochs (compute-matched to 4 disjoint epochs) with fused AdamW and SDPA attention.
 
 ---
 
@@ -248,10 +248,13 @@ tmux new -s train_asr
 * `--batch_size 8 --grad_accum 4`: Effective batch size of 32; the measured fast L40S configuration.
 * `--gradient_checkpointing` / `--no-gradient_checkpointing`: **off by default**. Off is about 35% faster; enable it only if a larger micro-batch requires the VRAM savings.
 * `--eval_steps 1000 --save_steps 1000`: evaluation and checkpoint interval. `save_steps` must be a multiple of `eval_steps`.
-* `--telephony_prob 0.5`: half clean, half customer-channel training audio.
+* `--telephony_mode paired` (default): every utterance once clean and once phone-simulated, 116,488 rows; `--epochs 2` is compute-matched to 4 disjoint epochs.
+* `--telephony_mode disjoint`: the old 50/50 coin (`--telephony_prob 0.5`); use `--epochs 4`.
+* `--telephony_mode clean`: no phone simulation; use `--epochs 4`.
+* `--epochs 2`: 2 paired epochs (same optimizer steps as 4 disjoint epochs).
 * `--learning_rate 1e-4`: Optimal for LoRA.
-* `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).
+* Prepared-data cache: direct Arrow shards in `prep_cache/train` and `prep_cache/validation`, published atomically with a validated `meta.json` (format, fingerprint, shard rows/sizes, feature schema); no `save_to_disk` duplicate. Paired training needs ~170 GB steady and peak; the writer guards ~180 GB free (current free plus the stale cache it replaces), leaving room on the ~250 GB overlay for raw audio/model weights (~25 GB).
 * `--run_dir <dir>`: self-contained CLI run ledger. It must be a canonical run directory directly under the resolved runs root (`<runs-root>/YYYYMMDD-HHMMSS-xxxxxx`); anything else exits with an error telling you to use `ASR_RUNS_DIR`/a canonical id. When `--results_dir` is not given it defaults to the run directory, and a default `--output_dir` becomes `<run>/output`. The trainer records its PID/attempt, writes `<run>/training.pid`, tees stdout/stderr to `<run>/training_live.log`, and closes the attempt at exit; the cockpit detects the live CLI run from the pid file. An explicit `--output_dir` still wins. An explicit `--results_dir` is honored for the run's telemetry (`live_telemetry.json`), benchmarks, loss history, and stop signal; the log and PID file always stay under the run directory. `--fresh_start` clears prior checkpoints, adapters, reports, and telemetry history first, including for a plain CLI run with no `--run_dir`.
 * `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows. Set both to `0` (`--preflight_samples 0 --max_benchmark_samples 0`) for the full 2,149-sample test set; keep them aligned.
 * `--no-enable-telemetry / --no-run-epoch-benchmark`: disable live telemetry or epoch eval.
