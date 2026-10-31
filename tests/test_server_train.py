@@ -54,7 +54,18 @@ def client(tmp_path, monkeypatch):
     client = TestClient(mod.app)
     client.mod = mod
     client.launched = launched
-    return client
+    try:
+        yield client
+    finally:
+        for close in (
+            mod._close_merge_log_fd,
+            mod._close_log_fd,
+            mod._close_smoke_log_fd,
+        ):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def _flags(cmd):
@@ -110,7 +121,10 @@ def _write_merge_artifacts(client, run_id, *, weights="model.safetensors"):
     return merged
 
 
-def test_refresh_finds_older_live_run(client):
+def test_refresh_finds_older_live_run(client, monkeypatch):
+    monkeypatch.setattr(
+        client.mod, "_is_process_running", lambda pid=None: pid == os.getpid()
+    )
     old = _create_run(client, pid=os.getpid(), run_id="20261030-194700-aaaaaa")
     new = _create_run(client, pid=999999, run_id="20261030-195700-bbbbbb")
     client.mod._refresh_runs()
@@ -118,7 +132,8 @@ def test_refresh_finds_older_live_run(client):
     assert client.mod.LATEST_RUN["run_id"] == new["run_id"]
 
 
-def test_refresh_marks_dead_run_interrupted(client):
+def test_refresh_marks_dead_run_interrupted(client, monkeypatch):
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
     run = _create_run(client, pid=999999, status="running")
     client.mod._refresh_runs()
     assert (
@@ -127,7 +142,8 @@ def test_refresh_marks_dead_run_interrupted(client):
     )
 
 
-def test_refresh_does_not_rewrite_completed_run(client):
+def test_refresh_does_not_rewrite_completed_run(client, monkeypatch):
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
     run = _create_run(client, pid=999999, status="completed")
     client.mod._refresh_runs()
     assert (
@@ -151,11 +167,25 @@ def test_merge_starts_and_marks_stage(client):
     run_dir = client.mod.RUNS_DIR / start["run_id"]
     (run_dir / "output" / "best_adapter").mkdir(parents=True)
     (run_dir / "output" / "best_adapter" / "adapter_config.json").write_text("{}")
+    run_state.set_stage(run_dir, "preflight", "completed")
     run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
     res = client.post(f"/api/runs/{start['run_id']}/merge")
     assert res.status_code == 200, res.text
     assert "--adapter_path" in client.launched[-1]
     assert run_state.load_run(run_dir)["stages"][3]["status"] == "running"
+
+
+def test_merge_rejected_while_target_trainer_live_and_stages_pending(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    _seed_adapter(client, start["run_id"])
+    run_state.set_stage(run_dir, "training", "completed")
+    # The fake trainer handle is still live and belongs to this run, but
+    # preflight/post_eval are not terminal yet: R12 blocks the merge.
+    res = client.post(f"/api/runs/{start['run_id']}/merge")
+    assert res.status_code == 400
+    assert len(client.launched) == 1
 
 
 def test_merge_rejected_before_training_completed(client):
@@ -929,11 +959,91 @@ def test_training_exit_after_stop_request_marks_stopped(client, monkeypatch):
     assert run["stages"][1]["status"] == "stopped"
 
 
+def test_status_polls_child_before_refresh(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = _ExitedProcess(1)
+
+    body = client.get("/api/status").json()
+    assert body["run"]["run_id"] == start["run_id"]
+    assert body["run"]["status"] == "failed"
+    assert body["process_running"] is False
+
+
+def test_websocket_polls_child_before_refresh(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    monkeypatch.setattr(client.mod, "get_gpu_info", lambda: {})
+    client.mod.training_process = _ExitedProcess(1)
+
+    with client.websocket_connect("/ws/live") as ws:
+        payload = ws.receive_json()
+    assert payload["run"]["run_id"] == start["run_id"]
+    assert payload["run"]["status"] == "failed"
+    assert payload["telemetry"]["process_running"] is False
+
+
+def test_training_running_reconciles_dead_run_pid_file(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="running", run_id="20261030-194700-bbbbbc"
+    )
+    run_dir = client.mod.RUNS_DIR / run["run_id"]
+    (run_dir / "training.pid").write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = None
+    client.mod.training_run_id = None
+    client.mod.ACTIVE_RUN_ID = run["run_id"]
+    client.mod.CURRENT_RUN = run_state.load_run(run_dir)
+    client.mod.LATEST_RUN = client.mod.CURRENT_RUN
+
+    assert client.mod._training_running() is False
+    assert run_state.load_run(run_dir)["status"] == "interrupted"
+    assert not (run_dir / "training.pid").exists()
+
+
+def test_startup_recovery_reconciles_dead_run(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="running", run_id="20261030-194700-bbbbbd"
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+
+    client.mod._recover_runs_on_startup()
+    assert run_state.load_run(client.mod.RUNS_DIR / run["run_id"])["status"] == (
+        "interrupted"
+    )
+
+
+def test_startup_recovery_logs_failures(client, monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("startup boom")
+
+    monkeypatch.setattr(client.mod, "_training_running", boom)
+    client.mod._recover_runs_on_startup()
+    assert "startup training poll failed" in capsys.readouterr().err
+
+
+def test_lifespan_starts_and_stops_monitor(client):
+    from fastapi.testclient import TestClient
+
+    with TestClient(client.mod.app):
+        task = client.mod._monitor_task
+        assert task is not None
+        assert not task.done()
+    assert client.mod._monitor_task is None
+
+
+def _terminal_stages(run_dir):
+    """Complete preflight/training/post-eval so R12 permits a live-target merge."""
+    run_state.set_stage(run_dir, "preflight", "completed")
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
+
+
 def test_merge_completes_on_zero_exit_with_artifacts(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]
     _seed_adapter(client, start["run_id"])
-    run_state.set_stage(run_dir, "training", "completed")
+    _terminal_stages(run_dir)
     assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
 
     _write_merge_artifacts(client, start["run_id"])
@@ -945,14 +1055,13 @@ def test_merge_completes_on_zero_exit_with_artifacts(client):
     assert merge_stage["status"] == "completed"
     assert merge_stage["exit_code"] == 0
     assert run["merge_pid"] is None
-    assert client.mod.merge_last_exit_code == 0
 
 
 def test_merge_fails_on_zero_exit_without_artifacts(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]
     _seed_adapter(client, start["run_id"])
-    run_state.set_stage(run_dir, "training", "completed")
+    _terminal_stages(run_dir)
     assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
 
     client.mod.merge_process = _ExitedProcess(0)
@@ -970,7 +1079,7 @@ def test_merge_fails_on_nonzero_exit(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]
     _seed_adapter(client, start["run_id"])
-    run_state.set_stage(run_dir, "training", "completed")
+    _terminal_stages(run_dir)
     assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
 
     _write_merge_artifacts(client, start["run_id"])
@@ -1001,7 +1110,11 @@ def test_merge_recovery_uses_dead_pid_artifacts(client, monkeypatch):
     monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
     run_dir = _mark_merge_running(client, run["run_id"])
 
-    _write_merge_artifacts(client, run["run_id"])
+    merged = _write_merge_artifacts(client, run["run_id"])
+    stage = run_state.load_run(run_dir)["stages"][3]
+    # A recorded dead PID is enough even when the files are older than the
+    # stage start (only the no-PID path needs the mtime check).
+    _age_artifacts(merged, float(stage["started_at"]) - 60.0)
     assert client.mod._merge_running() is False
     assert run_state.load_run(run_dir)["stages"][3]["status"] == "completed"
 
@@ -1015,6 +1128,97 @@ def test_merge_recovery_marks_dead_pid_failed_without_artifacts(client, monkeypa
 
     assert client.mod._merge_running() is False
     assert run_state.load_run(run_dir)["stages"][3]["status"] == "failed"
+
+
+def _age_artifacts(merged_dir, mtime):
+    for name in ("config.json", "model.safetensors"):
+        os.utime(merged_dir / name, (mtime, mtime))
+
+
+def test_merge_recovery_rejects_stale_artifacts_without_pid(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-777777"
+    )
+    merged = _write_merge_artifacts(client, run["run_id"])
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    run_dir = _mark_merge_running(client, run["run_id"], pid=None)
+    stage = run_state.load_run(run_dir)["stages"][3]
+    _age_artifacts(merged, float(stage["started_at"]) - 60.0)
+
+    assert client.mod._merge_running() is False
+    stage = run_state.load_run(run_dir)["stages"][3]
+    assert stage["status"] == "failed"
+    assert "predate" in stage["detail"]
+
+
+def test_merge_recovery_accepts_fresh_artifacts_without_pid(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-888888"
+    )
+    merged = _write_merge_artifacts(client, run["run_id"])
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    run_dir = _mark_merge_running(client, run["run_id"], pid=None)
+    stage = run_state.load_run(run_dir)["stages"][3]
+    _age_artifacts(merged, float(stage["started_at"]) + 1.0)
+
+    assert client.mod._merge_running() is False
+    assert run_state.load_run(run_dir)["stages"][3]["status"] == "completed"
+
+
+def test_merge_artifacts_reject_adapter_weights(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-999999"
+    )
+    merged = _write_merge_artifacts(
+        client, run["run_id"], weights="adapter_model.safetensors"
+    )
+    assert (
+        client.mod._merge_artifacts_complete(
+            run_state.load_run(client.mod.RUNS_DIR / run["run_id"])
+        )
+        is False
+    )
+    (merged / "model.safetensors").write_text("", encoding="utf-8")
+    assert client.mod._merge_artifacts_complete(
+        run_state.load_run(client.mod.RUNS_DIR / run["run_id"])
+    )
+
+
+def test_merge_clears_stale_pid_before_start(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-aaaaab"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_dir = client.mod.RUNS_DIR / run["run_id"]
+    run_state.set_stage(run_dir, "training", "completed")
+    (run_dir / "merge.pid").write_text("12345", encoding="utf-8")
+    run_state.update_run(
+        run_dir, lambda current: {**current, "merge_pid": 12345}
+    )
+
+    res = client.post(f"/api/runs/{run['run_id']}/merge")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert (run_dir / "merge.pid").read_text(encoding="utf-8") == str(body["pid"])
+    assert run_state.load_run(run_dir)["merge_pid"] == body["pid"]
+
+
+def test_merge_rejected_when_legacy_trainer_pid_is_live(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-aaaaac"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    client.mod.training_process = None
+    client.mod.training_run_id = None
+    client.mod.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(
+        client.mod, "_is_process_running", lambda pid=None: pid == os.getpid()
+    )
+
+    res = client.post(f"/api/runs/{run['run_id']}/merge")
+    assert res.status_code == 400
+    assert client.launched == []
 
 
 def test_merge_writes_log_pid_and_manifest_pid(client):

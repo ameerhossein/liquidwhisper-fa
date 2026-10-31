@@ -139,7 +139,6 @@ CURRENT_RUN: Optional[Dict[str, Any]] = None
 # server is up.
 merge_process: Optional[subprocess.Popen] = None
 merge_log_fd = None
-merge_last_exit_code: Optional[int] = None
 merge_run_id: Optional[str] = None
 training_run_id: Optional[str] = None
 _monitor_task: Optional[asyncio.Task] = None
@@ -243,6 +242,16 @@ def read_json_safely(path: Path, default: Any) -> Any:
         return default
 
 
+def _log_exception(context: str) -> None:
+    """Print one monitor/recovery failure to stderr instead of hiding it."""
+    try:
+        import traceback
+        print(f"[cockpit] {context} failed:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _run_for_training_exit() -> Optional[Dict[str, Any]]:
     """The run that owned the just-exited child, else the current run view."""
     if training_run_id and run_state.run_id_valid(training_run_id):
@@ -281,7 +290,7 @@ def _reconcile_training_exit(exit_code: Optional[int]) -> None:
             pass
         except Exception:
             # A broken manifest must never make the monitor crash.
-            pass
+            _log_exception(f"reconcile training exit for {run.get('run_id')}")
     training_run_id = None
 
 
@@ -520,7 +529,7 @@ async def _monitor_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            _log_exception("monitor loop")
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -554,12 +563,16 @@ async def _stop_monitor_task() -> None:
 
 def _recover_runs_on_startup() -> None:
     """Startup recovery: apply child exits, merge recovery, ledger rescan."""
-    try:
-        _training_running()
-        _merge_running()
-        _refresh_runs()
-    except Exception:
-        pass
+    steps = (
+        ("startup training poll", _training_running),
+        ("startup merge recovery", _merge_running),
+        ("startup ledger refresh", _refresh_runs),
+    )
+    for context, step in steps:
+        try:
+            step()
+        except Exception:
+            _log_exception(context)
 
 
 def _smoke_output_dir() -> str:
@@ -701,18 +714,72 @@ def _merge_stage(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
 
 
-def _merge_artifacts_complete(run: Dict[str, Any]) -> bool:
-    """True when the merged model has its config and a weights file."""
+_MERGE_WEIGHT_NAMES = ("model.safetensors", "pytorch_model.bin", "model.bin")
+_TERMINAL_STAGE_STATUSES = (
+    "completed",
+    "stopped",
+    "failed",
+    "skipped",
+    "interrupted",
+)
+
+
+def _merge_artifact_paths(
+    run: Dict[str, Any]
+) -> Optional[tuple[Path, Path]]:
+    """The merged model's ``(config, weights)`` when both are present."""
     _run_dir_path, merged_dir, _log, _pid = _merge_paths(run)
-    if not (merged_dir / "config.json").is_file():
+    config = merged_dir / "config.json"
+    if not config.is_file():
+        return None
+    for name in _MERGE_WEIGHT_NAMES:
+        weights = merged_dir / name
+        if weights.is_file():
+            return config, weights
+    return None
+
+
+def _merge_artifacts_complete(run: Dict[str, Any]) -> bool:
+    """True when the merged model has its config and a model weights file."""
+    return _merge_artifact_paths(run) is not None
+
+
+def _merge_artifacts_fresh(run: Dict[str, Any], stage: Dict[str, Any]) -> bool:
+    """True when both merged artifacts were written at/after the stage start.
+
+    Used only for no-PID recovery: a crash before ``merge.pid`` was recorded
+    must not inherit a previous attempt's complete output.
+    """
+    artifacts = _merge_artifact_paths(run)
+    if artifacts is None:
         return False
-    weights = (
-        "model.safetensors",
-        "pytorch_model.bin",
-        "model.bin",
-        "adapter_model.safetensors",
+    try:
+        since = float(stage.get("started_at"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        return all(path.stat().st_mtime >= since for path in artifacts)
+    except OSError:
+        return False
+
+
+def _merge_stages_terminal(run: Dict[str, Any]) -> bool:
+    """R12: a target trainer may still exit only when its run is finished."""
+    stages = {
+        str(stage.get("name")): str(stage.get("status") or "pending")
+        for stage in run.get("stages") or []
+    }
+    if stages.get("training") != "completed":
+        return False
+    if stages.get("post_eval") not in ("completed", "skipped"):
+        return False
+    for name in ("preflight", "training", "post_eval"):
+        if stages.get(name, "pending") not in _TERMINAL_STAGE_STATUSES:
+            return False
+    return not any(
+        str(stage.get("status")) == "running"
+        for stage in run.get("stages") or []
     )
-    return any((merged_dir / name).is_file() for name in weights)
 
 
 def _close_merge_log_fd() -> None:
@@ -731,9 +798,14 @@ def _close_merge_log_fd() -> None:
         merge_log_fd = None
 
 
-def _finish_merge(run_id: str, exit_code: Optional[int]) -> None:
+def _finish_merge(
+    run_id: str,
+    exit_code: Optional[int],
+    *,
+    pid_known: bool = False,
+) -> None:
     """Classify a finished/recovered merge from its exit code and artifacts."""
-    global merge_last_exit_code, merge_run_id
+    global merge_run_id
     run = None
     if run_state.run_id_valid(run_id):
         try:
@@ -745,7 +817,17 @@ def _finish_merge(run_id: str, exit_code: Optional[int]) -> None:
         stage = _merge_stage(run)
         if stage is not None and stage.get("status") == "running":
             complete = _merge_artifacts_complete(run)
-            if complete and exit_code in (0, None):
+            completed = complete and (
+                exit_code == 0
+                or (
+                    exit_code is None
+                    and (
+                        pid_known
+                        or _merge_artifacts_fresh(run, stage)
+                    )
+                )
+            )
+            if completed:
                 run_state.set_stage(
                     run_dir,
                     "merge",
@@ -757,6 +839,8 @@ def _finish_merge(run_id: str, exit_code: Optional[int]) -> None:
                 tail = _read_log_tail(log_file, 30)
                 if exit_code == 0:
                     detail = "merge exited 0 without complete artifacts"
+                elif exit_code is None and complete:
+                    detail = "merge artifacts predate the merge attempt"
                 elif exit_code is None:
                     detail = "merge process ended without artifacts"
                 else:
@@ -775,7 +859,6 @@ def _finish_merge(run_id: str, exit_code: Optional[int]) -> None:
                 )
             except Exception:
                 pass
-    merge_last_exit_code = exit_code
     merge_run_id = None
 
 
@@ -805,7 +888,7 @@ def _merge_running() -> bool:
     server restart), every run's ``merge`` stage is inspected: a live PID
     means the merge continues, a dead PID is classified from its artifacts.
     """
-    global merge_process, merge_last_exit_code, merge_run_id
+    global merge_process, merge_run_id
     if merge_process is not None:
         code = merge_process.poll()
         if code is None:
@@ -814,14 +897,13 @@ def _merge_running() -> bool:
         merge_process = None
         _close_merge_log_fd()
         if run_id:
-            _finish_merge(run_id, code)
-        else:
-            merge_last_exit_code = code
+            _finish_merge(run_id, code, pid_known=True)
         return False
 
     try:
         runs = run_state.list_runs(RUNS_DIR, limit=None)
     except Exception:
+        _log_exception("scan runs for merge recovery")
         runs = []
     for run in runs:
         stage = _merge_stage(run)
@@ -831,7 +913,11 @@ def _merge_running() -> bool:
         if pid is not None and _is_process_running(pid):
             merge_run_id = str(run.get("run_id") or "") or None
             return True
-        _finish_merge(str(run.get("run_id") or ""), None)
+        _finish_merge(
+            str(run.get("run_id") or ""),
+            None,
+            pid_known=pid is not None,
+        )
     return False
 
 
@@ -1067,10 +1153,14 @@ async def serve_index():
 
 @app.get("/api/status")
 async def get_status():
+    # Apply a known child exit before refreshing the ledger so the response
+    # never reports a stale ``running`` run with ``process_running: false``.
+    training_live = _training_running()
+    _merge_running()
     _refresh_runs()
     run = _current_run()
     paths = _run_paths(run)
-    is_running = _training_running() or _active_run_process_running()
+    is_running = training_live or _active_run_process_running()
 
     telemetry = read_json_safely(paths["telemetry_file"], {
         "status": "running" if is_running else "idle",
@@ -1914,7 +2004,7 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
 
 def _start_merge(run_id: str) -> Dict[str, Any]:
     """Start the optional merge stage for a completed-training run."""
-    global merge_process, merge_log_fd, merge_last_exit_code, merge_run_id
+    global merge_process, merge_log_fd, merge_run_id
 
     if not run_state.run_id_valid(run_id):
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -1925,7 +2015,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
 
     # Apply any known child exits and a possibly-dead merge attempt before
     # deciding whether a new merge may start.
-    _training_running()
+    training_busy = _training_running()
     merge_busy = _merge_running()
     _refresh_runs()
     run = run_state.load_run(RUNS_DIR / run_id) or run
@@ -1946,15 +2036,23 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
             detail="Merge requires best_adapter/adapter_config.json.",
         )
 
+    # R12: only the target's own still-exiting trainer may overlap a merge,
+    # and only when every target stage is terminal. Any other live trainer,
+    # including a legacy PID-file process with no tracked child, blocks it.
+    target_trainer_live = bool(training_busy and training_run_id == run_id)
+    if training_busy and not target_trainer_live:
+        raise HTTPException(
+            status_code=400, detail="Training, smoke test, or merge is already running."
+        )
+    if target_trainer_live and not _merge_stages_terminal(run):
+        raise HTTPException(
+            status_code=400, detail="Training, smoke test, or merge is already running."
+        )
     if _smoke_running() or merge_busy:
         raise HTTPException(
             status_code=400, detail="Training, smoke test, or merge is already running."
         )
     active = _active_run()
-    # The target itself may still be the "active" ledger run when training
-    # just completed but its process handle has not been collected yet; the
-    # completed training stage means the adapter is final. Any *other* live
-    # full run still blocks the merge.
     if (
         active is not None
         and str(active.get("run_id")) != run_id
@@ -1963,14 +2061,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         raise HTTPException(
             status_code=400, detail="Training, smoke test, or merge is already running."
         )
-    if training_process is not None and training_run_id != run_id:
-        # A legacy/untracked full run still owns the GPU.
-        if training_process.poll() is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Training, smoke test, or merge is already running.",
-            )
-    # Training is done, but the target's post-eval may still be using the GPU.
+    # Any target stage still running (e.g. post-eval) blocks the merge.
     if any(
         str(stage.get("status")) == "running"
         for stage in run.get("stages") or []
@@ -1999,6 +2090,8 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     ]
 
     run_dir_path.mkdir(parents=True, exist_ok=True)
+    # A crashed retry must never read the previous attempt's PID.
+    _unlink_quietly(pid_file)
     _close_merge_log_fd()
     try:
         merge_log_fd = open(log_file, "w", encoding="utf-8")
@@ -2023,6 +2116,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         if stage is not None:
             for key in ("exit_code", "log_tail"):
                 stage.pop(key, None)
+        current["merge_pid"] = None
         return current
 
     run_state.update_run(run_dir, _reset_merge_stage)
@@ -2057,7 +2151,6 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         )
         raise HTTPException(status_code=500, detail=f"Failed to launch merge: {e}")
 
-    merge_last_exit_code = None
     merge_run_id = run_id
     pid = merge_process.pid
     try:
@@ -2298,6 +2391,8 @@ async def websocket_telemetry(websocket: WebSocket):
     try:
         while True:
             # Poll status, telemetry and send to client (1s cadence to save bandwidth)
+            training_live = _training_running()
+            _merge_running()
             _refresh_runs()
             run = _current_run()
             paths = _run_paths(run)
@@ -2308,7 +2403,7 @@ async def websocket_telemetry(websocket: WebSocket):
             )
             loss_hist = read_json_safely(paths["loss_history_file"], [])
 
-            is_running = _training_running() or _active_run_process_running()
+            is_running = training_live or _active_run_process_running()
             telemetry = _derive_status(telemetry, is_running, run)
             telemetry["process_running"] = is_running
             # WS clients otherwise never get a fresh GPU reading (the trainer
