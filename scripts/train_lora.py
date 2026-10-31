@@ -746,13 +746,15 @@ def _build_hf_mirror(args, run_dir, run=None):
             output_dir=Path(args.output_dir),
             results_dir=Path(args.results_dir),
             manifest_update=lambda mutate: run_state.update_run(run_dir, mutate),
+            start_worker=False,
         )
         mirror.start()
     except Exception as exc:
         print(f"[hf-sync] disabled: {exc}")
         return None
     # A pod restart may have lost the local checkpoint volume while the ledger
-    # survived. Pull the newest remote checkpoint before checkpoint selection.
+    # survived. Repair before the uploader starts so the initial backfill can
+    # never upload a stale checkpoint ahead of the newer remote one.
     if bool(getattr(args, "hf_auto_resume", True)) and not bool(
         getattr(args, "fresh_start", False)
     ):
@@ -760,6 +762,12 @@ def _build_hf_mirror(args, run_dir, run=None):
             mirror.auto_repair()
         except Exception as exc:
             print(f"[hf-sync] auto repair failed: {exc}")
+    start_uploader = getattr(mirror, "start_uploader", None)
+    if callable(start_uploader):
+        try:
+            start_uploader()
+        except Exception as exc:
+            print(f"[hf-sync] could not start the uploader: {exc}")
     return mirror
 
 
@@ -777,6 +785,64 @@ def _local_checkpoint_step(output_dir) -> Optional[int]:
         step = int(match.group(1))
         best = step if best is None else max(best, step)
     return best
+
+
+def _step_value(payload: Any) -> Optional[int]:
+    """Read a non-negative ``last_step`` from a JSON object."""
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("last_step")
+    if isinstance(value, bool):
+        return None
+    try:
+        step = int(value)
+    except (TypeError, ValueError):
+        return None
+    return step if step >= 0 else None
+
+
+def _local_hf_high_water(run, run_dir) -> int:
+    """Highest step recorded on the local ledger and local HF state file."""
+    step = _step_value(run) or 0
+    try:
+        with (Path(run_dir) / hf_sync.STATE_FILE).open(
+            "r", encoding="utf-8"
+        ) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = None
+    state_step = _step_value(state)
+    if state_step is not None:
+        step = max(step, state_step)
+    return step
+
+
+def _remote_hf_high_water(
+    api, repo_id: str, run_id: str, *, download=None
+) -> Optional[int]:
+    """Remote ``hf_state.json`` high-water, falling back to ``run.json``."""
+    download_fn = download if download is not None else hf_sync._default_download
+    prefix = hf_sync.repo_run_path(run_id)
+    for name in (hf_sync.STATE_FILE, hf_sync.MANIFEST_FILE):
+        try:
+            payload = hf_sync._download_json(
+                download_fn, repo_id, f"{prefix}/{name}"
+            )
+        except Exception:
+            payload = None
+        step = _step_value(payload)
+        if step is not None:
+            return step
+    return None
+
+
+def _remote_checkpoint_step(api, repo_id: str, run_id: str) -> Optional[int]:
+    """Highest complete checkpoint in the remote run listing, if any."""
+    try:
+        files = api.list_repo_files(repo_id, revision="main")
+    except Exception:
+        return None
+    return hf_sync.select_checkpoint_step(files, run_id)
 
 
 def _restore_hf_run(args) -> bool:
@@ -818,7 +884,36 @@ def _restore_hf_run(args) -> bool:
     checkpoint_step = (
         _local_checkpoint_step(run_dir / "output") if local_run is not None else None
     )
-    if local_run is None or checkpoint_step is None:
+    repair_pending = False
+    should_restore = local_run is None or checkpoint_step is None
+    if local_run is not None and checkpoint_step is None:
+        local_step = _local_hf_high_water(local_run, run_dir)
+        if local_step > 0:
+            remote_step = _remote_hf_high_water(api, config.repo_id, run_id)
+            if local_step > (remote_step or 0):
+                remote_checkpoint = _remote_checkpoint_step(
+                    api, config.repo_id, run_id
+                )
+                if remote_checkpoint is None:
+                    print(
+                        f"error: cannot restore run {run_id}: the local ledger "
+                        f"is at step {local_step}, newer than remote step "
+                        f"{remote_step if remote_step is not None else 'unknown'}, "
+                        "and the remote repo has no usable remote checkpoint to "
+                        "repair from",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(2)
+                print(
+                    f"[hf-sync] keeping the local ledger for {run_id} "
+                    f"(last_step {local_step} is newer than remote "
+                    f"{remote_step if remote_step is not None else 'unknown'}); "
+                    f"auto-repair will fetch checkpoint-{remote_checkpoint} "
+                    "before training resumes."
+                )
+                repair_pending = True
+                should_restore = False
+    if should_restore:
         # restore_run stages and validates the whole run before replacing any
         # existing local copy, so force is safe for a partial local ledger.
         try:
@@ -851,22 +946,30 @@ def _restore_hf_run(args) -> bool:
         explicit=getattr(args, "_explicit_keys", set()),
         run_dir=run_dir,
     )
+    args._hf_repair_pending = repair_pending
     args.telephony_profiles = _parse_telephony_profiles(
         getattr(args, "telephony_profiles", "customer")
     )
     if str(run.get("status") or "") == "completed":
         print(f"Restored completed run: {run_dir}")
         return True
-    if checkpoint_step is None:
+    if checkpoint_step is None and not repair_pending:
         print(
             f"error: run {run_id} has no complete checkpoint to resume from; "
             f"it was restored to {run_dir}",
             file=sys.stderr,
         )
         raise SystemExit(2)
-    print(
-        f"Restored {run_id} at checkpoint-{checkpoint_step}; resuming from {run_dir}"
-    )
+    if repair_pending:
+        print(
+            f"Local ledger for {run_id} is newer than the remote high-water "
+            "mark; waiting for HF auto-repair to install a checkpoint."
+        )
+    else:
+        print(
+            f"Restored {run_id} at checkpoint-{checkpoint_step}; "
+            f"resuming from {run_dir}"
+        )
     return False
 
 
@@ -1357,9 +1460,27 @@ def _finish_hf_mirror(mirror, run_dir) -> None:
         print(f"[hf-sync] could not close the mirror: {exc}")
 
 
+def _ensure_hf_repair_checkpoint(args) -> None:
+    """Refuse to train from scratch when a newer local ledger needs repair."""
+    if not bool(getattr(args, "_hf_repair_pending", False)):
+        return
+    if bool(getattr(args, "post_eval_only", False)):
+        return
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is not None and _local_checkpoint_step(output_dir) is not None:
+        return
+    print(
+        "error: no complete checkpoint is available after HF auto-repair; "
+        "refusing to start training from scratch over a newer local ledger",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def _run_training(args, run_dir):
     mirror = _build_hf_mirror(args, run_dir)
     try:
+        _ensure_hf_repair_checkpoint(args)
         _run_training_stages(args, run_dir, mirror)
     finally:
         _finish_hf_mirror(mirror, run_dir)

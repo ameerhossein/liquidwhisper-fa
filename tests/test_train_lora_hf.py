@@ -286,3 +286,157 @@ def test_post_eval_only_uploads_reports_and_terminal_ledger(tmp_path, monkeypatc
     assert ("ledger", "post_eval", {"reports": True}) in events
     assert ("ledger", "completed", {}) in events
     assert events[-1] == ("close",)
+
+
+def _restore_args(tmp_path, **overrides):
+    values = dict(
+        hf_resume=RUN,
+        hf_run_repo="me/run",
+        run_dir=None,
+        output_dir=str(tmp_path / "default-output"),
+        results_dir=None,
+        post_eval_only=False,
+        epochs=2,
+        batch_size=8,
+        fresh_start=False,
+        auto_resume=True,
+        resume_from_checkpoint=None,
+        preflight_cache_dir=None,
+        telephony_profiles="customer",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _prepare_restore_run(tmp_path, monkeypatch, *, last_step):
+    runs_root = tmp_path / "runs"
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
+    run_state.create_run(
+        runs_root, run_id=RUN, config={}, trainer_args={"epochs": 4}
+    )
+    run_dir = runs_root / RUN
+    if last_step:
+        run_state.set_progress(
+            run_dir, step=last_step, step_count=last_step, last_step_at=1.0
+        )
+    return runs_root, run_dir
+
+
+def test_restore_keeps_newer_local_ledger(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    _runs_root, run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=2000
+    )
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(train_lora, "_remote_hf_high_water", lambda *a, **k: 1000)
+    monkeypatch.setattr(train_lora, "_remote_checkpoint_step", lambda *a, **k: 1000)
+    restore_calls = []
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: restore_calls.append(k),
+    )
+
+    assert train_lora._restore_hf_run(args) is False
+    assert restore_calls == []
+    assert args.run_dir == str(run_dir.resolve())
+    assert args.output_dir == str(run_dir / "output")
+    assert getattr(args, "_hf_repair_pending", False) is True
+
+
+def test_restore_keeps_local_ledger_and_exits_without_remote_checkpoint(
+    tmp_path, monkeypatch, capsys
+):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=2000
+    )
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(train_lora, "_remote_hf_high_water", lambda *a, **k: 1000)
+    monkeypatch.setattr(train_lora, "_remote_checkpoint_step", lambda *a, **k: None)
+    restore_calls = []
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: restore_calls.append(k),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        train_lora._restore_hf_run(args)
+    assert excinfo.value.code == 2
+    assert restore_calls == []
+    assert "no usable remote checkpoint" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("remote_step", [1000, 2000])
+def test_restore_replaces_local_ledger_when_remote_not_older(
+    tmp_path, monkeypatch, remote_step
+):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=1000
+    )
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(
+        train_lora, "_remote_hf_high_water", lambda *a, **k: remote_step
+    )
+    restore_calls = []
+
+    def _restore(*args, **kwargs):
+        restore_calls.append(kwargs)
+        return {"run_id": RUN, "checkpoint_step": remote_step}
+
+    monkeypatch.setattr(train_lora.hf_sync, "restore_run", _restore)
+
+    assert train_lora._restore_hf_run(args) is False
+    assert len(restore_calls) == 1
+    assert restore_calls[0]["force"] is True
+    assert getattr(args, "_hf_repair_pending", False) is False
+
+
+def test_build_mirror_repairs_before_starting_uploader(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    events = []
+    created = {}
+
+    class _FakeMirror:
+        def __init__(self, config, **kwargs):
+            events.append("init")
+            created.update(kwargs)
+
+        def start(self):
+            events.append("start")
+
+        def auto_repair(self):
+            events.append("repair")
+
+        def start_uploader(self):
+            events.append("uploader")
+
+    monkeypatch.setattr(train_lora.hf_sync, "HFRunMirror", _FakeMirror)
+    args = SimpleNamespace(
+        hf_run_repo="me/run",
+        hf_private=True,
+        hf_adapter_snapshot_steps=250,
+        hf_auto_resume=True,
+        fresh_start=False,
+        output_dir=str(tmp_path / "output"),
+        results_dir=str(tmp_path / "results"),
+    )
+    mirror = train_lora._build_hf_mirror(args, tmp_path / "run", run={})
+
+    assert mirror is not None
+    assert created["start_worker"] is False
+    assert events == ["init", "start", "repair", "uploader"]

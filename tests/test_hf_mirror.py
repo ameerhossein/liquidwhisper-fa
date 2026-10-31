@@ -73,6 +73,21 @@ def _checkpoint(output, step):
     return path
 
 
+def test_start_uploader_defers_uploads_until_called(tmp_path):
+    api = FakeApi()
+    mirror = _mirror(tmp_path, api)
+    mirror.start()
+    assert mirror._worker is None
+    path = _checkpoint(mirror.output_dir, 1000)
+    mirror.enqueue_checkpoint(path, 1000)
+    assert api.folders == []
+    mirror.start_uploader()
+    assert mirror.drain(5)
+    assert api.folders
+    assert api.folders[0]["path_in_repo"] == f"runs/{RUN}/checkpoint-1000"
+    mirror.close()
+
+
 def test_checkpoint_upload_uses_run_scoped_path(tmp_path):
     api = FakeApi()
     mirror = _mirror(tmp_path, api)

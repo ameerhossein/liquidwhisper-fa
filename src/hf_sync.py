@@ -1482,14 +1482,28 @@ class HFRunMirror:
             self._write_state_locked()
 
         if self.start_worker:
-            worker = threading.Thread(
-                target=self._worker_loop,
-                name=f"hf-sync-{self.run_id}",
-                daemon=True,
-            )
-            with self._condition:
-                self._worker = worker
-            worker.start()
+            self.start_uploader()
+
+    def start_uploader(self) -> None:
+        """Start the background uploader if it is not already running.
+
+        ``start()`` normally starts it. A caller can construct the mirror with
+        ``start_worker=False``, run :meth:`auto_repair`, and then call this so a
+        repair completes before any queued upload is processed.
+        """
+        with self._condition:
+            if self._stopped or self._worker is not None:
+                return
+        worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"hf-sync-{self.run_id}",
+            daemon=True,
+        )
+        with self._condition:
+            if self._stopped or self._worker is not None:
+                return
+            self._worker = worker
+        worker.start()
 
     def _ensure_repo(self) -> None:
         create = getattr(self.api, "create_repo", None)
