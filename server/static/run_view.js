@@ -91,6 +91,56 @@ function isMergeAvailable(run, adapterExists = false) {
   return true;
 }
 
+// Resume/Merge visibility for renderRun(). Pure so Node can pin the gates:
+// Resume for interrupted/stopped/failed runs, Merge via isMergeAvailable().
+function runViewState(run, adapterExists = false) {
+  if (!run || typeof run !== "object") return { resumeVisible: false, mergeVisible: false };
+  const resumeVisible = ["interrupted", "stopped", "failed"].includes(run.status);
+  const adapterAvailable = Boolean(adapterExists) || Boolean(run.adapter_exists);
+  return { resumeVisible, mergeVisible: isMergeAvailable(run, adapterAvailable) };
+}
+
+function truthyFlagValue(value) {
+  if (typeof value === "string") {
+    return ["1", "on", "true", "yes"].includes(value.toLowerCase());
+  }
+  return Boolean(value);
+}
+
+// Map a run config onto form field values. Missing keys stay missing so the
+// form keeps its defaults; unknown keys never leak into the form.
+function formValuesFromConfig(config) {
+  if (!config || typeof config !== "object") return {};
+  const values = {};
+  for (const key of ["epochs", "batch_size", "grad_accum", "eval_steps", "learning_rate"]) {
+    const value = config[key];
+    if (value != null && value !== "") values[key] = String(value);
+  }
+  if (Object.prototype.hasOwnProperty.call(config, "gradient_checkpointing")) {
+    values.gradient_checkpointing = truthyFlagValue(config.gradient_checkpointing)
+      ? "on"
+      : "off";
+  }
+  return values;
+}
+
+// Pick the picker value after a /api/runs refresh: keep a still-listed
+// selection, otherwise fall back to Latest.
+function resolvePickerSelection(previous, runs) {
+  const list = Array.isArray(runs) ? runs : [];
+  if (previous === "latest" || previous == null || previous === "") return "latest";
+  const stillListed = list.some(
+    (run) => run && run.run_id != null && String(run.run_id) === String(previous),
+  );
+  return stillListed ? String(previous) : "latest";
+}
+
+// A stale /api/runs response must not overwrite an in-flight picker selection:
+// apply it only when neither the DOM value nor the selected run id moved.
+function shouldApplyPickerRefresh(selectionAtStart, selectionNow) {
+  return String(selectionAtStart ?? "latest") === String(selectionNow ?? "latest");
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     STAGE_ORDER,
@@ -100,5 +150,9 @@ if (typeof module !== "undefined" && module.exports) {
     savedStepsLabel,
     isMergeAvailable,
     runLogUrl,
+    runViewState,
+    formValuesFromConfig,
+    resolvePickerSelection,
+    shouldApplyPickerRefresh,
   };
 }

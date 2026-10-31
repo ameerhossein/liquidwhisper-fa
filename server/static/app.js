@@ -143,29 +143,23 @@ function escapeHtml(str) {
 
 // Run provenance
 
-function truthyFlag(value) {
-  if (typeof value === "string") {
-    return ["1", "on", "true", "yes"].includes(value.toLowerCase());
-  }
-  return Boolean(value);
-}
-
 function restoreRunConfig(config) {
   if (formRestored || !config || typeof config !== "object") return;
   formRestored = true;
 
+  const values = formValuesFromConfig(config);
   const fields = [
-    [el.inputEpochs, config.epochs],
-    [el.inputBatchSize, config.batch_size],
-    [el.inputGradAccum, config.grad_accum],
-    [el.inputEvalSteps, config.eval_steps],
-    [el.inputLearningRate, config.learning_rate],
+    [el.inputEpochs, values.epochs],
+    [el.inputBatchSize, values.batch_size],
+    [el.inputGradAccum, values.grad_accum],
+    [el.inputEvalSteps, values.eval_steps],
+    [el.inputLearningRate, values.learning_rate],
   ];
   for (const [input, value] of fields) {
-    if (input && value != null && value !== "") input.value = String(value);
+    if (input && value != null) input.value = value;
   }
-  if (Object.prototype.hasOwnProperty.call(config, "gradient_checkpointing")) {
-    el.inputGradCheckpoint.value = truthyFlag(config.gradient_checkpointing) ? "on" : "off";
+  if (values.gradient_checkpointing != null && el.inputGradCheckpoint) {
+    el.inputGradCheckpoint.value = values.gradient_checkpointing;
   }
 }
 
@@ -241,9 +235,9 @@ function renderRun(run, steps, storage, adapterExists = false) {
   el.stepSaved.textContent = savedStepsLabel(steps);
   updateStorageWarning(storage);
 
-  el.btnResume.hidden = !["interrupted", "stopped", "failed"].includes(run.status);
-  const adapterAvailable = Boolean(adapterExists) || Boolean(run.adapter_exists);
-  el.btnMerge.hidden = !isMergeAvailable(run, adapterAvailable);
+  const viewState = runViewState(run, adapterExists);
+  el.btnResume.hidden = !viewState.resumeVisible;
+  el.btnMerge.hidden = !viewState.mergeVisible;
   syncRunActionButtons();
   noteRenderedRun(run);
 }
@@ -282,15 +276,23 @@ function runOptionLabel(run) {
 // stays hidden in legacy/local-demo mode, where no ledger run exists.
 async function refreshRunList() {
   if (!el.runSelect) return;
-  const previous = el.runSelect.value || "latest";
+  // Capture the in-flight selection: a user change while this fetch is in
+  // flight must win over the stale response below.
+  const selectionAtStart = el.runSelect.value || "latest";
+  const selectedIdAtStart = selectedRunId;
   try {
     const res = await fetch("/api/runs?limit=20");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    // Bail on a stale response instead of overwriting the user's picker.
+    if (
+      !shouldApplyPickerRefresh(selectionAtStart, el.runSelect.value || "latest") ||
+      !shouldApplyPickerRefresh(selectedIdAtStart, selectedRunId)
+    ) {
+      return;
+    }
     const runs = Array.isArray(data && data.runs) ? data.runs : [];
-    const keepSelection =
-      previous === "latest" || runs.some((run) => run && String(run.run_id) === previous);
-    const next = keepSelection ? previous : "latest";
+    const next = resolvePickerSelection(selectionAtStart, runs);
 
     // Rebuilding the options every poll would close an open native dropdown.
     const signature = runs
@@ -315,7 +317,7 @@ async function refreshRunList() {
     el.runSelect.value = next;
     setRunPickerAvailable(runs.length > 0);
 
-    if (next !== previous) {
+    if (next !== selectionAtStart) {
       selectedRunId = "latest";
       viewingHistorical = false;
       loadRunState();

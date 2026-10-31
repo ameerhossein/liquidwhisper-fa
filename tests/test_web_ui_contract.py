@@ -176,3 +176,62 @@ def test_run_view_behavior():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _reduced_motion_block(css):
+    start = css.index("prefers-reduced-motion")
+    open_brace = css.index("{", start)
+    depth = 0
+    for i in range(open_brace, len(css)):
+        if css[i] == "{":
+            depth += 1
+        elif css[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return css[open_brace : i + 1]
+    raise AssertionError("unbalanced braces in prefers-reduced-motion block")
+
+
+def test_reduced_motion_covers_stepper_and_merge_transitions():
+    css = (ROOT / "server/static/style.css").read_text()
+    assert "prefers-reduced-motion" in css
+    block = _reduced_motion_block(css)
+    # The global rule must actually switch transitions off, not merely exist.
+    assert re.search(r"transition\s*:\s*none", block), (
+        "the reduced-motion rule must disable transitions"
+    )
+    # Universal coverage is what reaches the stepper dots, progress/bar fills,
+    # buttons, and merge states without enumerating each selector.
+    assert "*" in block, "the reduced-motion rule must apply globally"
+    # The transitions being covered must really exist, or the test is vacuous.
+    for selector in (".stage-dot", ".progress-fill", ".bar-fill", ".bar-ref", ".btn"):
+        assert selector in css, f"missing animated selector {selector}"
+        assert re.search(
+            rf"{re.escape(selector)}[^{{]*\{{[^}}]*transition\s*:",
+            css,
+        ), f"{selector} must declare a transition for reduced-motion to cover"
+
+
+def test_picker_refresh_guards_inflight_selection():
+    js = (ROOT / "server/static/app.js").read_text()
+    refresh = js.index("async function refreshRunList(")
+    select = js.index("async function selectRun(")
+    body = js[refresh:select]
+    assert "selectionAtStart" in body
+    assert "selectedIdAtStart" in body
+    assert "shouldApplyPickerRefresh" in body
+    assert "resolvePickerSelection" in body
+    # A stale response must bail before touching the picker or reloading state.
+    bail = body.index("shouldApplyPickerRefresh")
+    assert "return;" in body[bail:]
+    assert "loadRunState()" in body
+
+
+def test_pure_run_helpers_are_wired():
+    js = (ROOT / "server/static/app.js").read_text()
+    assert "formValuesFromConfig(" in js
+    assert "runViewState(" in js
+    restore = js.index("function restoreRunConfig(")
+    render = js.index("function renderRun(")
+    assert "formValuesFromConfig" in js[restore:render]
+    assert "runViewState" in js[render:]

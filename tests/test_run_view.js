@@ -12,6 +12,10 @@ const {
   savedStepsLabel,
   isMergeAvailable,
   runLogUrl,
+  formValuesFromConfig,
+  runViewState,
+  resolvePickerSelection,
+  shouldApplyPickerRefresh,
 } = require("../server/static/run_view.js");
 
 assert.deepStrictEqual(STAGE_ORDER, ["preflight", "training", "post_eval", "merge"]);
@@ -208,5 +212,130 @@ assert.strictEqual(
   runLogUrl("run/with space", true),
   "/api/runs/run%2Fwith%20space/logs?tail=80",
 );
+
+// formValuesFromConfig maps a run config onto form field values.
+const fullConfig = {
+  epochs: 4,
+  batch_size: 8,
+  grad_accum: 4,
+  eval_steps: 1000,
+  learning_rate: 0.0001,
+  gradient_checkpointing: true,
+};
+assert.deepStrictEqual(formValuesFromConfig(fullConfig), {
+  epochs: "4",
+  batch_size: "8",
+  grad_accum: "4",
+  eval_steps: "1000",
+  learning_rate: "0.0001",
+  gradient_checkpointing: "on",
+});
+assert.strictEqual(
+  formValuesFromConfig({ ...fullConfig, gradient_checkpointing: false }).gradient_checkpointing,
+  "off",
+);
+for (const truthy of ["1", "on", "true", "yes", "ON", "True", 1, true]) {
+  assert.strictEqual(
+    formValuesFromConfig({ gradient_checkpointing: truthy }).gradient_checkpointing,
+    "on",
+    `must treat ${JSON.stringify(truthy)} as on`,
+  );
+}
+for (const falsy of ["0", "off", "false", "no", "", 0, false, null]) {
+  assert.strictEqual(
+    formValuesFromConfig({ gradient_checkpointing: falsy }).gradient_checkpointing,
+    "off",
+    `must treat ${JSON.stringify(falsy)} as off`,
+  );
+}
+
+// Missing keys stay missing so the form keeps its defaults.
+assert.deepStrictEqual(formValuesFromConfig({}), {});
+assert.deepStrictEqual(formValuesFromConfig({ epochs: 2 }), { epochs: "2" });
+assert.deepStrictEqual(formValuesFromConfig({ batch_size: null, epochs: "" }), {});
+
+// Extra keys never leak into the form mapping.
+assert.deepStrictEqual(
+  formValuesFromConfig({ epochs: 3, trainer_args: { lora_r: 64 }, unknown_key: "x" }),
+  { epochs: "3" },
+);
+
+// Non-object configs map to nothing.
+assert.deepStrictEqual(formValuesFromConfig(null), {});
+assert.deepStrictEqual(formValuesFromConfig(undefined), {});
+assert.deepStrictEqual(formValuesFromConfig("epochs=4"), {});
+
+// runViewState drives Resume/Merge visibility in renderRun.
+const resumable = (status) =>
+  runViewState(
+    {
+      status,
+      stages: [
+        { name: "training", status: "completed" },
+        { name: "post_eval", status: "completed" },
+        { name: "merge", status: "pending" },
+      ],
+    },
+    true,
+  );
+for (const status of ["interrupted", "stopped", "failed"]) {
+  assert.strictEqual(
+    resumable(status).resumeVisible,
+    true,
+    `${status} must offer Resume`,
+  );
+}
+for (const status of ["starting", "running", "completed", undefined, "unknown"]) {
+  assert.strictEqual(
+    runViewState({ status, stages: [] }, false).resumeVisible,
+    false,
+    `${status} must hide Resume`,
+  );
+}
+assert.deepStrictEqual(runViewState(null, true), {
+  resumeVisible: false,
+  mergeVisible: false,
+});
+assert.strictEqual(
+  runViewState({ status: "completed", adapter_exists: false }, false).mergeVisible,
+  false,
+  "merge hides without an adapter artifact",
+);
+assert.strictEqual(
+  resumable("completed").mergeVisible,
+  true,
+  "a completed run with an adapter offers Merge",
+);
+assert.strictEqual(
+  resumable("failed").mergeVisible,
+  true,
+  "a failed post-eval keeps Merge when training completed",
+);
+assert.strictEqual(
+  runViewState({ status: "running", stages: [{ name: "training", status: "completed" }] }, true)
+    .mergeVisible,
+  false,
+  "a running run never offers Merge",
+);
+assert.strictEqual(
+  runViewState({ status: "completed", stages: [] }, false).mergeVisible,
+  false,
+  "merge hides when training did not complete",
+);
+
+// Picker race: a stale /api/runs response must not clobber an in-flight selection.
+assert.strictEqual(shouldApplyPickerRefresh("latest", "latest"), true);
+assert.strictEqual(shouldApplyPickerRefresh("20261031-101500-aaaaaa", "20261031-101500-aaaaaa"), true);
+assert.strictEqual(shouldApplyPickerRefresh("latest", "20261031-101500-aaaaaa"), false);
+assert.strictEqual(shouldApplyPickerRefresh("20261031-101500-aaaaaa", "latest"), false);
+assert.strictEqual(shouldApplyPickerRefresh("run-a", "run-b"), false);
+assert.strictEqual(resolvePickerSelection("latest", [{ run_id: "run-a" }]), "latest");
+assert.strictEqual(
+  resolvePickerSelection("run-a", [{ run_id: "run-a" }, { run_id: "run-b" }]),
+  "run-a",
+);
+assert.strictEqual(resolvePickerSelection("run-gone", [{ run_id: "run-a" }]), "latest");
+assert.strictEqual(resolvePickerSelection("run-a", []), "latest");
+assert.strictEqual(resolvePickerSelection("run-a", null), "latest");
 
 console.log("run_view behavior tests passed");
