@@ -447,10 +447,12 @@ def _telemetry(
     speed: float,
     eta_seconds: int,
     elapsed_seconds: int,
+    step_count: int = 0,
 ) -> dict:
     return {
         "status": status,
         "step": int(step),
+        "step_count": int(step_count),
         "max_steps": int(max_steps),
         "epoch": round(float(epoch), 2),
         "loss": loss,
@@ -732,6 +734,7 @@ def _halt(
     loss: float | None,
     learning_rate: float | None,
     elapsed: float,
+    step_count: int = 0,
 ) -> int:
     _remove_signal(signal_path)
     log("stop requested; training halted")
@@ -740,6 +743,7 @@ def _halt(
         _telemetry(
             status="stopped",
             step=step,
+            step_count=step_count,
             max_steps=max_steps,
             epoch=epoch,
             loss=loss,
@@ -779,6 +783,7 @@ def _hang_until_stopped(
         signal_path,
         log,
         step=start_step,
+        step_count=run_state.step_count(results_dir),
         max_steps=max_steps,
         epoch=0.0,
         loss=None,
@@ -890,6 +895,7 @@ def _run(
         _telemetry(
             status="initializing",
             step=start_step,
+            step_count=run_state.step_count(results_dir),
             max_steps=total_steps,
             epoch=0.0,
             loss=None,
@@ -944,6 +950,7 @@ def _run(
             _telemetry(
                 status="training",
                 step=start_step,
+                step_count=run_state.step_count(results_dir),
                 max_steps=total_steps,
                 epoch=0.0,
                 loss=None,
@@ -1004,11 +1011,15 @@ def _run(
             elapsed = now - started_at
             eta_seconds = int(max(0, total_steps - step) * delay)
 
+            # The snapshot carries the count including this step, mirroring
+            # the real callback (which appends the step record first); the
+            # step is always new here because resumes continue past it.
             _write_json(
                 telemetry_path,
                 _telemetry(
                     status="training",
                     step=step,
+                    step_count=run_state.step_count(results_dir) + 1,
                     max_steps=total_steps,
                     epoch=epoch,
                     loss=loss,
@@ -1078,6 +1089,7 @@ def _run(
                 signal_path,
                 log,
                 step=last_completed_step,
+                step_count=run_state.step_count(results_dir),
                 max_steps=total_steps,
                 epoch=epoch,
                 loss=loss,
@@ -1131,6 +1143,7 @@ def _run(
         _telemetry(
             status="evaluating_benchmark",
             step=post_eval_step,
+            step_count=run_state.step_count(results_dir),
             max_steps=post_eval_step,
             epoch=epoch,
             loss=loss,
@@ -1162,6 +1175,7 @@ def _run(
         _telemetry(
             status="completed",
             step=finished_step,
+            step_count=run_state.step_count(results_dir),
             max_steps=finished_step,
             epoch=epoch,
             loss=loss,

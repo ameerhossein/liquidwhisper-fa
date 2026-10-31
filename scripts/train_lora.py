@@ -926,7 +926,7 @@ def _run_post_eval_stage(
         _mark_run_status(
             run_dir, "failed", failed_stage="post_eval", last_error=str(exc)
         )
-        _write_telemetry_status(results_dir, "failed")
+        _write_telemetry_status(results_dir, "failed", run_dir=run_dir)
         raise
     _mark_run_stage(run_dir, "post_eval", "completed", detail=None)
     _write_telemetry_status(results_dir, "completed", run_dir=run_dir)
@@ -959,7 +959,7 @@ def _run_post_eval_only(args) -> None:
         _mark_run_status(
             run_dir, "failed", failed_stage="post_eval", last_error=message
         )
-        _write_telemetry_status(results_dir, "failed")
+        _write_telemetry_status(results_dir, "failed", run_dir=run_dir)
         raise SystemExit(message)
 
     _mark_run_status(run_dir, "running")
@@ -1499,7 +1499,7 @@ def _run_training(args, run_dir):
             return
     else:
         _mark_run_stage(run_dir, "post_eval", "skipped", detail=None)
-        _write_telemetry_status(args.results_dir, "completed")
+        _write_telemetry_status(args.results_dir, "completed", run_dir=run_dir)
 
     # Overall completion requires training completed and post-eval
     # completed/skipped; merge is tracked separately and never blocks this.

@@ -374,6 +374,21 @@ def _invalidate_refresh_cache() -> None:
     _refresh_cache_summary = None
 
 
+def _note_merge_scan(result: bool) -> None:
+    """Record a merge-scan outcome without walking the ledger.
+
+    Used when the outcome is already known (a merge just started, or its
+    launch failed): a non-forced ``_merge_running()`` must not report the
+    previous cached value after that.
+    """
+    global _merge_scan_at, _merge_scan_result
+    try:
+        _merge_scan_at = time.monotonic()
+    except Exception:
+        _merge_scan_at = time.time()
+    _merge_scan_result = result
+
+
 def _reconcile_training_exit(exit_code: Optional[int]) -> None:
     """Apply the observed child exit (or a dead PID) to the run ledger.
 
@@ -643,23 +658,28 @@ def _active_run_process_running() -> bool:
     return pid is not None and _is_process_running(pid)
 
 
-def _steps_summary(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _steps_summary(
+    run: Optional[Dict[str, Any]],
+    telemetry: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if not run:
         return {"count": 0, "last_step": None, "last_saved_at": None}
     # The active run reports its exact per-step count from live telemetry;
     # historical runs report the deduplicated manifest count.
     try:
         if ACTIVE_RUN_ID is not None and str(run.get("run_id")) == ACTIVE_RUN_ID:
-            telemetry = read_json_safely(
-                _run_paths(run)["telemetry_file"], {}
-            )
-            if isinstance(telemetry, dict) and telemetry.get("step_count") is not None:
+            data = telemetry if isinstance(telemetry, dict) else None
+            if data is None:
+                data = read_json_safely(
+                    _run_paths(run)["telemetry_file"], {}
+                )
+            if isinstance(data, dict) and data.get("step_count") is not None:
                 try:
-                    active_count = int(telemetry["step_count"])
+                    active_count = int(data["step_count"])
                 except (TypeError, ValueError):
                     active_count = None
                 if active_count is not None:
-                    last_step = telemetry.get("step", run.get("last_step"))
+                    last_step = data.get("step", run.get("last_step"))
                     try:
                         last_step_i = int(last_step) if last_step is not None else None
                     except (TypeError, ValueError):
@@ -668,7 +688,7 @@ def _steps_summary(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                         "count": active_count,
                         "last_step": last_step_i,
                         "last_saved_at": run.get("last_step_at")
-                        or telemetry.get("updated_at"),
+                        or data.get("updated_at"),
                     }
     except Exception:
         pass
@@ -725,15 +745,16 @@ def _run_payload(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "adapter_exists": False,
         }
     paths = _run_paths(run)
+    telemetry = read_json_safely(paths["telemetry_file"], {})
     return {
         "run": run,
-        "telemetry": read_json_safely(paths["telemetry_file"], {}),
+        "telemetry": telemetry,
         "benchmarks": _get_benchmark_rows(
             benchmarks_file=paths["benchmarks_file"],
             preflight_file=_run_preflight_file(run),
         ),
         "loss_history": read_json_safely(paths["loss_history_file"], []),
-        "steps": _steps_summary(run),
+        "steps": _steps_summary(run, telemetry),
         "storage": run_state.storage_info(RUNS_DIR),
         "process_running": _run_process_running(run),
         "adapter_exists": _run_adapter_exists(run),
@@ -1454,7 +1475,7 @@ async def get_status():
     telemetry["gpu"] = telemetry.get("gpu") or get_gpu_info()
     telemetry["run"] = run
     telemetry["active_run_id"] = ACTIVE_RUN_ID
-    telemetry["steps"] = _steps_summary(run)
+    telemetry["steps"] = _steps_summary(run, telemetry)
     telemetry["storage"] = run_state.storage_info(RUNS_DIR)
     telemetry["adapter_exists"] = _run_adapter_exists(run)
     return telemetry
@@ -2407,6 +2428,9 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     run_state.update_run(run_dir, _reset_merge_stage)
     run_state.set_stage(run_dir, "merge", "running", detail="merging")
     _invalidate_refresh_cache()
+    # The merge stage is running from here on: keep a non-forced scan from
+    # reporting a stale False (or reaping the stage before the PID lands).
+    _note_merge_scan(True)
 
     merge_process = None
     try:
@@ -2435,6 +2459,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         run_state.update_run(
             run_dir, lambda current: {**current, "merge_pid": None}
         )
+        _note_merge_scan(False)
         raise HTTPException(status_code=500, detail=f"Failed to launch merge: {e}")
 
     merge_run_id = run_id
@@ -2456,6 +2481,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         run_state.update_run(
             run_dir, lambda current: {**current, "merge_pid": None}
         )
+        _note_merge_scan(False)
         raise HTTPException(
             status_code=500, detail=f"Failed to record merge PID: {e}"
         )
@@ -2464,6 +2490,8 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         run_dir, lambda current: {**current, "merge_pid": int(pid)}
     )
     _invalidate_refresh_cache()
+    # The merge child is live: a non-forced scan must report it as running.
+    _note_merge_scan(True)
     return {
         "status": "started",
         "run_id": run_id,
@@ -2787,7 +2815,7 @@ async def websocket_telemetry(websocket: WebSocket):
                 "benchmarks": benchmarks,
                 "loss_history": loss_hist[-100:],  # last 100 points for crisp SVG chart
                 "run": run,
-                "steps": _steps_summary(run),
+                "steps": _steps_summary(run, telemetry),
                 "storage": run_state.storage_info(RUNS_DIR),
                 "adapter_exists": _run_adapter_exists(run),
                 "timestamp": time.time()

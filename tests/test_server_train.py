@@ -1714,6 +1714,26 @@ def test_merge_start_invalidates_cached_scan(client, monkeypatch):
     )
 
 
+def test_merge_start_clears_stale_scan_cache(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-cccccf"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(
+        client.mod.RUNS_DIR / run["run_id"], "training", "completed"
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = None
+
+    # Seed a fresh negative scan result, as if a no-child scan just ran.
+    assert client.mod._merge_running() is False
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    # Lose the child handle (server restart): the non-forced scan must not
+    # report the stale False cached before the merge started.
+    client.mod.merge_process = None
+    assert client.mod._merge_running() is True
+
+
 def test_refresh_cached_returns_shallow_copy(client):
     client.post("/api/train/start", json={})
     first = client.mod._refresh_runs_cached()
@@ -1887,3 +1907,52 @@ def test_steps_summary_uses_active_telemetry_count(client):
     historical_run = run_state.load_run(historical_dir)
     historical_summary = client.mod._steps_summary(historical_run)
     assert historical_summary["count"] == 7
+
+
+def test_steps_summary_uses_threaded_telemetry_without_reread(
+    client, monkeypatch
+):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 1, "step_count": 1}),
+        encoding="utf-8",
+    )
+    client.mod._refresh_runs()
+    run = run_state.load_run(run_dir)
+
+    threaded = {
+        "status": "training",
+        "step": 42,
+        "step_count": 42,
+        "updated_at": 123.0,
+    }
+    calls = []
+    orig = client.mod.read_json_safely
+
+    def counting(path, default):
+        calls.append(1)
+        return orig(path, default)
+
+    monkeypatch.setattr(client.mod, "read_json_safely", counting)
+    summary = client.mod._steps_summary(run, threaded)
+    assert summary["count"] == 42
+    assert summary["last_step"] == 42
+    assert calls == []
+
+    historical = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-cccccd"
+    )
+    historical_dir = client.mod.RUNS_DIR / historical["run_id"]
+    run_state.set_progress(historical_dir, step=7, step_count=7, last_step_at=1.0)
+    (historical_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "completed", "step": 99, "step_count": 99}),
+        encoding="utf-8",
+    )
+    historical_run = run_state.load_run(historical_dir)
+    historical_summary = client.mod._steps_summary(
+        historical_run,
+        {"status": "completed", "step": 99, "step_count": 99},
+    )
+    assert historical_summary["count"] == 7
+    assert historical_summary["last_step"] == 7

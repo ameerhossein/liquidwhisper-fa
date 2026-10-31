@@ -319,6 +319,64 @@ def test_fake_trainer_hang_waits_for_stop(tmp_path):
     assert stages["merge"]["status"] == "pending"
 
 
+def test_fake_trainer_telemetry_carries_step_count(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    result = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="5")
+
+    assert result.returncode == 0, result.stderr
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "completed"
+    assert telemetry["step"] == 5
+    assert telemetry["max_steps"] == 5
+    assert telemetry["step_count"] == 5
+    assert telemetry["step_count"] == run_state.step_count(run_dir)
+
+
+def test_fake_trainer_telemetry_step_count_current_per_step(tmp_path):
+    process, run_dir = _start_trainer(
+        tmp_path, ASR_FAKE_STEPS="1000", ASR_FAKE_STEP_DELAY="0.01"
+    )
+    try:
+        assert _wait_for_training(run_dir), "fake trainer never entered training"
+
+        def read_telemetry():
+            try:
+                return json.loads(
+                    (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+                )
+            except ValueError:
+                return {}
+
+        assert _wait_until(
+            lambda: read_telemetry().get("step_count", 0) >= 3
+        ), "telemetry step_count never advanced"
+        telemetry = read_telemetry()
+        assert telemetry["status"] == "training"
+        # The snapshot carries the count including the current step (written
+        # just before the step record is appended), so it is either the exact
+        # unique count or one ahead of it.
+        assert telemetry["step_count"] in (
+            run_state.step_count(run_dir),
+            run_state.step_count(run_dir) + 1,
+        )
+        (run_dir / "stop_training.signal").write_text("stop", encoding="utf-8")
+        output = _finish(process)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    assert process.returncode == 0, output
+    halted = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert halted["status"] == "stopped"
+    assert halted["step_count"] == run_state.step_count(run_dir)
+
+
 def test_fake_trainer_post_eval_only_does_not_replay_steps(tmp_path):
     run_dir = tmp_path / "runs" / RUN_ID
 
@@ -509,6 +567,7 @@ def test_fake_trainer_failure_telemetry_preserves_progress(tmp_path):
     assert telemetry["error"]
     assert telemetry["step"] == 5
     assert telemetry["max_steps"] == 5
+    assert telemetry["step_count"] == 5
     assert telemetry["epoch"] > 0
     assert telemetry["loss"] is not None
     assert telemetry["gpu"]["available"] is False

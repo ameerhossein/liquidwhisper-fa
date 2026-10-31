@@ -1042,6 +1042,75 @@ def test_plain_cli_post_eval_stage_writes_active_then_completed_telemetry(tmp_pa
     assert final["max_steps"] == 10
 
 
+def test_post_eval_stage_failure_backfills_telemetry_step(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    run_state.set_progress(run_dir, step=100, step_count=100, last_step_at=1.0)
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 0, "max_steps": 0}),
+        encoding="utf-8",
+    )
+
+    def evaluate():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        train_lora._run_post_eval_stage(
+            run_dir=run_dir, results_dir=run_dir, evaluate=evaluate
+        )
+
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "failed"
+    assert telemetry["step"] == 100
+    assert telemetry["max_steps"] == 100
+
+
+def test_post_eval_only_missing_adapter_backfills_telemetry_step(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+    run_state.set_progress(run_dir, step=100, step_count=100, last_step_at=1.0)
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 0, "max_steps": 0}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="adapter_config.json not found"):
+        train_lora._run_post_eval_only(args)
+
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "failed"
+    assert telemetry["step"] == 100
+    assert telemetry["max_steps"] == 100
+
+
+def test_skipped_post_eval_telemetry_backfills_from_run(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    run_state.set_progress(run_dir, step=100, step_count=100, last_step_at=1.0)
+    (results_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 0, "max_steps": 0}),
+        encoding="utf-8",
+    )
+
+    # Mirrors the skipped post-eval branch in _run_training.
+    train_lora._mark_run_stage(run_dir, "post_eval", "skipped", detail=None)
+    train_lora._write_telemetry_status(results_dir, "completed", run_dir=run_dir)
+
+    telemetry = json.loads(
+        (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "completed"
+    assert telemetry["step"] == 100
+    assert telemetry["max_steps"] == 100
+
+
 def test_plain_cli_post_eval_halt_writes_stopped_telemetry(tmp_path):
     train_lora = _train_lora()
     results_dir = tmp_path / "results"
