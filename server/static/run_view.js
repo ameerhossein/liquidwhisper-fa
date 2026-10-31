@@ -128,6 +128,12 @@ function formValuesFromConfig(config) {
       ? "on"
       : "off";
   }
+  // Pre-change run configs have no telephony_mode. Every such run trained
+  // disjoint, so map it explicitly instead of leaving the selector on its
+  // paired default next to the restored disjoint epoch count.
+  if (!values.telephony_mode && Object.keys(values).length > 0) {
+    values.telephony_mode = "disjoint";
+  }
   return values;
 }
 

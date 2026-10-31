@@ -1126,6 +1126,8 @@ def _run_training(args, run_dir):
         # runs first (train gets phone augmentation, eval stays clean).
         label_prefix_ids, label_eos_id = _label_format(args.base_model)
         mode = getattr(args, "telephony_mode", "paired")
+        if mode == "paired":
+            print("Note: --telephony_prob is ignored in paired mode; every train row is prepared clean + phone.")
         effective_train_prob = _effective_train_prob(
             mode, getattr(args, "telephony_prob", 0.0)
         )
@@ -1203,7 +1205,9 @@ def _run_training(args, run_dir):
             )
             reclaimable = prep_cache.dir_size(train_cache)
             # Guard before removing the old cache: the projection counts its space.
-            prep_cache.ensure_space(Path(prep_cache_dir), required, reclaimable)
+            # Pass the cache slot so ensure_space measures the cache root that
+            # actually holds the shards (its parent), not the root's parent.
+            prep_cache.ensure_space(train_cache, required, reclaimable)
             prep_cache.remove_cache(train_cache)
             staging = prep_cache.staging_dir(train_cache)
             try:
@@ -1232,7 +1236,7 @@ def _run_training(args, run_dir):
                 prep_cache.estimate_feature_bytes(len(raw_eval), copies=1) * 1.05
             )
             reclaimable = prep_cache.dir_size(eval_cache)
-            prep_cache.ensure_space(Path(prep_cache_dir), required, reclaimable)
+            prep_cache.ensure_space(eval_cache, required, reclaimable)
             prep_cache.remove_cache(eval_cache)
             staging = prep_cache.staging_dir(eval_cache)
             try:

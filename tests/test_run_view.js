@@ -230,6 +230,8 @@ assert.deepStrictEqual(formValuesFromConfig(fullConfig), {
   eval_steps: "1000",
   learning_rate: "0.0001",
   gradient_checkpointing: "on",
+  // A config from before telephony_mode existed was a disjoint run.
+  telephony_mode: "disjoint",
 });
 assert.strictEqual(
   formValuesFromConfig({ ...fullConfig, gradient_checkpointing: false }).gradient_checkpointing,
@@ -252,13 +254,36 @@ for (const falsy of ["0", "off", "false", "no", "", 0, false, null]) {
 
 // Missing keys stay missing so the form keeps its defaults.
 assert.deepStrictEqual(formValuesFromConfig({}), {});
-assert.deepStrictEqual(formValuesFromConfig({ epochs: 2 }), { epochs: "2" });
+assert.deepStrictEqual(
+  formValuesFromConfig({ epochs: 2 }),
+  { epochs: "2", telephony_mode: "disjoint" },
+);
 assert.deepStrictEqual(formValuesFromConfig({ batch_size: null, epochs: "" }), {});
+
+// A historical config with form values but no telephony_mode restores the
+// disjoint mode (and its saved 4 epochs) instead of leaving paired selected.
+assert.deepStrictEqual(
+  formValuesFromConfig({ epochs: 4, batch_size: 8, grad_accum: 4 }),
+  {
+    epochs: "4",
+    batch_size: "8",
+    grad_accum: "4",
+    telephony_mode: "disjoint",
+  },
+);
+assert.strictEqual(
+  formValuesFromConfig({ epochs: 4, telephony_mode: null }).telephony_mode,
+  "disjoint",
+);
+assert.strictEqual(
+  formValuesFromConfig({ epochs: 4, telephony_mode: "" }).telephony_mode,
+  "disjoint",
+);
 
 // Extra keys never leak into the form mapping.
 assert.deepStrictEqual(
   formValuesFromConfig({ epochs: 3, trainer_args: { lora_r: 64 }, unknown_key: "x" }),
-  { epochs: "3" },
+  { epochs: "3", telephony_mode: "disjoint" },
 );
 
 // Non-object configs map to nothing.

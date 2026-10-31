@@ -347,7 +347,7 @@ def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch)
     assert stage["status"] == "failed"
 
 
-def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
+def test_prep_failure_does_not_publish(tmp_path, monkeypatch, capsys):
     """A failed map must not publish a partial cache slot."""
     train_lora = _train_lora()
     monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
@@ -364,6 +364,7 @@ def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(train_lora, "parse_args", lambda: args)
     published = []
+    events = []
 
     class _FakeProcessor:
         @classmethod
@@ -378,12 +379,19 @@ def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
             return [object()]
 
         def prepare_paired_dataset(self, *a, **k):
+            events.append(("prepare_paired_dataset", Path(k["cache_dir"])))
             staging.mkdir(parents=True, exist_ok=True)
             (staging / "clean.arrow").write_bytes(b"partial shard")
             raise RuntimeError("paired prep boom")
 
         def prepare_dataset_split(self, *a, **k):
             raise AssertionError("paired mode must not prepare a plain split")
+
+    def _ensure_space(cache_dir, required, reclaimable=0):
+        events.append(("ensure_space", Path(cache_dir)))
+
+    def _remove_cache(cache_dir):
+        events.append(("remove_cache", Path(cache_dir)))
 
     monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
     monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
@@ -392,8 +400,8 @@ def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
     monkeypatch.setattr(
         train_lora.prep_cache, "cleanup_stale_staging", lambda *a, **k: None
     )
-    monkeypatch.setattr(train_lora.prep_cache, "ensure_space", lambda *a, **k: None)
-    monkeypatch.setattr(train_lora.prep_cache, "remove_cache", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "ensure_space", _ensure_space)
+    monkeypatch.setattr(train_lora.prep_cache, "remove_cache", _remove_cache)
     monkeypatch.setattr(
         train_lora.prep_cache, "staging_dir", lambda *a, **k: staging
     )
@@ -412,7 +420,18 @@ def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
         train_lora.main()
 
     assert published == []
+    # The guard must measure the prep-cache root via the train slot, and run
+    # before the stale slot is removed and the map starts.
+    train_cache = prep_cache_dir / "train"
+    assert [kind for kind, _ in events] == [
+        "ensure_space",
+        "remove_cache",
+        "prepare_paired_dataset",
+    ]
+    assert events[0][1] == train_cache
+    assert events[1][1] == train_cache
     assert not staging.exists()
+    assert "--telephony_prob is ignored in paired mode" in capsys.readouterr().out
     run = run_state.load_run(run_dir)
     assert run["status"] == "failed"
     assert run["failed_stage"] == "preflight"
@@ -420,6 +439,92 @@ def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
     stage = _stages(run_dir)["preflight"]
     assert stage["status"] == "failed"
     assert "paired prep boom" in stage["detail"]
+
+
+def test_eval_prep_guard_uses_validation_slot(tmp_path, monkeypatch):
+    """The validation miss guards its own slot, not the prep-cache root."""
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    prep_cache_dir = tmp_path / "prep_cache"
+    staging = prep_cache_dir / "validation.staging-test"
+    args = _main_args(
+        tmp_path,
+        run_dir,
+        prep_cache_dir=str(prep_cache_dir),
+        run_epoch_benchmark=False,
+        max_train_samples=None,
+        max_eval_samples=None,
+        preflight_samples=10,
+        eval_batch_size=16,
+        overwrite_preflight=False,
+    )
+    events = []
+    loads = {"train": 0, "validation": 0}
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakePipeline:
+        def __init__(self, *a, **k):
+            pass
+
+        def load_raw_dataset(self, *a, **k):
+            return [object()]
+
+        def prepare_dataset_split(self, *a, **k):
+            events.append(("prepare_dataset_split", Path(k["cache_dir"])))
+            return [object()]
+
+        def prepare_paired_dataset(self, *a, **k):
+            raise AssertionError("a train cache hit must not re-prep")
+
+    def _load(cache_dir, fingerprint):
+        name = Path(cache_dir).name
+        loads[name] += 1
+        if name == "validation" and loads[name] == 1:
+            return None
+        return [object()]
+
+    def _ensure_space(cache_dir, required, reclaimable=0):
+        events.append(("ensure_space", Path(cache_dir)))
+
+    def _remove_cache(cache_dir):
+        events.append(("remove_cache", Path(cache_dir)))
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
+    monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
+    monkeypatch.setattr(train_lora.prep_cache, "load_prep_cache", _load)
+    monkeypatch.setattr(train_lora.prep_cache, "publish_dataset", lambda *a, **k: None)
+    monkeypatch.setattr(
+        train_lora.prep_cache, "cleanup_stale_staging", lambda *a, **k: None
+    )
+    monkeypatch.setattr(train_lora.prep_cache, "ensure_space", _ensure_space)
+    monkeypatch.setattr(train_lora.prep_cache, "remove_cache", _remove_cache)
+    monkeypatch.setattr(train_lora.prep_cache, "staging_dir", lambda *a, **k: staging)
+    monkeypatch.setattr(
+        train_lora.prep_cache, "estimate_feature_bytes", lambda rows, copies=1: 1
+    )
+    monkeypatch.setattr(
+        train_lora,
+        "run_preflight",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("stop after prep")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after prep"):
+        train_lora._run_training(args, run_dir)
+
+    eval_cache = prep_cache_dir / "validation"
+    assert [kind for kind, _ in events] == [
+        "ensure_space",
+        "remove_cache",
+        "prepare_dataset_split",
+    ]
+    assert events[0][1] == eval_cache
+    assert events[1][1] == eval_cache
+    assert loads == {"train": 1, "validation": 2}
 
 
 @pytest.mark.parametrize(

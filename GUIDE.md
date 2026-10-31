@@ -142,7 +142,7 @@ source .venv/bin/activate
 | **Batch Size** | 8 per device $\times$ 4 gradient accumulation = **32 effective batch size**, gradient checkpointing off |
 | **Telephony Mix** | Paired clean + phone (1:1, 2 epochs) |
 | **Optimizer** | `adamw_torch_fused` |
-| **Duration** | **~10 hours** for 2 paired epochs (same optimizer steps as 4 disjoint epochs); prep is ~2× the disjoint prep (one-time) |
+| **Duration** | **~10 hours** for 2 paired epochs (same optimizer steps as 4 disjoint epochs); prep is ~2× the first disjoint run (one-time) |
 | **Validation / Checkpoint** | Every 1,000 optimizer steps (`--eval_steps 1000 --save_steps 1000`) |
 | **Checkpoint Output** | `outputs/buzzasr-neyshekar-lora/best_adapter` |
 | **Config File** | `configs/l40s_train_config.yaml` via `--config` (CLI overrides file) |

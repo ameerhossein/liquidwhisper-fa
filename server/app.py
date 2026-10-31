@@ -2284,7 +2284,10 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     }
 
     trainer_args = dict(run.get("trainer_args") or {})
-    trainer_args.setdefault("telephony_mode", "disjoint")
+    # Pre-change runs (and malformed null/empty values) were disjoint; never
+    # let a resumed checkpoint fall through to the trainer's paired default.
+    if not trainer_args.get("telephony_mode"):
+        trainer_args["telephony_mode"] = "disjoint"
     trainer_args.pop("resume_from_checkpoint", None)
     trainer_args.update({
         "run_dir": str(run_dir),

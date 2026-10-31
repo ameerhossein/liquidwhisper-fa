@@ -133,7 +133,7 @@ simulated UI and does not create ledger runs.
 
 * **Native Persian Tokenizer:** OpenAI's standard Whisper Large v3 uses a multilingual byte-level BPE tokenizer, taking 5–12 tokens per Persian word. `BuzzASR/persian` replaces this with a Persian BPE tokenizer (~3.3x compression), preventing looping hallucinations and speeding up generation.
 * **Neyshekar Dataset (v5/v6):** Provides ~80–100 hours of curated native Persian speech with strict **speaker-disjoint** and **text-disjoint** splits, containing both formal Persian and ~25–35% colloquial/informal Persian.
-* **Full BF16 LoRA on L40S:** With 48 GB VRAM, training runs in full 16-bit precision without 4-bit quantization latency, taking ~3 to 5 hours for the default 2 paired epochs (compute-matched to 4 disjoint epochs) with fused AdamW and SDPA attention.
+* **Full BF16 LoRA on L40S:** With 48 GB VRAM, training runs in full 16-bit precision without 4-bit quantization latency, taking ~10 hours for the default 2 paired epochs (same optimizer steps as 4 disjoint epochs; prep is ~2× the first disjoint run) with fused AdamW and SDPA attention.
 
 ---
 

@@ -259,6 +259,18 @@ def test_start_defaults_to_paired_and_two_epochs(client):
     assert flags["--epochs"] == "2"
 
 
+@pytest.mark.parametrize("mode", ["disjoint", "clean"])
+def test_start_explicit_telephony_mode_is_passed_and_stored(client, mode):
+    res = client.post("/api/train/start", json={"telephony_mode": mode})
+    assert res.status_code == 200, res.text
+    flags = _flags(client.launched[-1])
+    assert flags["--telephony_mode"] == mode
+    assert res.json()["config"]["telephony_mode"] == mode
+    run = _run_json(client, res.json()["run_id"])
+    assert run["config"]["telephony_mode"] == mode
+    assert run["trainer_args"]["telephony_mode"] == mode
+
+
 def test_start_rejects_unknown_telephony_mode(client):
     res = client.post("/api/train/start", json={"telephony_mode": "satellite"})
     assert res.status_code == 400
@@ -509,6 +521,12 @@ def test_smoke_command_includes_paired_mode(client):
     assert _flags(client.launched[0])["--telephony_mode"] == "paired"
 
 
+def test_smoke_start_rejects_unknown_telephony_mode(client):
+    res = client.post("/api/train/smoke", json={"telephony_mode": "satellite"})
+    assert res.status_code == 400
+    assert client.launched == []
+
+
 def test_smoke_output_dir_avoids_persistent_fallback_collision(client, monkeypatch):
     monkeypatch.setattr(
         client.mod,
@@ -740,6 +758,28 @@ def test_resume_legacy_run_defaults_to_disjoint(client):
     assert res.status_code == 200, res.text
     flags = _flags(client.launched[-1])
     assert flags["--telephony_mode"] == "disjoint"
+    assert res.json()["config"]["telephony_mode"] == "disjoint"
+
+
+@pytest.mark.parametrize("stored_mode", [None, ""])
+def test_resume_null_or_empty_telephony_mode_defaults_to_disjoint(client, stored_mode):
+    start = client.post("/api/train/start", json={}).json()
+    run_id = start["run_id"]
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+
+    def blank_mode(run):
+        run["trainer_args"]["telephony_mode"] = stored_mode
+        run["config"]["telephony_mode"] = stored_mode
+        run["status"] = "failed"
+        return run
+
+    run_state.update_run(client.mod.RUNS_DIR / run_id, blank_mode)
+    res = client.post(f"/api/runs/{run_id}/resume")
+    assert res.status_code == 200, res.text
+    flags = _flags(client.launched[-1])
+    assert flags["--telephony_mode"] == "disjoint"
+    assert res.json()["config"]["telephony_mode"] == "disjoint"
 
 
 def test_run_preflight_file_falls_back_to_legacy(client, tmp_path, monkeypatch):
