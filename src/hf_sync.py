@@ -24,7 +24,9 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,62 @@ REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*
 LATEST_FILE = "latest.json"
 MANIFEST_FILE = "run.json"
 STATE_FILE = "hf_state.json"
+SYNC_FILE = "hf_sync.json"
+PENDING_FILE = "hf_sync_pending.json"
+README_FILE = "README.md"
+TRAINING_LOG_FILE = "training_live.log"
+MAX_TRAINING_LOG_BYTES = 5 * 1024 * 1024
+
+LEDGER_ROOT_FILES = (
+    MANIFEST_FILE,
+    "steps.jsonl",
+    "events.jsonl",
+    "live_telemetry.json",
+    "loss_history.json",
+    "epoch_benchmarks.json",
+)
+LEDGER_PREFLIGHT_FILE = "baselines/preflight.json"
+REPORT_FILES = ("final_evaluation_report.json", "final_evaluation_report.md")
+
+README_CONTENT = """\
+# ASR run mirror
+
+Private mirror of ASR training runs. Each run is self-contained so it can be
+restored on a fresh pod by run id.
+
+## Layout
+
+```
+latest.json
+runs/<run_id>/
+  run.json
+  steps.jsonl
+  events.jsonl
+  live_telemetry.json
+  loss_history.json
+  epoch_benchmarks.json
+  baselines/preflight.json
+  hf_state.json
+  checkpoint-<step>/
+  adapter_snapshots/step-<step>/
+  best_adapter/
+  reports/
+  merged/
+  training_live.log
+```
+
+`latest.json` points at the most recently active run. `runs/<run_id>/hf_state.json`
+is the per-run high-water mark and the authoritative state for an older run.
+
+## Restore
+
+```bash
+python scripts/hf_restore.py --run <run_id>
+python scripts/train_lora.py --hf_resume <run_id>
+```
+
+The repository is private by default.
+"""
 
 ADAPTER_CONFIG_FILE = "adapter_config.json"
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
@@ -1063,3 +1121,940 @@ def restore_run(
         "downloaded": downloaded,
         "run": run,
     }
+
+
+# ---------------------------------------------------------------------------
+# Background uploader
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SyncJob:
+    """One unit of upload work for :class:`HFRunMirror`."""
+
+    kind: str
+    path: Path | None = None
+    step: int | None = None
+    label: str = ""
+    reports: bool = False
+
+
+class _DropJob(Exception):
+    """A job is invalid or disallowed; retrying it cannot help."""
+
+    def __init__(self, message: str, *, record_error: bool = False) -> None:
+        super().__init__(message)
+        self.record_error = record_error
+
+
+def _job_to_dict(job: SyncJob) -> dict:
+    return {
+        "kind": job.kind,
+        "path": str(job.path) if job.path is not None else None,
+        "step": job.step,
+        "label": job.label,
+        "reports": bool(job.reports),
+    }
+
+
+def _job_from_dict(raw: Any) -> SyncJob | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return None
+    path: Path | None = None
+    raw_path = raw.get("path")
+    if raw_path:
+        try:
+            path = Path(str(raw_path))
+        except (TypeError, ValueError):
+            return None
+    label = raw.get("label")
+    return SyncJob(
+        kind=kind,
+        path=path,
+        step=_as_int(raw.get("step")),
+        label=str(label) if label is not None else "",
+        reports=bool(raw.get("reports")),
+    )
+
+
+def _path_size(path: Path | None) -> int:
+    """Total bytes of a file or directory tree, best effort."""
+    if path is None:
+        return 0
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        if path.is_dir():
+            total = 0
+            for child in path.rglob("*"):
+                try:
+                    if child.is_file():
+                        total += int(child.stat().st_size)
+                except OSError:
+                    continue
+            return total
+    except OSError:
+        return 0
+    return 0
+
+
+def _read_json_file(path: Path) -> dict | None:
+    try:
+        return _json_payload(Path(path).read_bytes())
+    except (OSError, ValueError):
+        return None
+
+
+class HFRunMirror:
+    """Background, best-effort mirror of one training run to a HF repo.
+
+    Every upload is wrapped so a Hugging Face failure can only move
+    ``hf_sync.json`` to ``error``; it never propagates into training.
+    """
+
+    def __init__(
+        self,
+        config: HFSyncConfig,
+        *,
+        run_id: str,
+        run_dir: Path | str,
+        output_dir: Path | str,
+        results_dir: Path | str,
+        api: Any = None,
+        manifest_update: Any = None,
+        download: Any = _default_download,
+        log: Any = print,
+        start_worker: bool = True,
+        max_attempts: int = 3,
+        sleep: Any = time.sleep,
+    ) -> None:
+        self.config = config
+        self.run_id = _require_run_id(run_id)
+        self.run_dir = Path(run_dir)
+        self.output_dir = Path(output_dir)
+        self.results_dir = Path(results_dir)
+        self.api = api if api is not None else make_api()
+        self.manifest_update = manifest_update
+        self.download = download
+        self.log = log
+        self.start_worker = bool(start_worker)
+        try:
+            self.max_attempts = max(1, int(max_attempts))
+        except (TypeError, ValueError):
+            self.max_attempts = 3
+        self.sleep = sleep
+
+        self._condition = threading.Condition()
+        self._pending: deque[SyncJob] = deque()
+        self._active: SyncJob | None = None
+        self._worker: threading.Thread | None = None
+        self._stopped = False
+        self._started = False
+        self._remote_files: list[str] | None = None
+        self._last_step = 0
+        self._uploaded_checkpoints: set[int] = set()
+
+        self._state: dict[str, Any] = {
+            "enabled": True,
+            "repo_id": self.config.repo_id,
+            "status": "idle",
+            "last_success_at": None,
+            "last_success_step": None,
+            "last_error": None,
+            "pending": 0,
+            "bytes_uploaded": 0,
+        }
+
+    # -- status and persistence ------------------------------------------------
+
+    def status(self) -> dict:
+        """Return a snapshot of the local ``hf_sync.json`` state."""
+        with self._condition:
+            payload = dict(self._state)
+            payload["pending"] = len(self._pending) + (
+                1 if self._active is not None else 0
+            )
+            return payload
+
+    def _write_state_locked(self) -> None:
+        payload = dict(self._state)
+        payload["pending"] = len(self._pending) + (
+            1 if self._active is not None else 0
+        )
+        try:
+            _write_json_atomic(self.run_dir / SYNC_FILE, payload)
+        except Exception as exc:  # noqa: BLE001 - status is best effort
+            self.log(f"[hf-sync] could not write {SYNC_FILE}: {exc}")
+
+    def _record_error(self, message: str) -> None:
+        with self._condition:
+            self._state["status"] = "error"
+            self._state["last_error"] = str(message)
+            self._write_state_locked()
+
+    def _record_failure(self, job: SyncJob, exc: BaseException) -> None:
+        message = str(exc) or type(exc).__name__
+        with self._condition:
+            self._state["status"] = "error"
+            self._state["last_error"] = message
+            self._write_state_locked()
+        self.log(f"[hf-sync] upload failed for {job.kind}: {message}")
+        self._append_error_event(job, message)
+
+    def _append_error_event(self, job: SyncJob, message: str) -> None:
+        payload = {
+            "type": "hf_sync",
+            "status": "error",
+            "kind": job.kind,
+            "step": job.step,
+            "error": message,
+            "at": time.time(),
+        }
+        try:
+            path = self.run_dir / "events.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self.log(f"[hf-sync] could not append the error event: {exc}")
+
+    def _persist_pending_locked(self) -> None:
+        jobs: list[dict] = []
+        if self._active is not None:
+            jobs.append(_job_to_dict(self._active))
+        jobs.extend(_job_to_dict(job) for job in self._pending)
+        try:
+            _write_json_atomic(self.run_dir / PENDING_FILE, {"jobs": jobs})
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self.log(f"[hf-sync] could not write {PENDING_FILE}: {exc}")
+
+    def _load_pending(self) -> None:
+        payload = _read_json_file(self.run_dir / PENDING_FILE)
+        if payload is None:
+            return
+        raw_jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+        if not isinstance(raw_jobs, list):
+            return
+        loaded: list[SyncJob] = []
+        for raw in raw_jobs:
+            job = _job_from_dict(raw)
+            if job is None:
+                continue
+            if job.kind in ("checkpoint", "adapter", "merged"):
+                if job.path is None or not job.path.exists():
+                    continue
+            loaded.append(job)
+        with self._condition:
+            for job in loaded:
+                self._append_job_locked(job, persist=False)
+            self._persist_pending_locked()
+
+    # -- enqueue -------------------------------------------------------------
+
+    def _append_job_locked(self, job: SyncJob, *, persist: bool = True) -> None:
+        if job.kind == "adapter" and job.label in ("", "snapshot"):
+            self._pending = deque(
+                pending
+                for pending in self._pending
+                if not (
+                    pending.kind == "adapter"
+                    and pending.label in ("", "snapshot")
+                )
+            )
+        elif job.kind == "latest":
+            self._pending = deque(
+                pending for pending in self._pending if pending.kind != "latest"
+            )
+        self._pending.append(job)
+        if persist:
+            self._persist_pending_locked()
+            self._write_state_locked()
+        self._condition.notify_all()
+
+    def _enqueue(self, job: SyncJob) -> None:
+        try:
+            with self._condition:
+                self._append_job_locked(job)
+        except Exception as exc:  # noqa: BLE001 - enqueue never raises
+            self.log(f"[hf-sync] could not enqueue {job.kind}: {exc}")
+
+    def enqueue_checkpoint(self, path: Path | str, step: int) -> None:
+        self._enqueue(
+            SyncJob("checkpoint", Path(path), _as_int(step))
+        )
+
+    def enqueue_adapter_snapshot(self, path: Path | str, step: int) -> None:
+        self._enqueue(
+            SyncJob("adapter", Path(path), _as_int(step), label="snapshot")
+        )
+
+    def enqueue_adapter(
+        self, path: Path | str, label: str = "best_adapter"
+    ) -> None:
+        self._enqueue(SyncJob("adapter", Path(path), label=str(label)))
+
+    def enqueue_ledger(self, status: str = "running", *, reports: bool = False) -> None:
+        self._enqueue(
+            SyncJob(
+                "ledger",
+                None,
+                label=str(status or "running"),
+                reports=bool(reports),
+            )
+        )
+
+    def enqueue_merged(self, path: Path | str) -> None:
+        self._enqueue(SyncJob("merged", Path(path)))
+
+    def enqueue_latest(self) -> None:
+        self._enqueue(SyncJob("latest"))
+
+    def _is_pending(self, kind: str, path: Path) -> bool:
+        with self._condition:
+            if (
+                self._active is not None
+                and self._active.kind == kind
+                and self._active.path == path
+            ):
+                return True
+            return any(
+                job.kind == kind and job.path == path for job in self._pending
+            )
+
+    # -- start and backfill ---------------------------------------------------
+
+    def start(self) -> None:
+        """Prepare the repo and enqueue recovery/backfill work once."""
+        with self._condition:
+            if self._started:
+                return
+            self._started = True
+
+        files: list[str] | None = None
+        try:
+            self._ensure_repo()
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"could not create or verify the repository: {exc}")
+            self.log(f"[hf-sync] could not create or verify the repository: {exc}")
+
+        try:
+            files = self._list_files(force=True)
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"could not list the repository: {exc}")
+            self.log(f"[hf-sync] could not list the repository: {exc}")
+
+        try:
+            self._ensure_readme(files)
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"could not create {README_FILE}: {exc}")
+            self.log(f"[hf-sync] could not create {README_FILE}: {exc}")
+
+        try:
+            self._update_manifest()
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"could not update {MANIFEST_FILE}: {exc}")
+            self.log(f"[hf-sync] could not update {MANIFEST_FILE}: {exc}")
+
+        try:
+            self._load_pending()
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self.log(f"[hf-sync] could not load {PENDING_FILE}: {exc}")
+
+        try:
+            self._backfill(files)
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"could not backfill local artifacts: {exc}")
+            self.log(f"[hf-sync] could not backfill local artifacts: {exc}")
+
+        with self._condition:
+            self._write_state_locked()
+
+        if self.start_worker:
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"hf-sync-{self.run_id}",
+                daemon=True,
+            )
+            with self._condition:
+                self._worker = worker
+            worker.start()
+
+    def _ensure_repo(self) -> None:
+        create = getattr(self.api, "create_repo", None)
+        if create is None:
+            return
+        create(
+            self.config.repo_id,
+            private=self.config.private,
+            exist_ok=True,
+        )
+
+    def _ensure_readme(self, files: list[str] | None) -> None:
+        if files is None:
+            files = self._list_files()
+        if README_FILE in files:
+            return
+        self.api.upload_file(
+            path_or_fileobj=README_CONTENT.encode("utf-8"),
+            path_in_repo=README_FILE,
+            repo_id=self.config.repo_id,
+            commit_message="Add the run mirror README",
+        )
+
+    def _update_manifest(self) -> None:
+        hf = {
+            "enabled": True,
+            "repo_id": self.config.repo_id,
+            "private": self.config.private,
+            "adapter_snapshot_steps": self.config.adapter_snapshot_steps,
+            "auto_resume": self.config.auto_resume,
+            "run_id": self.run_id,
+            "layout": 1,
+        }
+
+        def mutate(run: dict) -> None:
+            run["hf"] = dict(hf)
+
+        if callable(self.manifest_update):
+            self.manifest_update(mutate)
+            return
+        path = self.run_dir / MANIFEST_FILE
+        run = _read_json_file(path)
+        if run is None:
+            return
+        mutate(run)
+        run["updated_at"] = time.time()
+        _write_json_atomic(path, run)
+
+    def _list_files(self, *, force: bool = False) -> list[str]:
+        with self._condition:
+            cached = self._remote_files
+        if cached is not None and not force:
+            return list(cached)
+        files = _listed_files(self.api, self.config.repo_id)
+        with self._condition:
+            self._remote_files = list(files)
+        return files
+
+    def _remote_high_water(self, files: list[str] | None) -> int | None:
+        state_path = f"{repo_run_path(self.run_id)}/{STATE_FILE}"
+        if files is None or state_path in files:
+            try:
+                state = _json_payload(
+                    self.download(self.config.repo_id, state_path)
+                )
+            except Exception:  # noqa: BLE001 - a missing state is not fatal
+                state = None
+            if state is not None:
+                step = _as_int(state.get("last_step"))
+                if step is not None:
+                    return step
+        if files is None:
+            return None
+        return select_checkpoint_step(files, self.run_id)
+
+    def _backfill(self, files: list[str] | None) -> None:
+        remote_step = self._remote_high_water(files)
+        for step, path in self._local_checkpoints():
+            if remote_step is not None and step <= remote_step:
+                continue
+            if not self._is_pending("checkpoint", path):
+                self.enqueue_checkpoint(path, step)
+
+        best = self.output_dir / "best_adapter"
+        if best.is_dir() and validate_adapter(best)[0]:
+            if not self._is_pending("adapter", best):
+                self.enqueue_adapter(best)
+
+    def _local_checkpoints(self) -> list[tuple[int, Path]]:
+        found: list[tuple[int, Path]] = []
+        try:
+            entries = list(self.output_dir.iterdir())
+        except OSError:
+            return found
+        for path in entries:
+            match = CHECKPOINT_RE.fullmatch(path.name)
+            if match is not None and is_complete_checkpoint(path):
+                found.append((int(match.group(1)), path))
+        found.sort(key=lambda item: item[0])
+        return found
+
+    def _highest_local_checkpoint(self) -> int | None:
+        checkpoints = self._local_checkpoints()
+        return checkpoints[-1][0] if checkpoints else None
+
+    # -- repair ---------------------------------------------------------------
+
+    def auto_repair(self) -> bool:
+        """Pull a newer remote checkpoint into ``output_dir`` when one exists."""
+        try:
+            local_step = self._highest_local_checkpoint()
+            files = self._list_files(force=True)
+            remote_step = select_checkpoint_step(files, self.run_id)
+            if remote_step is None:
+                return False
+            if local_step is not None and remote_step <= local_step:
+                return False
+            step, _downloaded = _download_checkpoint(
+                self.download,
+                self.config.repo_id,
+                self.run_id,
+                files,
+                self.output_dir,
+            )
+            if step is None:
+                return False
+            if local_step is not None and step <= local_step:
+                return False
+            self.log(
+                f"[hf-sync] repaired the local run with checkpoint-{step}"
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - never fail training
+            self._record_error(f"auto repair failed: {exc}")
+            self.log(f"[hf-sync] auto repair failed: {exc}")
+            return False
+
+    # -- worker and draining --------------------------------------------------
+
+    def process_pending(self) -> int:
+        """Upload every queued job synchronously; return successes."""
+        handled = 0
+        while True:
+            job = self._take_job()
+            if job is None:
+                break
+            success = self._handle_job(job)
+            with self._condition:
+                self._active = None
+                self._persist_pending_locked()
+                if not self._pending and self._state["status"] != "error":
+                    self._state["status"] = "idle"
+                self._write_state_locked()
+                self._condition.notify_all()
+            if success:
+                handled += 1
+        return handled
+
+    def _take_job(self) -> SyncJob | None:
+        with self._condition:
+            if not self._pending:
+                return None
+            job = self._pending.popleft()
+            self._active = job
+            self._state["status"] = "running"
+            self._persist_pending_locked()
+            return job
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending and not self._stopped:
+                    self._condition.wait()
+                if self._stopped and not self._pending:
+                    return
+                job = self._pending.popleft()
+                self._active = job
+                self._state["status"] = "running"
+                self._persist_pending_locked()
+            self._handle_job(job)
+            with self._condition:
+                self._active = None
+                self._persist_pending_locked()
+                if not self._pending and self._state["status"] != "error":
+                    self._state["status"] = "idle"
+                self._write_state_locked()
+                self._condition.notify_all()
+
+    def drain(self, timeout: float = 120.0) -> bool:
+        try:
+            wait_seconds = max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            wait_seconds = 120.0
+        deadline = time.monotonic() + wait_seconds
+        with self._condition:
+            while self._pending or self._active is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def close(self, timeout: float = 120.0) -> None:
+        with self._condition:
+            worker = self._worker
+        if worker is not None and worker.is_alive():
+            self.drain(timeout)
+        else:
+            self.process_pending()
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        if worker is not None and worker.is_alive():
+            try:
+                worker.join(timeout=min(5.0, max(0.0, float(timeout))))
+            except (TypeError, ValueError):
+                worker.join(timeout=5.0)
+
+    # -- uploads --------------------------------------------------------------
+
+    def _handle_job(self, job: SyncJob) -> bool:
+        for attempt in range(self.max_attempts):
+            try:
+                step, uploaded_bytes = self._upload_job(job)
+                self._record_success(job, step, uploaded_bytes)
+                return True
+            except _DropJob as exc:
+                if exc.record_error:
+                    self._record_error(str(exc))
+                self.log(f"[hf-sync] dropped {job.kind} job: {exc}")
+                return False
+            except Exception as exc:  # noqa: BLE001 - retry, then record
+                if attempt + 1 < self.max_attempts:
+                    self.log(f"[hf-sync] upload failed ({exc}), retrying")
+                    try:
+                        self.sleep(2**attempt)
+                    except Exception:  # noqa: BLE001 - a bad sleep hook is harmless
+                        pass
+                    continue
+                self._record_failure(job, exc)
+                return False
+        return False
+
+    def _record_success(
+        self, job: SyncJob, step: int | None, uploaded_bytes: int
+    ) -> None:
+        if job.kind == "checkpoint" and step is not None:
+            self._uploaded_checkpoints.add(int(step))
+        self._write_local_hf_state(step)
+        latest_bytes = self._upload_latest()
+        with self._condition:
+            self._state["last_success_at"] = time.time()
+            if step is not None:
+                self._state["last_success_step"] = int(step)
+            self._state["last_error"] = None
+            self._state["bytes_uploaded"] = (
+                _as_int(self._state.get("bytes_uploaded")) or 0
+            ) + int(uploaded_bytes) + int(latest_bytes)
+            self._state["status"] = (
+                "running" if self._pending or self._active is not None else "idle"
+            )
+            self._write_state_locked()
+
+    def _upload_job(self, job: SyncJob) -> tuple[int | None, int]:
+        kind = job.kind
+        if kind == "checkpoint":
+            return self._upload_checkpoint(job)
+        if kind == "adapter":
+            return self._upload_adapter(job)
+        if kind == "ledger":
+            step, size = self._commit_ledger(
+                status=job.label or "running",
+                step=job.step,
+                reports=job.reports,
+            )
+            return step, size
+        if kind == "merged":
+            return self._upload_merged(job)
+        if kind == "latest":
+            return None, self._upload_latest()
+        raise _DropJob(f"unknown job kind: {kind!r}")
+
+    def _upload_checkpoint(self, job: SyncJob) -> tuple[int | None, int]:
+        path = job.path
+        if path is None or not is_complete_checkpoint(path):
+            raise _DropJob(f"incomplete checkpoint: {path}")
+        step = job.step
+        if step is None:
+            match = CHECKPOINT_RE.fullmatch(path.name)
+            step = int(match.group(1)) if match is not None else None
+        if step is None:
+            raise _DropJob(f"checkpoint has no step: {path}")
+        size = _path_size(path)
+        self._upload_folder(
+            path,
+            repo_checkpoint_path(self.run_id, step),
+            f"Upload checkpoint-{step}",
+        )
+        ledger_step, ledger_size = self._commit_ledger(
+            status=self._manifest_status(),
+            step=step,
+            reports=False,
+            checkpoint_step=step,
+        )
+        return ledger_step, size + ledger_size
+
+    def _upload_adapter(self, job: SyncJob) -> tuple[int | None, int]:
+        path = job.path
+        if path is None:
+            raise _DropJob("adapter job has no path")
+        ok, reason = validate_adapter(path)
+        if not ok:
+            raise _DropJob(f"invalid adapter {path}: {reason}")
+        label = job.label or "snapshot"
+        run_prefix = repo_run_path(self.run_id)
+        snapshot_step: int | None = None
+        if label == "best_adapter" or path.name == "best_adapter":
+            path_in_repo = f"{run_prefix}/best_adapter"
+        else:
+            match = _ADAPTER_SNAPSHOT_RE.fullmatch(path.name)
+            if match is None:
+                raise _DropJob(
+                    f"adapter snapshot has an invalid folder name: {path.name}"
+                )
+            snapshot_step = int(match.group(1))
+            path_in_repo = f"{run_prefix}/adapter_snapshots/{path.name}"
+        size = _path_size(path)
+        self._upload_folder(
+            path,
+            path_in_repo,
+            f"Upload {path.name}",
+        )
+        if snapshot_step is not None:
+            self._retain_adapter_snapshots(snapshot_step)
+        return job.step, size
+
+    def _upload_merged(self, job: SyncJob) -> tuple[int | None, int]:
+        path = job.path
+        if path is None:
+            raise _DropJob("merged job has no path")
+        ok, reason = validate_merged(path)
+        if not ok:
+            raise _DropJob(f"invalid merged model {path}: {reason}")
+        size = _path_size(path)
+        self._upload_folder(
+            path,
+            f"{repo_run_path(self.run_id)}/merged",
+            "Upload the merged model",
+        )
+        return None, size
+
+    def _upload_folder(self, path: Path, path_in_repo: str, message: str) -> None:
+        self.api.upload_folder(
+            folder_path=str(path),
+            path_in_repo=path_in_repo,
+            repo_id=self.config.repo_id,
+            commit_message=message,
+        )
+
+    def _retain_adapter_snapshots(self, newest_step: int) -> None:
+        """Keep the newest two snapshots; delete only superseded ones."""
+        root = self.output_dir / "adapter_snapshots"
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return
+        snapshots: list[tuple[int, Path]] = []
+        for path in entries:
+            match = _ADAPTER_SNAPSHOT_RE.fullmatch(path.name)
+            if match is not None and path.is_dir():
+                snapshots.append((int(match.group(1)), path))
+        snapshots.sort(key=lambda item: item[0], reverse=True)
+        for step, path in snapshots[2:]:
+            if step >= newest_step:
+                # Never remove an unsucceeded snapshot that is newer than the
+                # one whose upload just succeeded.
+                continue
+            try:
+                shutil.rmtree(path)
+                self.log(f"[hf-sync] removed old adapter snapshot {path.name}")
+            except OSError as exc:
+                self.log(f"[hf-sync] could not remove {path}: {exc}")
+
+    # -- ledger and latest ----------------------------------------------------
+
+    def _manifest(self) -> dict:
+        return _read_json_file(self.run_dir / MANIFEST_FILE) or {}
+
+    def _manifest_status(self) -> str:
+        return str(self._manifest().get("status") or "running")
+
+    def _local_hf_state(self) -> dict:
+        return _read_json_file(self.run_dir / STATE_FILE) or {}
+
+    def _find_ledger_file(self, name: str) -> Path | None:
+        for base in (self.run_dir, self.results_dir):
+            path = base / name
+            if path.is_file():
+                return path
+        return None
+
+    def _report_files(self) -> dict[str, Path]:
+        found: dict[str, Path] = {}
+        for base in (self.run_dir, self.output_dir):
+            for name in REPORT_FILES:
+                path = base / name
+                if path.is_file():
+                    found.setdefault(name, path)
+            reports_dir = base / "reports"
+            if reports_dir.is_dir():
+                for path in sorted(reports_dir.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    try:
+                        relative = path.relative_to(reports_dir).as_posix()
+                    except ValueError:
+                        continue
+                    found[relative] = path
+        return found
+
+    def _ledger_files(self, *, reports: bool) -> dict[str, Path]:
+        files: dict[str, Path] = {}
+        for name in LEDGER_ROOT_FILES:
+            path = self._find_ledger_file(name)
+            if path is not None:
+                files[name] = path
+        preflight = self._find_ledger_file(LEDGER_PREFLIGHT_FILE)
+        if preflight is not None:
+            files[LEDGER_PREFLIGHT_FILE] = preflight
+        log_file = self.run_dir / TRAINING_LOG_FILE
+        if not log_file.is_file():
+            log_file = self.results_dir / TRAINING_LOG_FILE
+        try:
+            if log_file.is_file() and log_file.stat().st_size < MAX_TRAINING_LOG_BYTES:
+                files[TRAINING_LOG_FILE] = log_file
+        except OSError:
+            pass
+        if reports:
+            for relative, path in self._report_files().items():
+                files[f"reports/{relative}"] = path
+        return files
+
+    def _write_local_hf_state(self, step: int | None) -> None:
+        manifest = self._manifest()
+        current = self._local_hf_state()
+        checkpoints = {
+            int(value)
+            for value in current.get("checkpoints") or []
+            if _as_int(value) is not None
+        }
+        checkpoints.update(self._uploaded_checkpoints)
+        last_step = max(
+            int(step or 0),
+            _as_int(manifest.get("last_step")) or 0,
+            _as_int(current.get("last_step")) or 0,
+            self._last_step,
+        )
+        payload = {
+            "last_step": last_step,
+            "updated_at": time.time(),
+            "checkpoints": sorted(checkpoints),
+            "status": str(manifest.get("status") or "running"),
+        }
+        _write_json_atomic(self.run_dir / STATE_FILE, payload)
+        self._last_step = last_step
+
+    def _remote_ledger_step(self) -> int | None:
+        state_path = f"{repo_run_path(self.run_id)}/{STATE_FILE}"
+        try:
+            state = _json_payload(self.download(self.config.repo_id, state_path))
+        except Exception:  # noqa: BLE001 - fall back to the file listing
+            state = None
+        if state is not None:
+            step = _as_int(state.get("last_step"))
+            if step is not None:
+                return step
+        try:
+            files = self._list_files()
+        except Exception as exc:  # noqa: BLE001 - refuse an unverifiable ledger
+            raise _DropJob(
+                f"cannot verify the remote high-water mark: {exc}",
+                record_error=True,
+            ) from exc
+        return select_checkpoint_step(files, self.run_id)
+
+    def _commit_ledger(
+        self,
+        *,
+        status: str,
+        step: int | None,
+        reports: bool,
+        checkpoint_step: int | None = None,
+    ) -> tuple[int, int]:
+        manifest = self._manifest()
+        current = self._local_hf_state()
+        local_step = max(
+            int(step or 0),
+            _as_int(manifest.get("last_step")) or 0,
+            _as_int(current.get("last_step")) or 0,
+            self._last_step,
+        )
+        remote_step = self._remote_ledger_step()
+        if remote_step is not None and remote_step > local_step:
+            raise _DropJob(
+                "refusing to upload ledger at last_step "
+                f"{local_step}: remote high-water mark is {remote_step}",
+                record_error=True,
+            )
+
+        checkpoints = {
+            int(value)
+            for value in current.get("checkpoints") or []
+            if _as_int(value) is not None
+        }
+        checkpoints.update(self._uploaded_checkpoints)
+        if checkpoint_step is not None:
+            checkpoints.add(int(checkpoint_step))
+        self._write_hf_state(local_step, checkpoints, status)
+
+        files = self._ledger_files(reports=reports)
+        state_path = self.run_dir / STATE_FILE
+        files[STATE_FILE] = state_path
+
+        try:
+            from huggingface_hub import CommitOperationAdd  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001 - treated as an upload failure
+            raise HFSyncError(
+                "huggingface_hub is required to upload ledger snapshots"
+            ) from exc
+
+        prefix = repo_run_path(self.run_id)
+        operations = []
+        for relative, path in files.items():
+            operations.append(
+                CommitOperationAdd(
+                    path_in_repo=f"{prefix}/{relative}",
+                    path_or_fileobj=str(path),
+                )
+            )
+        self.api.create_commit(
+            repo_id=self.config.repo_id,
+            operations=operations,
+            commit_message=f"Sync {self.run_id} ledger ({status})",
+        )
+        return local_step, sum(_path_size(path) for path in files.values())
+
+    def _write_hf_state(
+        self, last_step: int, checkpoints: set[int], status: str
+    ) -> None:
+        payload = {
+            "last_step": int(last_step),
+            "updated_at": time.time(),
+            "checkpoints": sorted(int(value) for value in checkpoints),
+            "status": str(status or "running"),
+        }
+        _write_json_atomic(self.run_dir / STATE_FILE, payload)
+        self._last_step = max(self._last_step, int(last_step))
+
+    def _upload_latest(self) -> int:
+        manifest = self._manifest()
+        payload = {
+            "run_id": self.run_id,
+            "status": str(manifest.get("status") or "running"),
+            "last_step": self._last_step,
+            "updated_at": time.time(),
+            "layout": 1,
+        }
+        data = (
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        self.api.upload_file(
+            path_or_fileobj=data,
+            path_in_repo=LATEST_FILE,
+            repo_id=self.config.repo_id,
+            commit_message=f"Update {LATEST_FILE} for {self.run_id}",
+        )
+        return len(data)
