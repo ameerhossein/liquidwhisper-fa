@@ -800,21 +800,9 @@ function hideHfLocalRunNotice() {
   if (el.hfLocalRunNotice) el.hfLocalRunNotice.hidden = true;
 }
 
-function selectedHfRemoteRun() {
-  const runId = el.inputHfRunId ? String(el.inputHfRunId.value || "").trim() : "";
-  if (!runId) return null;
-  return remoteHfRuns.find((run) => run && String(run.run_id || "") === runId) || null;
-}
-
 function hfRestoreSelection() {
   const runId = el.inputHfRunId ? String(el.inputHfRunId.value || "").trim() : "";
-  const run = runId ? selectedHfRemoteRun() : null;
-  // A manually typed id that is not in the listed page still gets Restore
-  // only and Resume; the server validates it and reports a missing checkpoint.
-  const state = run
-    ? recoverActionState(run)
-    : { canRestore: Boolean(runId), canResume: Boolean(runId), reason: "" };
-  return { runId, run, state };
+  return recoverSelectionState(runId, remoteHfRuns);
 }
 
 function syncHfRestoreButtons() {
@@ -977,7 +965,7 @@ async function startRestore(resume) {
     setHfRestoreStatus(state.reason || "Choose a remote run to restore.", true);
     return;
   }
-  if (resume && run && !state.canResume) {
+  if (resume && !(run && state.canResume)) {
     setHfRestoreStatus(state.reason || "This run cannot be resumed.", true);
     return;
   }
@@ -1834,8 +1822,8 @@ if (el.btnHfOpenLocal) el.btnHfOpenLocal.addEventListener("click", openHfLocalRu
 if (el.inputHfRunId) {
   el.inputHfRunId.addEventListener("input", () => {
     syncHfRestoreButtons();
-    const { run, state } = hfRestoreSelection();
-    if (run && state.reason) setHfRestoreStatus(state.reason);
+    const { state } = hfRestoreSelection();
+    setHfRestoreStatus(state.reason || "");
   });
 }
 syncHfRestoreButtons();

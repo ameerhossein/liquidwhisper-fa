@@ -192,6 +192,39 @@ function recoverActionState(remoteRun) {
   return { canRestore: true, canResume: true, reason: "" };
 }
 
+// Resolve the dialog's current run id against the listed remote runs and gate
+// its actions. A typed id with no matching row has no checkpoint metadata, so
+// it stays restore-only until the user lists and selects it.
+function recoverSelectionState(runId, runs) {
+  const id = runId == null ? "" : String(runId).trim();
+  const list = Array.isArray(runs) ? runs : [];
+  const run = id
+    ? list.find((candidate) => candidate && String(candidate.run_id || "") === id) || null
+    : null;
+  if (run) return { runId: id, run, state: recoverActionState(run) };
+  if (!id) {
+    return {
+      runId: id,
+      run: null,
+      state: {
+        canRestore: false,
+        canResume: false,
+        reason: "Choose a remote run to restore.",
+      },
+    };
+  }
+  return {
+    runId: id,
+    run: null,
+    state: {
+      canRestore: true,
+      canResume: false,
+      reason:
+        "List and select this run to verify its checkpoint before resuming.",
+    },
+  };
+}
+
 // The HF sync badge. ``enabled: false`` means sync is off, so there is no
 // badge; otherwise reflect uploading, the retrying error state, or the last
 // successfully uploaded step with its local time.
@@ -244,6 +277,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolvePickerSelection,
     shouldApplyPickerRefresh,
     recoverActionState,
+    recoverSelectionState,
     hfSyncLabel,
     remoteRunOptionLabel,
   };

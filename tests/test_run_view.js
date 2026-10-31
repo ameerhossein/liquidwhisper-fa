@@ -18,6 +18,7 @@ const {
   resolvePickerSelection,
   shouldApplyPickerRefresh,
   recoverActionState,
+  recoverSelectionState,
   hfSyncLabel,
   remoteRunOptionLabel,
 } = require("../server/static/run_view.js");
@@ -411,35 +412,43 @@ assert.strictEqual(
   "20261031-120000-abcdef · running · step 1,000",
 );
 
-assert.deepStrictEqual(
-  recoverActionState({ run_id: "r", status: "running", has_checkpoint: true }),
-  { canRestore: true, canResume: true, reason: "" },
+// A typed run ID that has not been listed carries no checkpoint metadata:
+// restoring is safe, but resume must wait until it is listed and selected.
+const unresolvedSelection = recoverSelectionState(
+  "20261031-120000-abcdef",
+  [{ run_id: "20261031-100000-bbbbbb", status: "running", has_checkpoint: true }],
 );
-assert.strictEqual(
-  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
-    .canResume,
-  false,
-);
-assert.match(
-  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
-    .reason,
-  /completed/i,
-);
-assert.strictEqual(
-  recoverActionState({ run_id: "r", status: "running", has_checkpoint: false })
-    .canResume,
-  false,
-);
-assert.strictEqual(
-  hfSyncLabel({ enabled: true, status: "idle", last_success_step: 2000 }),
-  "HF: synced 2,000",
-);
-assert.strictEqual(hfSyncLabel({ enabled: true, status: "uploading" }), "HF: uploading…");
-assert.match(hfSyncLabel({ enabled: true, status: "error" }), /error/i);
-assert.strictEqual(hfSyncLabel({ enabled: false }), "");
-assert.strictEqual(
-  remoteRunOptionLabel({ run_id: "20261031-120000-abcdef", status: "running", last_step: 1000 }),
-  "20261031-120000-abcdef · running · step 1,000",
-);
+assert.strictEqual(unresolvedSelection.runId, "20261031-120000-abcdef");
+assert.strictEqual(unresolvedSelection.run, null);
+assert.strictEqual(unresolvedSelection.state.canRestore, true);
+assert.strictEqual(unresolvedSelection.state.canResume, false);
+assert.match(unresolvedSelection.state.reason, /list|select|verify/i);
+
+// A listed run keeps the existing gates.
+const listedSelection = recoverSelectionState("run-running", [
+  { run_id: "run-running", status: "running", has_checkpoint: true },
+]);
+assert.strictEqual(listedSelection.runId, "run-running");
+assert.strictEqual(listedSelection.state.canRestore, true);
+assert.strictEqual(listedSelection.state.canResume, true);
+assert.strictEqual(listedSelection.state.reason, "");
+
+const noCheckpointSelection = recoverSelectionState("run-empty", [
+  { run_id: "run-empty", status: "running", has_checkpoint: false },
+]);
+assert.strictEqual(noCheckpointSelection.state.canRestore, true);
+assert.strictEqual(noCheckpointSelection.state.canResume, false);
+assert.match(noCheckpointSelection.state.reason, /checkpoint/i);
+
+const completedSelection = recoverSelectionState("run-done", [
+  { run_id: "run-done", status: "completed", has_checkpoint: true },
+]);
+assert.strictEqual(completedSelection.state.canRestore, true);
+assert.strictEqual(completedSelection.state.canResume, false);
+assert.match(completedSelection.state.reason, /completed/i);
+
+const emptySelection = recoverSelectionState("", []);
+assert.strictEqual(emptySelection.state.canRestore, false);
+assert.strictEqual(emptySelection.state.canResume, false);
 
 console.log("run_view behavior tests passed");

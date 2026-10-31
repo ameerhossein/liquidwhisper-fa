@@ -287,43 +287,5 @@ def test_hf_recover_ui_is_present_and_wired():
         assert endpoint in js
     assert "hfSyncLabel" in js
     assert "recoverActionState" in js
-
-
-def test_hf_recover_ui_is_present_and_wired():
-    html = (ROOT / "server/static/index.html").read_text()
-    js = (ROOT / "server/static/app.js").read_text()
-    for element in (
-        "btnRecover",
-        "hfRecoverDialog",
-        "inputHfRepo",
-        "inputHfRunId",
-        "btnHfList",
-        "hfRunList",
-        "btnHfRestore",
-        "btnHfRestoreResume",
-        "hfRestoreStatus",
-        "hfRestoreLog",
-        "btnHfClose",
-        "hfSyncBadge",
-    ):
-        assert f'id="{element}"' in html
-    for function in (
-        "loadHfConfig",
-        "openRecoverDialog",
-        "closeRecoverDialog",
-        "loadRemoteRuns",
-        "renderRemoteRuns",
-        "startRestore",
-        "pollRestore",
-        "renderHfBadge",
-    ):
-        assert f"function {function}(" in js
-    for endpoint in (
-        "/api/hf/config",
-        "/api/hf/runs",
-        "/api/hf/restore",
-        "/api/hf/restore/status",
-    ):
-        assert endpoint in js
-    assert "hfSyncLabel" in js
-    assert "recoverActionState" in js
+    assert "recoverSelectionState" in js
+    assert "run && state.canResume" in js
