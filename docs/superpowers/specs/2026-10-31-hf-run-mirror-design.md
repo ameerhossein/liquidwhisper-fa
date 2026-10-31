@@ -238,13 +238,40 @@ checkpoints and stage boundaries, not on every optimizer step.
 
 Two entry points share `src/hf_sync.py`.
 
+0. **Recover by run ID (the primary fresh-pod path).**
+   - `python scripts/hf_restore.py --run <run_id> [--repo <user>/<repo>]` restores
+     the run's state and artifacts only; it never starts training.
+   - `python scripts/train_lora.py --hf_resume <run_id>` restores the same state,
+     then resumes training when the run is not terminal. If the run is
+     `completed`, it restores and exits with a message instead of re-training.
+   - The repo is resolved in this order: explicit `--repo`/`--hf_run_repo`, the
+     `hf.repo_id` recorded in a local `run.json` for that run ID, then
+     `ASR_HF_RUN_REPO`. If none is available, the command fails before any
+     download and prints the repo options. With `ASR_HF_RUN_REPO` set once in
+     `.env`, the run ID is the only argument needed on a fresh pod.
+   - The run ID maps directly to `runs/<run_id>/` in the repo. A missing run ID
+     fails with a short list of available run IDs.
+   - This pulls exactly what is needed to rebuild the local run:
+     `run.json`, `steps.jsonl`, `events.jsonl`, `live_telemetry.json`,
+     `loss_history.json`, `epoch_benchmarks.json`, `baselines/preflight.json`,
+     `hf_state.json`, `best_adapter/`, `reports/`, and the newest complete
+     `checkpoint-<step>/`. `merged/` is pulled only with `--include-merged`
+     because it is large and can be regenerated.
+   - If `best_adapter/` is absent but a checkpoint exists, the checkpoint is
+     enough to resume training. If no checkpoint exists, the command restores
+     the ledger and adapter snapshot, prints what is available, and exits
+     non-zero rather than starting fresh.
+   - Restoring into an existing non-empty run directory is refused unless
+     `--force` is passed, and a local ledger newer than the remote high-water
+     mark is never overwritten.
+
 1. **Automatic repair while resuming an existing run.** When `--run_dir` exists
    and the local output has no complete checkpoint, or the remote newest is newer,
    and `--hf_auto_resume` is on, download the newest complete checkpoint for that
    run into `output/`. This covers a pod that kept the run ledger but lost its
    output, and a pod that restored an older volume snapshot.
 
-2. **Fresh-pod restore (`scripts/hf_restore.py` or `train_lora --hf_resume`).**
+2. **Latest-run restore (`--run latest` / `--hf_resume latest`).**
    - `--hf_resume latest` resolves `latest.json` (the most recently active run);
      if it is missing, list `runs/*/run.json` and pick the newest `run_id` (the ID
      is timestamp-sortable, so no clock comparison is needed). If that run is
