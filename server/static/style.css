@@ -436,6 +436,17 @@ th {
   color: var(--ink-3);
 }
 
+.stage.is-unknown .stage-dot {
+  border-style: dashed;
+  border-color: var(--ink-3);
+  background: transparent;
+}
+
+.stage.is-unknown .stage-label,
+.stage.is-unknown .stage-detail {
+  color: var(--ink-3);
+}
+
 .stage.is-interrupted .stage-dot {
   border-color: var(--brick);
   background: var(--brick-wash);
@@ -679,6 +690,10 @@ th {
   background: var(--paper-deep);
   color: var(--ink-2);
   font-size: 13px;
+}
+
+.merge-result {
+  overflow-wrap: anywhere;
 }
 
 .smoke-result.pass,
@@ -1150,10 +1165,11 @@ mark.wrong {
   .config-actions {
     margin-left: 0;
     width: 100%;
+    flex-wrap: wrap;
   }
 
   .config-actions .btn {
-    flex: 1;
+    flex: 1 1 calc(50% - 4px);
   }
 }
 

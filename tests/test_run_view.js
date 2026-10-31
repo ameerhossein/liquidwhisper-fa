@@ -125,4 +125,15 @@ assert.strictEqual(
   "a running stage blocks merge",
 );
 
+// Task 8 action gates: merge needs an artifact and interrupted runs read clearly.
+assert.strictEqual(
+  isMergeAvailable(
+    { status: "completed", stages: [{ name: "training", status: "completed" }] },
+    false,
+  ),
+  false,
+  "merge requires an adapter artifact",
+);
+assert.strictEqual(runStatusLabel({ status: "interrupted" }), "Run interrupted");
+
 console.log("run_view behavior tests passed");

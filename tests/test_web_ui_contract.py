@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import re
 import shutil
 import subprocess
 
@@ -61,6 +63,57 @@ def test_stateful_run_controls_are_present():
     assert "Dev simulation" in html
 
 
+def test_run_actions_are_wired():
+    js = (ROOT / "server/static/app.js").read_text()
+    assert "/resume" in js
+    assert "/merge" in js
+    assert "/api/runs?limit=" in js
+    assert "storageWarning" in js
+    assert "Dev simulation" in js
+
+
+def test_run_history_and_actions_are_wired():
+    js = (ROOT / "server/static/app.js").read_text()
+    for function in (
+        "refreshRunList",
+        "selectRun",
+        "resumeRun",
+        "mergeRun",
+        "renderMergeStatus",
+    ):
+        assert f"function {function}(" in js, f"missing {function}()"
+    assert "viewingHistorical" in js
+    assert '"/api/runs?limit=20"' in js
+    assert "runSelect" in js
+    assert "adapter_exists" in js
+    assert 'run.source === "fake"' in js
+    assert "formRestored = false" in js
+    assert "scheduleMergePoll(runId, 2000)" in js
+    assert "mergeLog" in js
+    assert "runPicker" in (ROOT / "server/static/index.html").read_text()
+
+
+def test_stepper_markup_matches_stage_order():
+    html = (ROOT / "server/static/index.html").read_text()
+    stages = re.findall(r'data-stage="([^"]+)"', html)
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    result = subprocess.run(
+        [
+            node,
+            "-e",
+            "process.stdout.write(JSON.stringify("
+            "require('./server/static/run_view.js').STAGE_ORDER))",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert stages == json.loads(result.stdout)
+
+
 def test_stepper_styles_every_stage_state():
     css = (ROOT / "server/static/style.css").read_text()
     for status in (
@@ -71,6 +124,7 @@ def test_stepper_styles_every_stage_state():
         "failed",
         "skipped",
         "interrupted",
+        "unknown",
     ):
         assert f".stage.is-{status}" in css
     assert ".storage-warning" in css

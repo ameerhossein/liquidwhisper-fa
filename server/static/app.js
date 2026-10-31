@@ -28,6 +28,7 @@ const el = {
   btnResume: document.getElementById("btnResume"),
   btnMerge: document.getElementById("btnMerge"),
   runSelect: document.getElementById("runSelect"),
+  runPicker: document.getElementById("runPicker"),
   runHead: document.getElementById("runHead"),
   runIdentity: document.getElementById("runIdentity"),
   runStatus: document.getElementById("runStatus"),
@@ -68,6 +69,16 @@ let smokeRunning = false;
 let smokePollTimer = null;
 let fullRunRunning = false;
 let formRestored = false;
+let selectedRunId = "latest";
+let viewingHistorical = false;
+let runViewToken = 0;
+let lastRenderedRunKey = null;
+let resumePending = false;
+let mergePending = false;
+let mergePollTimer = null;
+let mergePendingPolls = 0;
+let mergeError = "";
+let mergeViewSignature = null;
 
 const STAGE_STATUS_LABELS = {
   pending: "Pending",
@@ -78,6 +89,11 @@ const STAGE_STATUS_LABELS = {
   skipped: "Skipped",
   interrupted: "Interrupted",
 };
+
+function humanizeStatus(value) {
+  const text = String(value ?? "").trim().replace(/[_-]+/g, " ");
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Unknown";
+}
 
 // Formatters
 
@@ -185,18 +201,21 @@ function renderStepper(run) {
   for (const stage of el.stageStepper.querySelectorAll(".stage")) {
     const name = stage.dataset.stage;
     const current = stages.get(name) || { status: "pending" };
-    const status = STAGE_STATUS_LABELS[current.status] ? current.status : "pending";
+    const rawStatus = String(current.status || "pending").trim().toLowerCase();
+    const known = Object.prototype.hasOwnProperty.call(STAGE_STATUS_LABELS, rawStatus);
+    const status = known ? rawStatus : "unknown";
+    const detailText = known ? STAGE_STATUS_LABELS[rawStatus] : humanizeStatus(current.status);
 
     for (const cls of Array.from(stage.classList)) {
       if (cls.startsWith("is-")) stage.classList.remove(cls);
     }
     stage.classList.add(`is-${status}`);
-    stage.dataset.status = status;
+    stage.dataset.status = detailText;
 
     const label = stage.querySelector(".stage-label");
     if (label) label.textContent = stageLabel(name);
     const detail = stage.querySelector(".stage-detail");
-    if (detail) detail.textContent = STAGE_STATUS_LABELS[status];
+    if (detail) detail.textContent = detailText;
     stage.title = current.detail ? String(current.detail) : "";
   }
 }
@@ -214,51 +233,397 @@ function renderRun(run, steps, storage, adapterExists = false) {
   el.runStatus.textContent = runStatusLabel(run);
   el.runStatus.className = `run-status run-status-${knownStatus.includes(status) ? status : "unknown"}`;
   el.runCreated.textContent = formatCreatedAt(run.created_at);
-  el.runSource.hidden = run.source !== "fake";
+  el.runSource.hidden = !(run.source === "fake");
+  el.runSource.textContent = "Dev simulation";
   renderStepper(run);
   el.stepSaved.textContent = savedStepsLabel(steps);
   updateStorageWarning(storage);
 
   el.btnResume.hidden = !["interrupted", "stopped", "failed"].includes(run.status);
-  el.btnMerge.hidden = !isMergeAvailable(run, Boolean(adapterExists) || Boolean(run.adapter_exists));
+  const adapterAvailable = Boolean(adapterExists) || Boolean(run.adapter_exists);
+  el.btnMerge.hidden = !isMergeAvailable(run, adapterAvailable);
+  syncRunActionButtons();
+  noteRenderedRun(run);
 }
 
 function hideRunUi() {
   if (el.runHead) el.runHead.hidden = true;
   if (el.btnResume) el.btnResume.hidden = true;
   if (el.btnMerge) el.btnMerge.hidden = true;
+  hideMergeResult();
+}
+
+function noteRenderedRun(run) {
+  const key = `${run && run.run_id ? run.run_id : ""}|${run && run.status ? run.status : ""}`;
+  const previous = lastRenderedRunKey;
+  lastRenderedRunKey = key;
+  if (viewingHistorical) return;
+  // A first run can appear while the page is already open in legacy mode.
+  const pickerWasHidden = Boolean(el.runPicker && el.runPicker.hidden);
+  if (previous ? previous !== key : pickerWasHidden) refreshRunList();
+}
+
+function setRunPickerAvailable(available) {
+  if (el.runPicker) el.runPicker.hidden = !available;
+  if (!el.runSelect) return;
+  el.runSelect.disabled = !available;
+  if (!available) el.runSelect.value = "latest";
+}
+
+function runOptionLabel(run) {
+  const id = String(run.run_id || "");
+  const status = run.status ? humanizeStatus(run.status) : "Unknown";
+  return `${id} · ${status}`;
+}
+
+// Fill the history picker with Latest plus the newest ledger runs. The picker
+// stays hidden in legacy/local-demo mode, where no ledger run exists.
+async function refreshRunList() {
+  if (!el.runSelect) return;
+  const previous = el.runSelect.value || "latest";
+  try {
+    const res = await fetch("/api/runs?limit=20");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const runs = Array.isArray(data && data.runs) ? data.runs : [];
+    const keepSelection =
+      previous === "latest" || runs.some((run) => run && String(run.run_id) === previous);
+    const next = keepSelection ? previous : "latest";
+
+    const fragment = document.createDocumentFragment();
+    const latestOption = document.createElement("option");
+    latestOption.value = "latest";
+    latestOption.textContent = "Latest";
+    fragment.append(latestOption);
+    for (const run of runs) {
+      if (!run || !run.run_id) continue;
+      const option = document.createElement("option");
+      option.value = String(run.run_id);
+      option.textContent = runOptionLabel(run);
+      fragment.append(option);
+    }
+    el.runSelect.replaceChildren(fragment);
+    el.runSelect.value = next;
+    setRunPickerAvailable(runs.length > 0);
+
+    if (next !== previous) {
+      selectedRunId = "latest";
+      viewingHistorical = false;
+      loadRunState();
+    }
+  } catch (e) {
+    // Legacy/local demo server without the run ledger API.
+    setRunPickerAvailable(false);
+  }
+}
+
+async function selectRun(runId) {
+  const target = runId == null || runId === "" ? "latest" : String(runId);
+  selectedRunId = target;
+  viewingHistorical = target !== "latest";
+  formRestored = false;
+  mergePending = false;
+  mergePendingPolls = 0;
+  mergeError = "";
+  mergeViewSignature = null;
+  stopMergePolling();
+  syncRunActionButtons();
+  if (el.runSelect && el.runSelect.value !== target) el.runSelect.value = target;
+
+  const token = ++runViewToken;
+  const url =
+    target === "latest" ? "/api/runs/latest" : `/api/runs/${encodeURIComponent(target)}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    if (token !== runViewToken) return;
+    if (!payload || !payload.run) {
+      // Legacy/local demo without a run ledger: keep the pre-run cockpit.
+      selectedRunId = "latest";
+      hideRunUi();
+      return;
+    }
+
+    selectedRunId = String(payload.run.run_id || "latest");
+    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    restoreRunConfig(payload.run.config);
+    if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
+    if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
+    renderMergeStatus(payload);
+    ensureMergePolling(payload);
+  } catch (e) {
+    if (token !== runViewToken) return;
+    console.error("Failed to load run", target, e);
+    if (target !== "latest") {
+      // A stale history entry falls back to Latest rather than a dead view.
+      await selectRun("latest");
+      refreshRunList();
+    } else {
+      selectedRunId = "latest";
+      hideRunUi();
+    }
+  }
 }
 
 function applyLiveRun(data) {
-  if (!data || !data.run) return;
-  const selected = el.runSelect ? el.runSelect.value || "latest" : "latest";
-  if (selected !== "latest") return;
+  if (!data || !data.run || viewingHistorical) return;
+  selectedRunId = data.run.run_id ? String(data.run.run_id) : "latest";
   renderRun(data.run, data.steps, data.storage, data.adapter_exists);
   restoreRunConfig(data.run.config);
+  renderMergeStatus(data);
 }
 
 async function loadRunState() {
+  if (viewingHistorical) return;
+  const token = ++runViewToken;
   try {
     const res = await fetch("/api/runs/latest");
+    if (token !== runViewToken) return;
     if (!res.ok) {
       hideRunUi();
       return;
     }
     const payload = await res.json();
+    if (token !== runViewToken) return;
     if (!payload || !payload.run) {
       // Legacy/local demo without a run ledger: keep the pre-run cockpit.
       hideRunUi();
       return;
     }
 
-    const firstLoad = !formRestored;
+    selectedRunId = payload.run.run_id ? String(payload.run.run_id) : "latest";
     renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
     restoreRunConfig(payload.run.config);
     if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
     if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
-    if (firstLoad) fetchLogs();
+    renderMergeStatus(payload);
+    ensureMergePolling(payload);
   } catch (e) {
-    hideRunUi();
+    if (token === runViewToken) hideRunUi();
+  }
+}
+
+// Run actions
+
+function syncRunActionButtons() {
+  if (el.btnResume) {
+    el.btnResume.disabled = resumePending;
+    el.btnResume.textContent = resumePending ? "Resuming…" : "Resume run";
+  }
+  if (el.btnMerge) {
+    el.btnMerge.disabled = mergePending;
+    el.btnMerge.textContent = mergePending ? "Merging…" : "Merge adapter";
+  }
+}
+
+function hideMergeResult() {
+  mergeViewSignature = null;
+  if (!el.mergeResult) return;
+  el.mergeResult.hidden = true;
+  el.mergeResult.className = "merge-result";
+  if (el.mergeResultText) el.mergeResultText.textContent = "";
+  if (el.mergeLogWrap) el.mergeLogWrap.hidden = true;
+  if (el.mergeLog) el.mergeLog.textContent = "";
+}
+
+function setMergeResult(kind, text, logLines = []) {
+  if (!el.mergeResult || !el.mergeResultText) return;
+  el.mergeResult.hidden = false;
+  el.mergeResult.className = `merge-result ${kind}`;
+  el.mergeResultText.textContent = text;
+  const hasLog = logLines.length > 0;
+  if (el.mergeLogWrap) el.mergeLogWrap.hidden = !hasLog;
+  if (el.mergeLog) el.mergeLog.textContent = hasLog ? logLines.join("\n") : "";
+  if (hasLog && el.mergeLogWrap) el.mergeLogWrap.open = kind === "fail";
+}
+
+// renderMergeStatus accepts a /api/runs/{id} payload and reflects only the
+// merge stage; the run's completed training status is never rewritten here.
+function renderMergeStatus(payload) {
+  if (!el.mergeResult) return;
+  const run = payload && payload.run;
+  const stage = run ? stageMap(run).get("merge") : null;
+  const status = stage ? String(stage.status || "pending") : "pending";
+  let kind = "idle";
+  let text = "";
+  let logs = [];
+
+  if (status === "running" || (status === "pending" && mergePending)) {
+    kind = "running";
+    text = "Merging adapter…";
+  } else if (status === "completed") {
+    kind = "pass";
+    text = stage.detail ? `Merge complete — ${stage.detail}` : "Merge complete.";
+  } else if (["failed", "stopped", "interrupted"].includes(status)) {
+    kind = "fail";
+    const label = status === "failed" ? "Merge failed" : `Merge ${humanizeStatus(status).toLowerCase()}`;
+    text = stage.detail ? `${label}: ${stage.detail}` : `${label}.`;
+    logs = Array.isArray(stage.log_tail) ? stage.log_tail.map(String) : [];
+  } else if (status === "pending" && mergeError) {
+    kind = "fail";
+    text = mergeError;
+  }
+
+  if (kind === "pass" || kind === "fail") {
+    mergePending = false;
+    syncRunActionButtons();
+  }
+
+  const signature = `${kind}\u0000${text}\u0000${logs.join("\n")}`;
+  if (signature === mergeViewSignature) return;
+  if (kind === "idle") {
+    if (el.mergeResult.hidden) {
+      mergeViewSignature = signature;
+    } else {
+      hideMergeResult();
+    }
+    return;
+  }
+  mergeViewSignature = signature;
+  setMergeResult(kind, text, logs);
+}
+
+async function errorDetail(res) {
+  const text = await res.text();
+  if (!text) return `HTTP ${res.status}`;
+  let detail = text;
+  try {
+    const err = JSON.parse(text);
+    detail = err.detail || err.error || text;
+  } catch {
+    // Non-JSON body: keep the raw text.
+  }
+  if (typeof detail === "string" && detail.length > 500) detail = `${detail.slice(0, 500)}…`;
+  return detail || `HTTP ${res.status}`;
+}
+
+function stopMergePolling() {
+  if (mergePollTimer) {
+    clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+  }
+}
+
+function scheduleMergePoll(runId, delay = 2000) {
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = setTimeout(() => pollMergeStatus(runId), delay);
+}
+
+function ensureMergePolling(payload) {
+  const run = payload && payload.run;
+  if (!run || !run.run_id) return;
+  const stage = stageMap(run).get("merge");
+  if (!stage || stage.status !== "running") return;
+  mergePending = true;
+  syncRunActionButtons();
+  if (mergePollTimer) return;
+  scheduleMergePoll(String(run.run_id), 2000);
+}
+
+async function pollMergeStatus(runId) {
+  mergePollTimer = null;
+  if (!runId) return;
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await res.json();
+    const displayed = selectedRunId === runId;
+    if (displayed) {
+      renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+      if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
+      if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
+      renderMergeStatus(payload);
+    }
+
+    const stage = payload.run ? stageMap(payload.run).get("merge") : null;
+    const status = stage ? String(stage.status || "pending") : "pending";
+    if (status === "running") {
+      mergePendingPolls = 0;
+      scheduleMergePoll(runId, 2000);
+      return;
+    }
+    if (status === "pending" && mergePendingPolls < 3) {
+      // The POST has returned but the ledger may not have caught up yet.
+      mergePendingPolls += 1;
+      scheduleMergePoll(runId, 2000);
+      return;
+    }
+    mergePending = false;
+    if (status === "pending") {
+      mergeError = "Merge did not start. Check the training log.";
+      mergeViewSignature = null;
+      if (displayed) renderMergeStatus(payload);
+    }
+    syncRunActionButtons();
+    refreshRunList();
+  } catch (e) {
+    mergePending = false;
+    mergeError = `Merge status unavailable: ${e}`;
+    mergeViewSignature = null;
+    if (selectedRunId === runId) renderMergeStatus({});
+    syncRunActionButtons();
+    refreshRunList();
+  }
+}
+
+async function resumeRun() {
+  const runId = selectedRunId !== "latest" ? selectedRunId : null;
+  if (!runId || resumePending) return;
+  resumePending = true;
+  syncRunActionButtons();
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/resume`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) {
+      alert(`Resume failed: ${await errorDetail(res)}`);
+      return;
+    }
+    await refreshRunList();
+    await selectRun("latest");
+  } catch (e) {
+    alert(`Resume failed: ${e}`);
+  } finally {
+    resumePending = false;
+    syncRunActionButtons();
+  }
+}
+
+async function mergeRun() {
+  const runId = selectedRunId !== "latest" ? selectedRunId : null;
+  if (!runId || mergePending) return;
+  mergePending = true;
+  mergePendingPolls = 0;
+  mergeError = "";
+  mergeViewSignature = null;
+  syncRunActionButtons();
+  renderMergeStatus({ run: { stages: [{ name: "merge", status: "running" }] } });
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/merge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!res.ok) {
+      mergePending = false;
+      mergeError = `Could not start merge: ${await errorDetail(res)}`;
+      mergeViewSignature = null;
+      renderMergeStatus({});
+      syncRunActionButtons();
+      refreshRunList();
+      return;
+    }
+    scheduleMergePoll(runId, 2000);
+    refreshRunList();
+  } catch (e) {
+    mergePending = false;
+    mergeError = `Could not start merge: ${e}`;
+    mergeViewSignature = null;
+    renderMergeStatus({});
+    syncRunActionButtons();
   }
 }
 
@@ -279,13 +644,17 @@ function connectWebSocket() {
       try {
         const data = JSON.parse(event.data);
         if (data.telemetry) updateTelemetry(data.telemetry);
-        if (data.benchmarks) updateBenchmarks(data.benchmarks);
-        if (data.loss_history) updateLossHistory(data.loss_history);
-        if (Object.prototype.hasOwnProperty.call(data, "run")) {
-          if (data.run) {
-            applyLiveRun(data);
-          } else if (!el.runSelect || (el.runSelect.value || "latest") === "latest") {
-            hideRunUi();
+        // A pinned historical run keeps its own benchmarks, loss, and stage
+        // rail; live run data resumes only when Latest is selected again.
+        if (!viewingHistorical) {
+          if (data.benchmarks) updateBenchmarks(data.benchmarks);
+          if (data.loss_history) updateLossHistory(data.loss_history);
+          if (Object.prototype.hasOwnProperty.call(data, "run")) {
+            if (data.run) {
+              applyLiveRun(data);
+            } else {
+              hideRunUi();
+            }
           }
         }
       } catch (e) {
@@ -316,8 +685,10 @@ async function pollTelemetryFallback() {
       fetch("/api/loss-history").then((r) => (r.ok ? r.json() : null)),
     ]);
     if (statusRes) updateTelemetry(statusRes);
-    if (benchRes) updateBenchmarks(benchRes);
-    if (lossRes) updateLossHistory(lossRes);
+    if (!viewingHistorical) {
+      if (benchRes) updateBenchmarks(benchRes);
+      if (lossRes) updateLossHistory(lossRes);
+    }
   } catch (e) {
     // Network hiccup: the next poll will retry.
   }
@@ -834,6 +1205,10 @@ async function startRun(freshStart) {
       alert(`Start failed: ${detail || "Unknown error"}`);
       el.btnStart.disabled = false;
       el.btnFresh.disabled = false;
+    } else {
+      // A new run is now the live target, even if a historical run was pinned.
+      await refreshRunList();
+      await selectRun("latest");
     }
   } catch (e) {
     alert(`Failed to start training: ${e}`);
@@ -844,6 +1219,11 @@ async function startRun(freshStart) {
 
 el.btnStart.addEventListener("click", () => startRun(false));
 if (el.btnSmoke) el.btnSmoke.addEventListener("click", startSmokeRun);
+if (el.runSelect) {
+  el.runSelect.addEventListener("change", () => selectRun(el.runSelect.value));
+}
+if (el.btnResume) el.btnResume.addEventListener("click", resumeRun);
+if (el.btnMerge) el.btnMerge.addEventListener("click", mergeRun);
 
 el.btnFresh.addEventListener("click", () => {
   if (!confirm("Fresh start deletes existing checkpoints, the best adapter, reports and telemetry history before training. This cannot be undone. Continue?")) {
@@ -870,6 +1250,7 @@ window.addEventListener("DOMContentLoaded", () => {
   connectWebSocket();
   pollTelemetryFallback();
   setInterval(pollTelemetryFallback, 1000);
+  refreshRunList();
   loadRunState();
   setInterval(() => {
     if (!wsActive) loadRunState();
