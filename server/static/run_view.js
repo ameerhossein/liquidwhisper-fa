@@ -58,6 +58,14 @@ function savedStepsLabel(steps) {
   return `${count.toLocaleString("en-US")} step${count === 1 ? "" : "s"} saved`;
 }
 
+function runLogUrl(runId, historical = false) {
+  const id = runId == null ? "" : String(runId);
+  if (historical && id && id !== "latest") {
+    return `/api/runs/${encodeURIComponent(id)}/logs?tail=80`;
+  }
+  return "/api/logs?tail=80";
+}
+
 function isMergeAvailable(run, adapterExists = false) {
   if (!run || !adapterExists || run.status !== "completed") return false;
   const stages = stageMap(run);
@@ -76,5 +84,6 @@ if (typeof module !== "undefined" && module.exports) {
     runStatusLabel,
     savedStepsLabel,
     isMergeAvailable,
+    runLogUrl,
   };
 }

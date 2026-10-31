@@ -2262,6 +2262,31 @@ async def get_run_steps(run_id: str, tail: int = 2000):
     }
 
 
+@app.get("/api/runs/{run_id}/logs")
+async def get_run_logs(run_id: str, tail: int = 80):
+    """Read the selected run's log without touching the live-run buffer."""
+    if not run_state.run_id_valid(run_id):
+        raise HTTPException(status_code=404, detail="Run not found.")
+    run = run_state.load_run(RUNS_DIR / run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    log_file = _run_paths(run)["log_file"]
+    if not log_file.exists():
+        return {"logs": ["Log buffer empty. Training has not started."]}
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return {"logs": [f"Error reading log file: {e}"]}
+    try:
+        count = int(tail)
+    except (TypeError, ValueError):
+        count = 80
+    count = max(0, min(count, 2000))
+    selected = [] if count == 0 else lines[-count:]
+    return {"logs": [line.rstrip() for line in selected]}
+
+
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: str):
     if not run_state.run_id_valid(run_id):

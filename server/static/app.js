@@ -73,9 +73,11 @@ let selectedRunId = "latest";
 let viewingHistorical = false;
 let runViewToken = 0;
 let lastRenderedRunKey = null;
+let lastRunListSignature = null;
 let resumePending = false;
 let mergePending = false;
 let mergePollTimer = null;
+let mergePollGeneration = 0;
 let mergePendingPolls = 0;
 let mergeError = "";
 let mergeViewSignature = null;
@@ -210,7 +212,7 @@ function renderStepper(run) {
       if (cls.startsWith("is-")) stage.classList.remove(cls);
     }
     stage.classList.add(`is-${status}`);
-    stage.dataset.status = detailText;
+    stage.dataset.status = status;
 
     const label = stage.querySelector(".stage-label");
     if (label) label.textContent = stageLabel(name);
@@ -290,19 +292,26 @@ async function refreshRunList() {
       previous === "latest" || runs.some((run) => run && String(run.run_id) === previous);
     const next = keepSelection ? previous : "latest";
 
-    const fragment = document.createDocumentFragment();
-    const latestOption = document.createElement("option");
-    latestOption.value = "latest";
-    latestOption.textContent = "Latest";
-    fragment.append(latestOption);
-    for (const run of runs) {
-      if (!run || !run.run_id) continue;
-      const option = document.createElement("option");
-      option.value = String(run.run_id);
-      option.textContent = runOptionLabel(run);
-      fragment.append(option);
+    // Rebuilding the options every poll would close an open native dropdown.
+    const signature = runs
+      .map((run) => `${run && run.run_id ? run.run_id : ""}:${run && run.status ? run.status : ""}`)
+      .join("|");
+    if (signature !== lastRunListSignature) {
+      lastRunListSignature = signature;
+      const fragment = document.createDocumentFragment();
+      const latestOption = document.createElement("option");
+      latestOption.value = "latest";
+      latestOption.textContent = "Latest";
+      fragment.append(latestOption);
+      for (const run of runs) {
+        if (!run || !run.run_id) continue;
+        const option = document.createElement("option");
+        option.value = String(run.run_id);
+        option.textContent = runOptionLabel(run);
+        fragment.append(option);
+      }
+      el.runSelect.replaceChildren(fragment);
     }
-    el.runSelect.replaceChildren(fragment);
     el.runSelect.value = next;
     setRunPickerAvailable(runs.length > 0);
 
@@ -312,8 +321,13 @@ async function refreshRunList() {
       loadRunState();
     }
   } catch (e) {
-    // Legacy/local demo server without the run ledger API.
+    // Legacy/local demo server without the run ledger API, or a transient
+    // failure: never leave the picker on Latest while a historical run is
+    // still the rendered view.
     setRunPickerAvailable(false);
+    selectedRunId = "latest";
+    viewingHistorical = false;
+    loadRunState();
   }
 }
 
@@ -348,10 +362,12 @@ async function selectRun(runId) {
     selectedRunId = String(payload.run.run_id || "latest");
     renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
     restoreRunConfig(payload.run.config);
+    updateTelemetry(payload.telemetry || {}, viewingHistorical);
     if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
     if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
     renderMergeStatus(payload);
     ensureMergePolling(payload);
+    await fetchLogs();
   } catch (e) {
     if (token !== runViewToken) return;
     console.error("Failed to load run", target, e);
@@ -499,15 +515,16 @@ async function errorDetail(res) {
 }
 
 function stopMergePolling() {
+  mergePollGeneration += 1;
   if (mergePollTimer) {
     clearTimeout(mergePollTimer);
     mergePollTimer = null;
   }
 }
 
-function scheduleMergePoll(runId, delay = 2000) {
+function scheduleMergePoll(runId, delay = 2000, generation = mergePollGeneration) {
   if (mergePollTimer) clearTimeout(mergePollTimer);
-  mergePollTimer = setTimeout(() => pollMergeStatus(runId), delay);
+  mergePollTimer = setTimeout(() => pollMergeStatus(runId, generation), delay);
 }
 
 function ensureMergePolling(payload) {
@@ -521,47 +538,47 @@ function ensureMergePolling(payload) {
   scheduleMergePoll(String(run.run_id), 2000);
 }
 
-async function pollMergeStatus(runId) {
+async function pollMergeStatus(runId, generation) {
   mergePollTimer = null;
-  if (!runId) return;
+  if (!runId || generation !== mergePollGeneration || selectedRunId !== runId) return;
   try {
     const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
-    const displayed = selectedRunId === runId;
-    if (displayed) {
-      renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
-      if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
-      if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
-      renderMergeStatus(payload);
-    }
+    // The user may have switched runs while this request was in flight.
+    if (generation !== mergePollGeneration || selectedRunId !== runId) return;
+    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
+    if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
+    renderMergeStatus(payload);
 
     const stage = payload.run ? stageMap(payload.run).get("merge") : null;
     const status = stage ? String(stage.status || "pending") : "pending";
     if (status === "running") {
       mergePendingPolls = 0;
-      scheduleMergePoll(runId, 2000);
+      scheduleMergePoll(runId, 2000, generation);
       return;
     }
     if (status === "pending" && mergePendingPolls < 3) {
       // The POST has returned but the ledger may not have caught up yet.
       mergePendingPolls += 1;
-      scheduleMergePoll(runId, 2000);
+      scheduleMergePoll(runId, 2000, generation);
       return;
     }
     mergePending = false;
     if (status === "pending") {
       mergeError = "Merge did not start. Check the training log.";
       mergeViewSignature = null;
-      if (displayed) renderMergeStatus(payload);
+      renderMergeStatus(payload);
     }
     syncRunActionButtons();
     refreshRunList();
   } catch (e) {
+    if (generation !== mergePollGeneration || selectedRunId !== runId) return;
     mergePending = false;
     mergeError = `Merge status unavailable: ${e}`;
     mergeViewSignature = null;
-    if (selectedRunId === runId) renderMergeStatus({});
+    renderMergeStatus({});
     syncRunActionButtons();
     refreshRunList();
   }
@@ -595,12 +612,14 @@ async function resumeRun() {
 async function mergeRun() {
   const runId = selectedRunId !== "latest" ? selectedRunId : null;
   if (!runId || mergePending) return;
+  const generation = mergePollGeneration;
   mergePending = true;
   mergePendingPolls = 0;
   mergeError = "";
   mergeViewSignature = null;
   syncRunActionButtons();
   renderMergeStatus({ run: { stages: [{ name: "merge", status: "running" }] } });
+  const stillSelected = () => generation === mergePollGeneration && selectedRunId === runId;
   try {
     const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/merge`, {
       method: "POST",
@@ -608,17 +627,21 @@ async function mergeRun() {
       body: "{}",
     });
     if (!res.ok) {
-      mergePending = false;
-      mergeError = `Could not start merge: ${await errorDetail(res)}`;
-      mergeViewSignature = null;
-      renderMergeStatus({});
-      syncRunActionButtons();
+      const detail = await errorDetail(res);
+      if (stillSelected()) {
+        mergePending = false;
+        mergeError = `Could not start merge: ${detail}`;
+        mergeViewSignature = null;
+        renderMergeStatus({});
+        syncRunActionButtons();
+      }
       refreshRunList();
       return;
     }
-    scheduleMergePoll(runId, 2000);
+    if (stillSelected()) scheduleMergePoll(runId, 2000, generation);
     refreshRunList();
   } catch (e) {
+    if (!stillSelected()) return;
     mergePending = false;
     mergeError = `Could not start merge: ${e}`;
     mergeViewSignature = null;
@@ -643,10 +666,10 @@ function connectWebSocket() {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.telemetry) updateTelemetry(data.telemetry);
-        // A pinned historical run keeps its own benchmarks, loss, and stage
-        // rail; live run data resumes only when Latest is selected again.
+        // A pinned historical run keeps its own telemetry, benchmarks, loss,
+        // and stage rail; live data resumes only when Latest is selected.
         if (!viewingHistorical) {
+          if (data.telemetry) updateTelemetry(data.telemetry);
           if (data.benchmarks) updateBenchmarks(data.benchmarks);
           if (data.loss_history) updateLossHistory(data.loss_history);
           if (Object.prototype.hasOwnProperty.call(data, "run")) {
@@ -677,7 +700,7 @@ function connectWebSocket() {
 
 // Resilient HTTP polling fallback (keeps the local demo working without WebSocket)
 async function pollTelemetryFallback() {
-  if (wsActive) return;
+  if (wsActive || viewingHistorical) return;
   try {
     const [statusRes, benchRes, lossRes] = await Promise.all([
       fetch("/api/status").then((r) => (r.ok ? r.json() : null)),
@@ -733,7 +756,7 @@ function syncRunButtons(stopping = false) {
   el.btnStop.disabled = !fullRunRunning || stopping;
 }
 
-function updateTelemetry(tel) {
+function updateTelemetry(tel, historical = false) {
   const status = tel.status || "idle";
   const running = !!tel.process_running || ["initializing", "training", "stopping", "evaluating_benchmark"].includes(status);
 
@@ -742,8 +765,12 @@ function updateTelemetry(tel) {
   el.statusDot.className = `dot dot-${state}`;
   el.statusLabel.textContent = STATE_LABELS[state];
 
-  fullRunRunning = running;
-  syncRunButtons(state === "stopping");
+  // A historical snapshot describes the selected run, not the live job:
+  // keep the start/halt controls driven by the actual current process.
+  if (!historical) {
+    fullRunRunning = running;
+    syncRunButtons(state === "stopping");
+  }
 
   const gpu = tel.gpu || {};
   if (gpu.available) {
@@ -1045,11 +1072,17 @@ function renderCanary(canaries) {
 // Training log
 
 async function fetchLogs() {
+  const target = viewingHistorical && selectedRunId !== "latest" ? selectedRunId : null;
   try {
-    const res = await fetch("/api/logs?tail=80");
+    const res = await fetch(runLogUrl(selectedRunId, viewingHistorical));
     if (!res.ok) return;
     const data = await res.json();
     if (!Array.isArray(data.logs)) return;
+
+    // A selection change while this request was in flight must not overwrite
+    // the newly selected run's log.
+    const current = viewingHistorical && selectedRunId !== "latest" ? selectedRunId : null;
+    if (target !== current) return;
 
     const box = el.consoleBox;
     const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
@@ -1187,22 +1220,7 @@ async function startRun(freshStart) {
       }),
     });
     if (!res.ok) {
-      // Read the body as text first: error responses are JSON
-      // ({"detail": ...}) but proxies/legacy servers may return plain-text
-      // "Internal Server Error". Parsing text directly avoids masking the
-      // real message as "SyntaxError: Unexpected token 'I' ...".
-      const text = await res.text();
-      let detail = text;
-      try {
-        const err = JSON.parse(text);
-        detail = err.detail || err.error || text || "Unknown error";
-      } catch {
-        // Non-JSON body: keep the raw text.
-      }
-      if (typeof detail === "string" && detail.length > 500) {
-        detail = `${detail.slice(0, 500)}…`;
-      }
-      alert(`Start failed: ${detail || "Unknown error"}`);
+      alert(`Start failed: ${await errorDetail(res)}`);
       el.btnStart.disabled = false;
       el.btnFresh.disabled = false;
     } else {
@@ -1253,6 +1271,12 @@ window.addEventListener("DOMContentLoaded", () => {
   refreshRunList();
   loadRunState();
   setInterval(() => {
+    if (viewingHistorical) {
+      // Only the picker follows the live ledger while a historical run is
+      // pinned; the rendered content stays historical.
+      refreshRunList();
+      return;
+    }
     if (!wsActive) loadRunState();
   }, 2000);
   fetchLogs();

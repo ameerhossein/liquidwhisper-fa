@@ -162,6 +162,44 @@ def test_runs_endpoints_list_latest_and_steps(client):
     assert steps["total"] == 0
 
 
+def test_run_logs_are_scoped_and_missing_runs_are_404(client):
+    first = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-aaaaaa"
+    )
+    second = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-195700-bbbbbb"
+    )
+    first_dir = client.mod.RUNS_DIR / first["run_id"]
+    second_dir = client.mod.RUNS_DIR / second["run_id"]
+    (first_dir / "training_live.log").write_text(
+        "first line\nsecond line\nthird line\n", encoding="utf-8"
+    )
+    (second_dir / "training_live.log").write_text("live only\n", encoding="utf-8")
+
+    res = client.get(f"/api/runs/{first['run_id']}/logs?tail=2")
+    assert res.status_code == 200, res.text
+    assert res.json() == {"logs": ["second line", "third line"]}
+
+    # The live endpoint keeps its current-run behavior.
+    live = client.get("/api/logs?tail=5")
+    assert live.status_code == 200, live.text
+    assert live.json() == {"logs": ["live only"]}
+
+    empty = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-200700-cccccc"
+    )
+    empty_res = client.get(f"/api/runs/{empty['run_id']}/logs")
+    assert empty_res.status_code == 200, empty_res.text
+    assert empty_res.json() == {
+        "logs": ["Log buffer empty. Training has not started."]
+    }
+
+    missing = client.get("/api/runs/20990101-000000-abcdef/logs")
+    assert missing.status_code == 404
+    invalid = client.get("/api/runs/not-a-run/logs")
+    assert invalid.status_code == 404
+
+
 def test_merge_starts_and_marks_stage(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]

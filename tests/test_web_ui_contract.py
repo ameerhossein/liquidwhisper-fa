@@ -88,9 +88,20 @@ def test_run_history_and_actions_are_wired():
     assert "adapter_exists" in js
     assert 'run.source === "fake"' in js
     assert "formRestored = false" in js
-    assert "scheduleMergePoll(runId, 2000)" in js
+    assert "scheduleMergePoll(runId, 2000, generation)" in js
     assert "mergeLog" in js
     assert "runPicker" in (ROOT / "server/static/index.html").read_text()
+
+
+def test_historical_run_content_is_scoped():
+    js = (ROOT / "server/static/app.js").read_text()
+    server = (ROOT / "server/app.py").read_text()
+    assert "runLogUrl(selectedRunId, viewingHistorical)" in js
+    assert "updateTelemetry(payload.telemetry || {}, viewingHistorical)" in js
+    assert "mergePollGeneration" in js
+    assert "stage.dataset.status = status;" in js
+    assert "if (detail) detail.textContent = detailText;" in js
+    assert '@app.get("/api/runs/{run_id}/logs")' in server
 
 
 def test_stepper_markup_matches_stage_order():

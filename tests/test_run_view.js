@@ -11,6 +11,7 @@ const {
   runStatusLabel,
   savedStepsLabel,
   isMergeAvailable,
+  runLogUrl,
 } = require("../server/static/run_view.js");
 
 assert.deepStrictEqual(STAGE_ORDER, ["preflight", "training", "post_eval", "merge"]);
@@ -135,5 +136,18 @@ assert.strictEqual(
   "merge requires an adapter artifact",
 );
 assert.strictEqual(runStatusLabel({ status: "interrupted" }), "Run interrupted");
+
+// Historical selection must read that run's log, never the live buffer.
+assert.strictEqual(
+  runLogUrl("20261031-101500-aaaaaa", true),
+  "/api/runs/20261031-101500-aaaaaa/logs?tail=80",
+);
+assert.strictEqual(runLogUrl("latest", true), "/api/logs?tail=80");
+assert.strictEqual(runLogUrl("20261031-101500-aaaaaa", false), "/api/logs?tail=80");
+assert.strictEqual(runLogUrl(null, true), "/api/logs?tail=80");
+assert.strictEqual(
+  runLogUrl("run/with space", true),
+  "/api/runs/run%2Fwith%20space/logs?tail=80",
+);
 
 console.log("run_view behavior tests passed");
