@@ -104,6 +104,11 @@ MERGED_WEIGHT_FILES = (
     "pytorch_model.bin",
     "pytorch_model.bin.index.json",
 )
+MERGED_SINGLE_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin")
+MERGED_INDEX_FILES = (
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+)
 
 DEFAULT_ADAPTER_SNAPSHOT_STEPS = 250
 DEFAULT_LIMIT = 50
@@ -276,16 +281,67 @@ def validate_adapter(path: Path | str) -> tuple[bool, str]:
     return True, ""
 
 
+def _safe_index_shard(directory: Path, shard: str) -> bool:
+    """True when *shard* is a safe relative path to an existing file."""
+    parts = Path(shard).parts
+    if (
+        not shard
+        or shard.startswith(("/", "\\"))
+        or "\\" in shard
+        or ".." in parts
+    ):
+        return False
+    return (directory / shard).is_file()
+
+
+def _validate_weight_index(directory: Path, index_name: str) -> str:
+    """Return an empty string when every shard in *index_name* exists."""
+    try:
+        payload = json.loads(
+            (directory / index_name).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return f"{index_name} is not valid JSON"
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        return f"{index_name} has no weight_map"
+    shards = sorted({str(value) for value in weight_map.values()})
+    missing = [
+        shard
+        for shard in shards
+        if not _safe_index_shard(directory, shard)
+    ]
+    if missing:
+        return f"missing indexed weight shards: {', '.join(missing[:3])}"
+    return ""
+
+
 def validate_merged(path: Path | str) -> tuple[bool, str]:
-    """Validate a standalone merged model directory; return ``(ok, reason)``."""
+    """Validate a standalone merged model directory; return ``(ok, reason)``.
+
+    A single-file model is enough. A sharded model must have an index whose
+    referenced shard files all exist locally; an index on its own is not a
+    usable merged model and must not be mirrored.
+    """
     directory = Path(path)
     if not directory.is_dir():
         return False, f"merged model directory not found: {directory}"
     if not (directory / "config.json").is_file():
         return False, "missing config.json"
-    if not _has_any_file(directory, MERGED_WEIGHT_FILES):
-        return False, "missing model weights"
-    return True, ""
+    if _has_any_file(directory, MERGED_SINGLE_WEIGHT_FILES):
+        return True, ""
+
+    index_reasons: list[str] = []
+    for index_name in MERGED_INDEX_FILES:
+        if not (directory / index_name).is_file():
+            continue
+        reason = _validate_weight_index(directory, index_name)
+        if not reason:
+            return True, ""
+        index_reasons.append(reason)
+    if index_reasons:
+        return False, "; ".join(index_reasons)
+    return False, "missing model weights"
 
 
 def select_checkpoint_step(files: Iterable[str], run_id: str) -> int | None:

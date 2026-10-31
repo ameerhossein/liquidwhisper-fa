@@ -9,15 +9,16 @@ Optimized for **NVIDIA L40S (48 GB VRAM)** using unquantized **Bfloat16 LoRA (PE
 ## Table of Contents
 1. [⚡ Quickstart: Local UI Demo (No GPU Needed)](#-quickstart-local-ui-demo-no-gpu-needed)
 2. [Persistent Runs & Cockpit Ledger](#persistent-runs--cockpit-ledger)
-3. [Why This Architecture?](#why-this-architecture)
-4. [Project Structure](#project-structure)
-5. [Transferring to the GPU Server](#transferring-to-the-gpu-server)
-6. [Environment Setup on GPU Server](#environment-setup-on-gpu-server)
-7. [Step 1: Baseline Benchmarking](#step-1-baseline-benchmarking)
-8. [Step 2: Training on NVIDIA L40S](#step-2-training-on-nvidia-l40s)
-9. [Step 3: Post-Training Evaluation & Diagnostics](#step-3-post-training-evaluation--diagnostics)
-10. [Step 4: Merging Adapter Weights for Deployment](#step-4-merging-adapter-weights-for-deployment)
-11. [Step 5: Transcribing Custom Audio (CLI)](#step-5-transcribing-custom-audio-cli)
+3. [Durable HF Run Mirror](#durable-hf-run-mirror)
+4. [Why This Architecture?](#why-this-architecture)
+5. [Project Structure](#project-structure)
+6. [Transferring to the GPU Server](#transferring-to-the-gpu-server)
+7. [Environment Setup on GPU Server](#environment-setup-on-gpu-server)
+8. [Step 1: Baseline Benchmarking](#step-1-baseline-benchmarking)
+9. [Step 2: Training on NVIDIA L40S](#step-2-training-on-nvidia-l40s)
+10. [Step 3: Post-Training Evaluation & Diagnostics](#step-3-post-training-evaluation--diagnostics)
+11. [Step 4: Merging Adapter Weights for Deployment](#step-4-merging-adapter-weights-for-deployment)
+12. [Step 5: Transcribing Custom Audio (CLI)](#step-5-transcribing-custom-audio-cli)
 
 ---
 
@@ -126,6 +127,53 @@ and confirm `/api/runs/latest` still returns the same run. `ASR_FAKE_STEPS`
 (default 200) and `ASR_FAKE_STEP_DELAY` (default 0.05 s) control the fake run's
 length. `./run_local_demo.sh` is different: it serves the zero-dependency
 simulated UI and does not create ledger runs.
+
+---
+
+## Durable HF Run Mirror
+
+Set `ASR_HF_RUN_REPO=<owner>/<name>` (for example `user/stt-experiment`) and
+authenticate with `HF_TOKEN` to mirror the run ledger and artifacts to a
+Hugging Face repo. The repo is created **private by default**. Mirroring is off
+when the variable is unset, and uploads are best effort: training and merging
+continue when Hugging Face is unreachable.
+
+Each run is self-contained under `runs/<run_id>/`:
+
+* `checkpoint-<step>/` is uploaded when a complete checkpoint is written, and
+  the run's `hf_state.json` records the high-water step used on restore.
+* `adapter_snapshots/step-<step>/` is uploaded every
+  `--hf_adapter_snapshot_steps` steps (default 250; `0` disables snapshots).
+* The ledger is refreshed at stage transitions: `run.json`, `steps.jsonl`,
+  `events.jsonl`, telemetry, benchmark, loss, and preflight files.
+* `best_adapter/`, the final reports, and the cockpit's `merged/` model are
+  uploaded when available. The cockpit merge passes `--run_dir` and
+  `--hf_run_repo`; a manual `scripts/merge_lora.py --run_dir <run_dir>` also
+  uploads the merged model with a status-`merge` ledger.
+* `latest.json` points at the most recently active run.
+
+Restore by run id on a fresh pod (the repo comes from `ASR_HF_RUN_REPO`, or
+pass `--repo`):
+
+```bash
+python scripts/hf_restore.py --run 20261031-142530-1a2b3c
+# Then resume:
+python scripts/train_lora.py --hf_resume 20261031-142530-1a2b3c
+```
+
+The restore CLI exits `0` with a complete checkpoint, `2` when only the ledger
+was restored (no resume is possible), and `1` on failure. Add
+`--include-merged` to fetch `merged/` too.
+
+In the cockpit, **Recover** lists remote runs and offers **Restore only** or
+**Restore & resume**. Completed runs are restore-only, and a run without a
+complete checkpoint cannot resume.
+
+Remote retention is **manual**: the mirror never deletes old runs or merged
+models. Remove obsolete `runs/<run_id>/` folders in the Hugging Face repo (UI
+or `hf` CLI) to reclaim storage. Tokens are read from the environment only and
+are never written to run files or logs; `HF_TOKEN` is shared with
+`scripts/upload_to_hf.py`.
 
 ---
 

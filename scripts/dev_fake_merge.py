@@ -23,6 +23,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--adapter_path", required=True, help="LoRA adapter dir")
     parser.add_argument("--output_dir", required=True, help="Merged model dir")
+    # Accepted for parity with scripts/merge_lora.py but intentionally ignored:
+    # the GPU-free fake never talks to Hugging Face.
+    parser.add_argument("--run_dir", default=None, help="Ignored HF run directory")
+    parser.add_argument(
+        "--hf_run_repo",
+        default=os.environ.get("ASR_HF_RUN_REPO", ""),
+        help="Ignored Hugging Face repo id",
+    )
     # scripts/merge_lora.py also accepts --base_model/--device; tolerate any
     # extra real-merge flags without requiring them.
     args, _unknown = parser.parse_known_args(argv)

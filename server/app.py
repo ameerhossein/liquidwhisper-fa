@@ -2725,6 +2725,12 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     adapter_dir = _run_output_dir(run) / "best_adapter"
     run_dir_path, merged_dir, log_file, pid_file = _merge_paths(run)
     script_name = "dev_fake_merge.py" if _fake_trainer_enabled() else "merge_lora.py"
+    hf_repo = ""
+    hf_section = run.get("hf")
+    if isinstance(hf_section, dict):
+        hf_repo = str(hf_section.get("repo_id") or "").strip()
+    if not hf_repo:
+        hf_repo = (os.environ.get("ASR_HF_RUN_REPO", "") or "").strip()
     cmd = [
         sys.executable,
         "-u",
@@ -2732,7 +2738,10 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         "--base_model", base_model,
         "--adapter_path", str(adapter_dir),
         "--output_dir", str(merged_dir),
+        "--run_dir", str(run_dir_path),
     ]
+    if hf_repo:
+        cmd.extend(["--hf_run_repo", hf_repo])
 
     run_dir_path.mkdir(parents=True, exist_ok=True)
     # A crashed retry must never read the previous attempt's PID.

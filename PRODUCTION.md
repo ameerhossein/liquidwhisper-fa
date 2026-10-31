@@ -153,3 +153,56 @@ The former `configs/` baseline file (`baselines.json`) is gone. Every training r
 - Epoch deltas are displayed as `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), and only when the row and baseline have the same sample count.
 - The final full-test report shows no delta without a matching full-test baseline; the default 1,000-row preflight against the 2,149-row test split reports `n/a (no matching full-test baseline)`.
 - For smoke runs, pass matching small values so the comparison stays valid: `--preflight_samples 20 --max_benchmark_samples 20`.
+
+## 6. Durable HF Run Mirror
+
+Enable mirroring with `ASR_HF_RUN_REPO=<owner>/<name>` and `HF_TOKEN`
+(`HF_TOKEN` is the same token used by `scripts/upload_to_hf.py`). Unset means
+off. The repo is created **private by default**, and uploads are best effort
+with retries, so a Hugging Face outage never blocks training or merging.
+
+The remote layout is one self-contained folder per run:
+
+```
+latest.json
+runs/<run_id>/run.json
+runs/<run_id>/hf_state.json
+runs/<run_id>/checkpoint-<step>/
+runs/<run_id>/adapter_snapshots/step-<step>/
+runs/<run_id>/best_adapter/
+runs/<run_id>/reports/
+runs/<run_id>/merged/
+```
+
+- A complete `checkpoint-<step>/` is uploaded as it is written. `hf_state.json`
+  is the authoritative high-water mark, and `latest.json` points at the most
+  recently active run.
+- `adapter_snapshots/step-<step>/` is uploaded every
+  `--hf_adapter_snapshot_steps` steps (default 250; `0` disables). The trainer
+  keeps the newest two snapshots locally.
+- The ledger (`run.json`, `steps.jsonl`, `events.jsonl`, `live_telemetry.json`,
+  `loss_history.json`, `epoch_benchmarks.json`, and
+  `baselines/preflight.json`) is refreshed at stage transitions.
+- `best_adapter/`, the final reports, and the merged model are uploaded when
+  available. The cockpit merge passes `--run_dir`/`--hf_run_repo` to
+  `scripts/merge_lora.py`; a manual merge can add `--run_dir <run_dir>`.
+
+Restore by run id on a fresh pod (repo from `ASR_HF_RUN_REPO`, or `--repo`):
+
+```bash
+python scripts/hf_restore.py --run <run_id>            # add --include-merged for merged/
+python scripts/train_lora.py --hf_resume <run_id>
+```
+
+Exit codes: `0` restored with a complete checkpoint, `2` ledger only (cannot
+resume), `1` failure.
+
+In the cockpit, the **Recover** dialog lists remote runs and offers **Restore
+only** or **Restore & resume**. Completed runs are restore-only; a run without
+a complete checkpoint cannot resume. Restore progress survives a page reload.
+
+**Retention is manual.** The mirror never prunes remote runs, checkpoints,
+snapshots, or merged models. Delete old `runs/<run_id>/` folders in the
+Hugging Face repo (UI or `hf` CLI) when storage needs to be reclaimed. Tokens
+are read from the environment only and are never written into run files or
+logs.

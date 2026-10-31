@@ -30,7 +30,57 @@ def parse_args():
     parser.add_argument("--adapter_path", type=str, required=True, help="Path to trained LoRA adapter")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save merged standalone model")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for merging (default: cuda if available, else cpu)")
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Run directory to mirror to Hugging Face after the merge",
+    )
+    parser.add_argument(
+        "--hf_run_repo",
+        type=str,
+        default=os.environ.get("ASR_HF_RUN_REPO", ""),
+        help="Hugging Face repo id for the run mirror (default: ASR_HF_RUN_REPO)",
+    )
     return parser.parse_args()
+
+
+def _upload_merged_to_hf(args) -> None:
+    """Best-effort mirror of the merged model; never fail the merge.
+
+    A mirror is only attempted when both a run directory and a repo are
+    configured. Upload failures are logged and swallowed, so the standalone
+    merged model remains usable even when Hugging Face is unavailable.
+    """
+    run_dir = str(getattr(args, "run_dir", None) or "").strip()
+    repo_id = str(getattr(args, "hf_run_repo", None) or "").strip()
+    if not run_dir or not repo_id:
+        return
+
+    mirror = None
+    try:
+        from src import hf_sync
+
+        run_path = Path(run_dir).expanduser().resolve()
+        mirror = hf_sync.HFRunMirror(
+            hf_sync.HFSyncConfig(repo_id=repo_id),
+            run_id=run_path.name,
+            run_dir=run_path,
+            output_dir=run_path / "output",
+            results_dir=run_path,
+            log=print,
+        )
+        mirror.start()
+        mirror.enqueue_merged(Path(args.output_dir))
+        mirror.enqueue_ledger("merge")
+    except Exception as exc:
+        print(f"[hf-sync] merged model upload skipped: {exc}")
+    finally:
+        if mirror is not None:
+            try:
+                mirror.close()
+            except Exception as exc:
+                print(f"[hf-sync] merged model upload failed: {exc}")
 
 
 def main():
@@ -65,6 +115,7 @@ def main():
     processor.save_pretrained(args.output_dir)
 
     print("\nMerge complete! The standalone model is ready for zero-overhead inference.")
+    _upload_merged_to_hf(args)
 
 
 if __name__ == "__main__":

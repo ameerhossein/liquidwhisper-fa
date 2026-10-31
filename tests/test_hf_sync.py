@@ -83,6 +83,23 @@ def test_adapter_and_merged_validation(tmp_path):
     assert validate_merged(tmp_path / "missing")[0] is False
 
 
+def test_merged_index_requires_referenced_shards(tmp_path):
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "config.json").write_text("{}")
+    (merged / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"model.a": "model-00001-of-00002.safetensors"}}
+        )
+    )
+    ok, reason = validate_merged(merged)
+    assert ok is False
+    assert "shard" in reason
+
+    (merged / "model-00001-of-00002.safetensors").write_text("")
+    assert validate_merged(merged)[0] is True
+
+
 def test_select_checkpoint_step_ignores_incomplete_and_bad_names():
     files = [
         f"runs/{RUN}/checkpoint-1000/trainer_state.json",

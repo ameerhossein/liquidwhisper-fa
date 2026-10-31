@@ -1678,6 +1678,20 @@ def test_merge_uses_fake_script_when_enabled(client, monkeypatch):
     assert Path(client.launched[-1][2]).name == "dev_fake_merge.py"
 
 
+def test_merge_command_passes_hf_context(client, monkeypatch):
+    monkeypatch.setenv("ASR_HF_RUN_REPO", "me/run")
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    cmd = client.launched[-1]
+    assert "--run_dir" in cmd
+    assert "--hf_run_repo" in cmd
+    assert "me/run" in cmd
+
+
 def test_monitor_task_start_is_idempotent(client):
     async def scenario():
         first = client.mod._ensure_monitor_task()
