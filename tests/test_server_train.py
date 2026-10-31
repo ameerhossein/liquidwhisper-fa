@@ -85,6 +85,88 @@ def _write_run(client, run_id=None, **fields):
     return run_state.update_run(client.mod.RUNS_DIR / run_id, mutate)
 
 
+def _create_run(client, *, pid, status="running", run_id="20261030-194700-aaaaaa"):
+    run = run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}, run_id=run_id
+    )
+    run_state.start_attempt(client.mod.RUNS_DIR / run_id, pid, "test")
+    run_state.set_status(client.mod.RUNS_DIR / run_id, status)
+    return run
+
+
+def _seed_adapter(client, run_id):
+    adapter = client.mod.RUNS_DIR / run_id / "output" / "best_adapter"
+    adapter.mkdir(parents=True, exist_ok=True)
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    return adapter
+
+
+def _write_merge_artifacts(client, run_id, *, weights="model.safetensors"):
+    merged = client.mod.RUNS_DIR / run_id / "merged"
+    merged.mkdir(parents=True, exist_ok=True)
+    (merged / "config.json").write_text("{}", encoding="utf-8")
+    if weights:
+        (merged / weights).write_text("", encoding="utf-8")
+    return merged
+
+
+def test_refresh_finds_older_live_run(client):
+    old = _create_run(client, pid=os.getpid(), run_id="20261030-194700-aaaaaa")
+    new = _create_run(client, pid=999999, run_id="20261030-195700-bbbbbb")
+    client.mod._refresh_runs()
+    assert client.mod.ACTIVE_RUN_ID == old["run_id"]
+    assert client.mod.LATEST_RUN["run_id"] == new["run_id"]
+
+
+def test_refresh_marks_dead_run_interrupted(client):
+    run = _create_run(client, pid=999999, status="running")
+    client.mod._refresh_runs()
+    assert (
+        run_state.load_run(client.mod.RUNS_DIR / run["run_id"])["status"]
+        == "interrupted"
+    )
+
+
+def test_refresh_does_not_rewrite_completed_run(client):
+    run = _create_run(client, pid=999999, status="completed")
+    client.mod._refresh_runs()
+    assert (
+        run_state.load_run(client.mod.RUNS_DIR / run["run_id"])["status"]
+        == "completed"
+    )
+
+
+def test_runs_endpoints_list_latest_and_steps(client):
+    start = client.post("/api/train/start", json={}).json()
+    assert client.get("/api/runs").json()["runs"][0]["run_id"] == start["run_id"]
+    latest = client.get("/api/runs/latest").json()
+    assert latest["run"]["run_id"] == start["run_id"]
+    steps = client.get(f"/api/runs/{start['run_id']}/steps?tail=5").json()
+    assert steps["run_id"] == start["run_id"]
+    assert steps["total"] == 0
+
+
+def test_merge_starts_and_marks_stage(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    (run_dir / "output" / "best_adapter").mkdir(parents=True)
+    (run_dir / "output" / "best_adapter" / "adapter_config.json").write_text("{}")
+    run_state.set_stage(run_dir, "training", "completed")
+    res = client.post(f"/api/runs/{start['run_id']}/merge")
+    assert res.status_code == 200, res.text
+    assert "--adapter_path" in client.launched[-1]
+    assert run_state.load_run(run_dir)["stages"][3]["status"] == "running"
+
+
+def test_merge_rejected_before_training_completed(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    (run_dir / "output" / "best_adapter").mkdir(parents=True)
+    (run_dir / "output" / "best_adapter" / "adapter_config.json").write_text("{}")
+    res = client.post(f"/api/runs/{start['run_id']}/merge")
+    assert res.status_code == 400
+
+
 def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
     res = client.post("/api/train/start", json={})
     assert res.status_code == 200, res.text
@@ -718,6 +800,345 @@ def test_smoke_status_reports_running_after_start(client):
     assert client.post("/api/train/smoke", json={}).status_code == 200
     res = client.get("/api/train/smoke/status")
     assert res.json()["status"] == "running"
+
+
+def test_runs_endpoint_returns_empty_list_without_runs(client):
+    assert client.get("/api/runs").json() == {"runs": []}
+
+
+def test_latest_run_is_null_without_runs(client):
+    assert client.get("/api/runs/latest").json()["run"] is None
+
+
+def test_run_endpoints_reject_invalid_and_missing_ids(client):
+    for run_id in ("not-a-run", "20261031-000000-abcdef"):
+        assert client.get(f"/api/runs/{run_id}").status_code == 404
+        assert client.get(f"/api/runs/{run_id}/steps").status_code == 404
+    assert client.post("/api/runs/not-a-run/merge").status_code == 404
+    assert (
+        client.post("/api/runs/20261031-000000-abcdef/merge").status_code == 404
+    )
+
+
+def test_run_payload_includes_adapter_exists(client):
+    start = client.post("/api/train/start", json={}).json()
+    payload = client.get("/api/runs/latest").json()
+    assert payload["run"]["run_id"] == start["run_id"]
+    assert payload["adapter_exists"] is False
+    assert payload["process_running"] is True
+    assert payload["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
+    assert payload["steps"] == {
+        "count": 0,
+        "last_step": None,
+        "last_saved_at": None,
+    }
+    assert payload["telemetry"]["status"] == "initializing"
+    assert payload["benchmarks"] == []
+    assert payload["loss_history"] == []
+
+    _seed_adapter(client, start["run_id"])
+    payload = client.get(f"/api/runs/{start['run_id']}").json()
+    assert payload["adapter_exists"] is True
+
+
+def test_run_steps_endpoint_reads_and_caps_tail(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    for step in range(1, 4):
+        run_state.append_step(run_dir, {"step": step, "loss": 1.0 / step})
+
+    body = client.get(f"/api/runs/{start['run_id']}/steps?tail=2").json()
+    assert body["run_id"] == start["run_id"]
+    assert body["total"] == 3
+    assert [row["step"] for row in body["steps"]] == [2, 3]
+
+    body = client.get(f"/api/runs/{start['run_id']}/steps?tail=99999").json()
+    assert len(body["steps"]) == 3
+
+    body = client.get(f"/api/runs/{start['run_id']}/steps?tail=0").json()
+    assert body["steps"] == []
+
+
+def test_status_and_websocket_include_adapter_and_storage(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    body = client.get("/api/status").json()
+    assert body["adapter_exists"] is False
+    assert body["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
+
+    _seed_adapter(client, start["run_id"])
+    monkeypatch.setattr(client.mod, "get_gpu_info", lambda: {})
+    with client.websocket_connect("/ws/live") as ws:
+        payload = ws.receive_json()
+    assert payload["run"]["run_id"] == start["run_id"]
+    assert payload["steps"]["count"] == 0
+    assert payload["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
+    assert payload["adapter_exists"] is True
+
+
+class _ExitedProcess:
+    def __init__(self, code, pid=999_999):
+        self._code = code
+        self.pid = pid
+
+    def poll(self):
+        return self._code
+
+
+def test_training_nonzero_exit_marks_run_failed(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = _ExitedProcess(7)
+
+    assert client.mod._training_running() is False
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "failed"
+    assert run["failed_stage"] == "training"
+    assert run["current_pid"] is None
+    assert run["attempts"][-1]["exit_code"] == 7
+    assert run["attempts"][-1]["reason"] == "process_exit"
+    assert run["stages"][1]["status"] == "failed"
+    assert client.mod.last_exit_code == 7
+
+
+def test_training_exit_zero_with_terminal_stages_marks_completed(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = _ExitedProcess(0)
+
+    assert client.mod._training_running() is False
+    assert run_state.load_run(run_dir)["status"] == "completed"
+
+
+def test_training_exit_after_stop_request_marks_stopped(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    run_state.set_stage(run_dir, "training", "running")
+    assert client.post("/api/train/stop", json={}).status_code == 200
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = _ExitedProcess(-15)
+
+    assert client.mod._training_running() is False
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "stopped"
+    assert run["attempts"][-1]["reason"] == "halted"
+    assert run["stages"][1]["status"] == "stopped"
+
+
+def test_merge_completes_on_zero_exit_with_artifacts(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    _seed_adapter(client, start["run_id"])
+    run_state.set_stage(run_dir, "training", "completed")
+    assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
+
+    _write_merge_artifacts(client, start["run_id"])
+    client.mod.merge_process = _ExitedProcess(0)
+
+    assert client.mod._merge_running() is False
+    run = run_state.load_run(run_dir)
+    merge_stage = run["stages"][3]
+    assert merge_stage["status"] == "completed"
+    assert merge_stage["exit_code"] == 0
+    assert run["merge_pid"] is None
+    assert client.mod.merge_last_exit_code == 0
+
+
+def test_merge_fails_on_zero_exit_without_artifacts(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    _seed_adapter(client, start["run_id"])
+    run_state.set_stage(run_dir, "training", "completed")
+    assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
+
+    client.mod.merge_process = _ExitedProcess(0)
+
+    assert client.mod._merge_running() is False
+    run = run_state.load_run(run_dir)
+    merge_stage = run["stages"][3]
+    assert merge_stage["status"] == "failed"
+    assert "artifact" in merge_stage["detail"].lower()
+    assert "log_tail" in merge_stage
+    assert run["merge_pid"] is None
+
+
+def test_merge_fails_on_nonzero_exit(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    _seed_adapter(client, start["run_id"])
+    run_state.set_stage(run_dir, "training", "completed")
+    assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
+
+    _write_merge_artifacts(client, start["run_id"])
+    client.mod.merge_process = _ExitedProcess(3)
+
+    assert client.mod._merge_running() is False
+    run = run_state.load_run(run_dir)
+    assert run["stages"][3]["status"] == "failed"
+    assert run["stages"][3]["exit_code"] == 3
+
+
+def _mark_merge_running(client, run_id, pid=999999):
+    run_dir = client.mod.RUNS_DIR / run_id
+
+    def mutate(run):
+        run["merge_pid"] = pid
+        return run
+
+    run_state.update_run(run_dir, mutate)
+    run_state.set_stage(run_dir, "merge", "running", detail="test")
+    return run_dir
+
+
+def test_merge_recovery_uses_dead_pid_artifacts(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-cccccc"
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    run_dir = _mark_merge_running(client, run["run_id"])
+
+    _write_merge_artifacts(client, run["run_id"])
+    assert client.mod._merge_running() is False
+    assert run_state.load_run(run_dir)["stages"][3]["status"] == "completed"
+
+
+def test_merge_recovery_marks_dead_pid_failed_without_artifacts(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-dddddd"
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    run_dir = _mark_merge_running(client, run["run_id"])
+
+    assert client.mod._merge_running() is False
+    assert run_state.load_run(run_dir)["stages"][3]["status"] == "failed"
+
+
+def test_merge_writes_log_pid_and_manifest_pid(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-555555"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    res = client.post(f"/api/runs/{run['run_id']}/merge")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    run_dir = client.mod.RUNS_DIR / run["run_id"]
+    assert body["status"] == "started"
+    assert body["merged_dir"] == str(run_dir / "merged")
+    assert (run_dir / "merge.log").is_file()
+    assert (run_dir / "merge.pid").read_text(encoding="utf-8") == str(body["pid"])
+    assert run_state.load_run(run_dir)["merge_pid"] == body["pid"]
+    cmd = client.launched[-1]
+    assert _flag_value(cmd, "--adapter_path") == str(
+        run_dir / "output" / "best_adapter"
+    )
+    assert _flag_value(cmd, "--output_dir") == str(run_dir / "merged")
+
+
+def test_merge_rejected_without_adapter(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-111111"
+    )
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    res = client.post(f"/api/runs/{run['run_id']}/merge")
+    assert res.status_code == 400
+    assert "best_adapter" in res.json()["detail"]
+    assert client.launched == []
+
+
+def test_merge_rejected_while_target_post_eval_is_running(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-666666"
+    )
+    run_dir = client.mod.RUNS_DIR / run["run_id"]
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "running")
+
+    res = client.post(f"/api/runs/{run['run_id']}/merge")
+    assert res.status_code == 400
+    assert client.launched == []
+
+
+def test_merge_rejected_while_another_run_is_active(client):
+    target = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-222222"
+    )
+    _seed_adapter(client, target["run_id"])
+    run_state.set_stage(
+        client.mod.RUNS_DIR / target["run_id"], "training", "completed"
+    )
+    _create_run(
+        client, pid=os.getpid(), status="running", run_id="20261030-194700-333333"
+    )
+
+    res = client.post(f"/api/runs/{target['run_id']}/merge")
+    assert res.status_code == 400
+    assert client.launched == []
+
+
+def test_merge_blocks_start_smoke_resume_and_second_merge(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-eeeeee"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    interrupted = _create_run(
+        client, pid=999999, status="interrupted", run_id="20261030-194700-444444"
+    )
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    assert len(client.launched) == 1
+
+    assert client.post("/api/train/start", json={}).status_code == 400
+    assert client.post("/api/train/smoke", json={}).status_code == 400
+    assert (
+        client.post(f"/api/runs/{interrupted['run_id']}/resume").status_code
+        == 400
+    )
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 400
+    assert len(client.launched) == 1
+
+
+def test_merge_uses_real_script_when_fake_disabled(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-ffffff"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    assert Path(client.launched[-1][2]).name == "merge_lora.py"
+    assert "--base_model" in client.launched[-1]
+
+
+def test_merge_uses_fake_script_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("ASR_FAKE_TRAINER", "1")
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    assert Path(client.launched[-1][2]).name == "dev_fake_merge.py"
+
+
+def test_monitor_task_start_is_idempotent(client):
+    async def scenario():
+        first = client.mod._ensure_monitor_task()
+        second = client.mod._ensure_monitor_task()
+        assert first is not None
+        assert first is second
+        first.cancel()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+        client.mod._monitor_task = None
+
+    asyncio.run(scenario())
 
 
 def test_smoke_controls_are_present_in_static_ui():
