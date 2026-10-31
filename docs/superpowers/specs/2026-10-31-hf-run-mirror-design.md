@@ -33,6 +33,8 @@ complete checkpoint, and resume.
    silently starting fresh.
 6. Record sync status in the run directory, expose clear logs, and retry failures.
 7. Keep the existing manual publish script and stable model repos.
+8. Recover from the web cockpit by run ID: list recent remote runs, restore one,
+   optionally resume it, and show its HF sync status on the run view.
 
 ## Non-goals
 
@@ -41,8 +43,8 @@ complete checkpoint, and resume.
 - Multi-pod concurrent training or distributed coordination.
 - Automatic remote retention or deletion of old runs.
 - An HF authentication UI.
-- A new cockpit upload screen; the restore script plus the existing Resume button
-  are enough for v1.
+- A remote file browser or artifact editor. The cockpit lists runs and restores
+  them; it does not browse or edit individual HF files.
 
 ## Anti-goals
 
@@ -341,6 +343,85 @@ restore, so the cockpit shows Resume instead of treating a dead PID as live.
 Terminal statuses (`completed`, `stopped`, `failed`) and completed/skipped stage
 states are preserved. `running` stages from the dead pod become `interrupted`.
 
+### Web UI
+
+The cockpit gets the same recovery path, not just a CLI. The existing run picker
+only knows local runs, and it hides when no local runs exist — exactly the state
+after a pod is replaced. The recovery entry point must therefore live outside the
+picker.
+
+**Entry point.** A `Recover` button sits in the top bar next to the run picker.
+It is visible when the server reports HF recovery enabled (a repo is configured
+or the request supplies one) and is disabled while a training, merge, smoke, or
+restore job is running. Because the picker hides with no local runs, `Recover`
+remains visible on an empty cockpit.
+
+**Recover dialog.**
+
+- Repo field prefilled from `/api/hf/config` (`ASR_HF_RUN_REPO`); editable under
+  an "Advanced" disclosure. The token is never shown.
+- Run ID field. A "Find recent runs" button loads the remote run list.
+- Remote run table: run ID, status, last step, updated time, and whether a
+  complete checkpoint exists. Selecting a row fills the run ID.
+- Actions: **Restore only** and **Restore & resume**. The latter is disabled when
+  the remote run is `completed` or has no complete checkpoint.
+- Progress area: status line plus a tail of the restore log, polled every 2
+  seconds. The dialog stays open until the restore succeeds or fails.
+- On success: refresh `/api/runs`, select the restored run, and close the dialog.
+  For "Restore & resume", call the existing
+  `POST /api/runs/{run_id}/resume` after the restore reports `completed`.
+- On failure: keep the dialog open and show the error plus the last log lines.
+- If the run already exists locally non-empty, the server returns `409` and the
+  dialog offers "Open local run" instead of overwriting it.
+- If no complete checkpoint exists, restore-only is allowed and a warning says
+  that the run cannot be resumed.
+
+**Run view.** The run header gets a small HF sync badge when mirroring is
+configured:
+
+- `HF: synced 2,000 · 12:34` after a successful checkpoint upload;
+- `HF: uploading…` while a job is active;
+- `HF: error — retrying` when `hf_sync.json` has a failure;
+- hidden when mirroring is disabled.
+
+The badge data comes from `hf_sync.json` and the `hf` section of `run.json`,
+included in the existing `/api/runs/{run_id}` payload. The run view does not get
+a manual upload button; uploads are automatic.
+
+**Server endpoints.**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/hf/config` | `{enabled, repo_id, runs_root}`; never returns the token |
+| `GET` | `/api/hf/runs?repo=<id>` | recent remote runs: `run_id`, `status`, `last_step`, `updated_at`, `has_checkpoint`; cached ~30 s |
+| `POST` | `/api/hf/restore` | body `{run_id, repo?, include_merged?}`; validates, starts `scripts/hf_restore.py` as a child process, returns `{state: "running", run_id}` |
+| `GET` | `/api/hf/restore/status` | `{state, run_id, message, log_tail, updated_at}` from the restore status file |
+| `POST` | `/api/runs/{run_id}/resume` | existing endpoint; used after restore |
+
+- `POST /api/hf/restore` uses the same `_check_auth` gate as training and merge.
+- It refuses when any job is already running, when the run ID is invalid, or when
+  the local run directory already exists and is non-empty.
+- The child restore process writes
+  `<runs_root>/_hf_restore.status.json` and `<runs_root>/_hf_restore.log` at
+  milestones (`listing`, `ledger`, `checkpoint`, `verify`, `done`/`failed`). The
+  server reads those files, so a page reload or server restart does not lose the
+  progress display; a stale `running` status with a dead PID is marked
+  `interrupted` on startup.
+- After a successful restore the server invalidates the run-list cache so the
+  restored run appears immediately.
+
+**UI behavior helpers.** Pure functions go in `server/static/run_view.js` so they
+are testable without a browser:
+
+- `recoverActionState(remoteRun)` returns `{canRestore, canResume, reason}` from
+  status and `has_checkpoint`.
+- `hfSyncLabel(sync)` renders the badge text from `hf_sync.json`.
+- `remoteRunOptionLabel(run)` renders the remote list row label.
+
+`server/static/app.js` owns the dialog, polling, and post-restore navigation.
+`server/static/index.html` adds `btnRecover`, the dialog markup, and the badge
+slot; `server/static/style.css` styles the dialog and badge.
+
 ### Integration points
 
 - `src/hf_sync.py`: config, repo layout, uploader, validation, restore. Stdlib
@@ -354,9 +435,13 @@ states are preserved. `running` stages from the dead pod become `interrupted`.
 - `scripts/merge_lora.py`: optional `--run_dir` and `--hf_run_repo`; upload the
   merged output after saving. The cockpit passes them; environment variables are
   the fallback.
-- `server/app.py`: no new upload UI. The merge child performs the upload, and the
-  run manifest `hf` section gives the server enough information to log status.
-- `scripts/hf_restore.py`: restore-only CLI.
+- `server/app.py`: `/api/hf/*` endpoints, restore child tracking, `hf_sync` in
+  `_run_payload`, run-list cache invalidation after restore, and startup
+  reconciliation of a stale restore job. The merge child performs its own upload.
+- `server/static/index.html`, `app.js`, `run_view.js`, `style.css`: Recover
+  button/dialog, remote run list, restore polling, post-restore selection, and
+  the HF sync badge.
+- `scripts/hf_restore.py`: restore-only CLI shared by the server and terminal.
 - `src/paths.py`: local behavior unchanged; add a helper only if the restore code
   needs one.
 - `scripts/upload_to_hf.py`: unchanged as the stable-publish path; it may reuse
@@ -419,8 +504,20 @@ Unit tests with a fake `HfApi`/uploader, no network:
 Integration: a fake trainer run with a stub mirror verifies stage uploads for
 preflight/training/post-eval/merge without network access.
 
+Web UI tests:
+
+- `test_web_ui_contract.py` asserts `btnRecover`, the dialog markup, the remote
+  list, restore status, and the HF badge are present and wired.
+- `test_run_view.js` covers `recoverActionState` (completed run, no checkpoint,
+  resumable run), `hfSyncLabel`, and `remoteRunOptionLabel`.
+- Server tests with a fake `hf_restore.py`/monkeypatched child verify invalid run
+  IDs, refused concurrent jobs, 409 on an existing local run, status transitions,
+  cache invalidation, and token-free `/api/hf/config`.
+- The remote-list endpoint is tested against a fake `HfApi`, not the network.
+
 Manual smoke: a private test repo, a short fake run, kill the process after a
-checkpoint, restore into a clean directory, and confirm the resume step.
+checkpoint, open the cockpit with no local runs, list remote runs, restore by run
+ID, and resume from the restored run.
 
 Tests must not require `HF_TOKEN`; network tests are skipped unless an explicit
 environment variable is set.
@@ -432,8 +529,10 @@ environment variable is set.
    restore.
 3. Enable on a real L40S run; verify checkpoint upload time and resume after a
    forced pod restart.
-4. Document `ASR_HF_RUN_REPO`, the restore commands, and retention in
-   `README.md`, `PRODUCTION.md`, and `.env.example`.
+4. Add the cockpit Recover dialog and HF badge; verify restore and resume from an
+   empty local runs root.
+5. Document `ASR_HF_RUN_REPO`, the restore commands, the Recover dialog, and
+   retention in `README.md`, `PRODUCTION.md`, and `.env.example`.
 
 ## Decisions left to the builder
 
@@ -443,5 +542,5 @@ environment variable is set.
   and stages; choose the lower-commit option if it keeps `last_step` useful.
 - Whether `training_live.log` is uploaded at stage boundaries. Skip it if large;
   `steps.jsonl` and the telemetry files are the durable history.
-- Whether the cockpit shows an HF sync badge in v1 or later; logs plus
-  `hf_sync.json` are sufficient for v1.
+- Exact visual treatment of the Recover dialog and HF badge; the behavior and
+  identifiers above are the contract the tests assert.
