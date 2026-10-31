@@ -861,7 +861,11 @@ def _download_newest_adapter_snapshot(
     output_dir: Path,
 ) -> list[str]:
     prefix = f"{run_prefix}/adapter_snapshots/"
-    snapshots: dict[int, list[str]] = {}
+    # Keep the literal remote folder name for each snapshot. Snapshots are
+    # zero-padded by the trainer callback (``step-000250``), so reconstructing
+    # the folder from the parsed integer (``step-250``) would build the wrong
+    # remote prefix and a nested local target.
+    snapshots: dict[int, dict[str, list[str]]] = {}
     for remote in files:
         if not remote.startswith(prefix):
             continue
@@ -871,18 +875,23 @@ def _download_newest_adapter_snapshot(
             continue
         match = _ADAPTER_SNAPSHOT_RE.fullmatch(folder)
         if match is not None:
-            snapshots.setdefault(int(match.group(1)), []).append(remote)
+            step = int(match.group(1))
+            snapshots.setdefault(step, {}).setdefault(folder, []).append(remote)
 
     if not snapshots:
         return []
     newest = max(snapshots)
-    snapshot_prefix = f"{prefix}step-{newest}/"
+    folders = snapshots[newest]
+    # A listing should only contain one spelling per step; pick
+    # deterministically if it does not.
+    folder = max(folders)
+    snapshot_prefix = f"{prefix}{folder}/"
     return _download_tree(
         download,
         repo_id,
-        snapshots[newest],
+        folders[folder],
         snapshot_prefix,
-        output_dir / "adapter_snapshots" / f"step-{newest}",
+        output_dir / "adapter_snapshots" / folder,
     )
 
 

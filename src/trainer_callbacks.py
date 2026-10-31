@@ -752,6 +752,20 @@ class HFMirrorCallback(TrainerCallback):
         except (TypeError, ValueError):
             return control
 
+        # The Trainer can save outside the ``save_steps`` cadence: its
+        # DefaultFlowCallback sets ``should_save`` for epoch-end saves and for
+        # the final step of a steps-strategy run. Never write a snapshot for a
+        # step that is about to produce a full checkpoint.
+        if getattr(control, "should_save", False):
+            return control
+        if getattr(args, "save_strategy", None) == "steps":
+            try:
+                max_steps = int(state.max_steps)
+            except (AttributeError, TypeError, ValueError):
+                max_steps = 0
+            if max_steps > 0 and step >= max_steps:
+                return control
+
         # ``snapshot_steps=0`` disables periodic snapshots. A step that the
         # Trainer saves as a full checkpoint is skipped: the checkpoint upload
         # already carries the same adapter weights.

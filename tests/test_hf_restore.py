@@ -11,6 +11,8 @@ from src import hf_sync
 from src.hf_sync import (
     HFRestoreConflict,
     HFRestoreError,
+    HFRunMirror,
+    HFSyncConfig,
     HFSyncError,
     apply_restored_args,
     make_api,
@@ -309,6 +311,81 @@ def test_restore_reports_snapshot_and_merged(tmp_path):
         run_dir / "output" / "adapter_snapshots" / "step-250"
     ).exists()
     assert (run_dir / "merged" / "model.safetensors").is_file()
+    assert result["checkpoint_step"] == 1000
+
+
+class _UploadingApi:
+    """Minimal HF API that keeps uploaded files in memory."""
+
+    def __init__(self):
+        self.files = {}
+
+    def upload_folder(
+        self, folder_path, path_in_repo, repo_id=None, commit_message=None
+    ):
+        root = Path(folder_path)
+        for child in root.rglob("*"):
+            if child.is_file():
+                relative = child.relative_to(root).as_posix()
+                self.files[f"{path_in_repo}/{relative}"] = child.read_bytes()
+
+    def upload_file(
+        self, path_or_fileobj, path_in_repo, repo_id=None, commit_message=None
+    ):
+        self.files[path_in_repo] = bytes(path_or_fileobj)
+
+    def list_repo_files(self, repo_id, revision="main"):
+        return sorted(self.files)
+
+
+def test_restore_round_trips_padded_adapter_snapshot(tmp_path):
+    api = _UploadingApi()
+    run_dir = tmp_path / "local-run"
+    output = run_dir / "output"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(
+        json.dumps({"run_id": RUN, "status": "running", "last_step": 500})
+    )
+    snapshot = output / "adapter_snapshots" / "step-000500"
+    snapshot.mkdir(parents=True)
+    (snapshot / "adapter_config.json").write_text("{}")
+    (snapshot / "adapter_model.safetensors").write_text("")
+
+    mirror = HFRunMirror(
+        HFSyncConfig(repo_id="me/run"),
+        run_id=RUN,
+        run_dir=run_dir,
+        output_dir=output,
+        results_dir=run_dir,
+        api=api,
+        start_worker=False,
+        download=lambda repo, path: api.files[path],
+        sleep=lambda _: None,
+    )
+    mirror.enqueue_adapter_snapshot(snapshot, 500)
+    assert mirror.process_pending() == 1
+    assert (
+        f"runs/{RUN}/adapter_snapshots/step-000500/adapter_config.json"
+        in api.files
+    )
+
+    # Add the ledger and checkpoint the callback-driven run also uploads.
+    api.files.update(_blobs(1000))
+    runs_root = tmp_path / "restored"
+    result = restore_run(
+        _api(sorted(api.files)),
+        "me/run",
+        RUN,
+        runs_root,
+        download=_download(api.files),
+    )
+
+    restored = (
+        runs_root / RUN / "output" / "adapter_snapshots" / "step-000500"
+    )
+    assert (restored / "adapter_config.json").read_bytes() == b"{}"
+    assert (restored / "adapter_model.safetensors").read_bytes() == b""
+    assert not (restored / "500").exists()
     assert result["checkpoint_step"] == 1000
 
 

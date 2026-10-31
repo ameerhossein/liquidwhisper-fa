@@ -140,3 +140,49 @@ def test_train_begin_ledger_and_missing_checkpoint_is_ignored(tmp_path):
     cb.on_train_begin(None, SimpleNamespace(global_step=0), None)
     cb.on_save(None, SimpleNamespace(global_step=1000), None)
     assert mirror.jobs == [("ledger", "training", None)]
+
+
+def test_snapshot_skipped_when_control_will_save(tmp_path):
+    mirror = FakeMirror()
+    cb = HFMirrorCallback(
+        mirror,
+        model=FakeModel(),
+        processor=FakeProcessor(),
+        output_dir=tmp_path,
+        snapshot_steps=250,
+        save_steps=1000,
+    )
+    cb.on_step_end(
+        SimpleNamespace(save_strategy="steps"),
+        SimpleNamespace(global_step=250, max_steps=2000),
+        SimpleNamespace(should_save=True),
+    )
+    assert mirror.jobs == []
+
+
+def test_snapshot_skipped_on_final_implicit_save(tmp_path):
+    mirror = FakeMirror()
+    cb = HFMirrorCallback(
+        mirror,
+        model=FakeModel(),
+        processor=FakeProcessor(),
+        output_dir=tmp_path,
+        snapshot_steps=250,
+        save_steps=1000,
+    )
+    # The final step of a steps-strategy run is always saved, even though
+    # 1250 is not a save_steps multiple.
+    cb.on_step_end(
+        SimpleNamespace(save_strategy="steps"),
+        SimpleNamespace(global_step=1250, max_steps=1250),
+        SimpleNamespace(should_save=False),
+    )
+    assert mirror.jobs == []
+
+    # A non-final snapshot step with no save due still snapshots.
+    cb.on_step_end(
+        SimpleNamespace(save_strategy="steps"),
+        SimpleNamespace(global_step=250, max_steps=2000),
+        SimpleNamespace(should_save=False),
+    )
+    assert [job[0] for job in mirror.jobs] == ["adapter"]
