@@ -112,7 +112,14 @@ function truthyFlagValue(value) {
 function formValuesFromConfig(config) {
   if (!config || typeof config !== "object") return {};
   const values = {};
-  for (const key of ["epochs", "batch_size", "grad_accum", "eval_steps", "learning_rate"]) {
+  for (const key of [
+    "epochs",
+    "batch_size",
+    "grad_accum",
+    "eval_steps",
+    "learning_rate",
+    "telephony_mode",
+  ]) {
     const value = config[key];
     if (value != null && value !== "") values[key] = String(value);
   }
@@ -122,6 +129,12 @@ function formValuesFromConfig(config) {
       : "off";
   }
   return values;
+}
+
+// Paired training consumes both clean and phone rows in one pass, so it needs
+// half the epochs of the disjoint/clean-only datasets.
+function epochsForTelephonyMode(mode) {
+  return String(mode || "paired") === "paired" ? 2 : 4;
 }
 
 // Pick the picker value after a /api/runs refresh: keep a still-listed
@@ -152,6 +165,7 @@ if (typeof module !== "undefined" && module.exports) {
     runLogUrl,
     runViewState,
     formValuesFromConfig,
+    epochsForTelephonyMode,
     resolvePickerSelection,
     shouldApplyPickerRefresh,
   };

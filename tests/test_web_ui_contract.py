@@ -227,6 +227,18 @@ def test_picker_refresh_guards_inflight_selection():
     assert "loadRunState()" in body
 
 
+def test_cockpit_exposes_paired_training_default():
+    html = (ROOT / "server" / "static" / "index.html").read_text()
+    js = (ROOT / "server" / "static" / "app.js").read_text()
+    view = (ROOT / "server" / "static" / "run_view.js").read_text()
+    assert 'id="inputTelephonyMode"' in html
+    assert 'value="paired" selected' in html
+    assert 'id="inputEpochs"' in html and 'value="2"' in html
+    assert "telephony_mode" in js
+    assert "epochsForTelephonyMode" in js
+    assert "epochsForTelephonyMode" in view
+
+
 def test_pure_run_helpers_are_wired():
     js = (ROOT / "server/static/app.js").read_text()
     assert "formValuesFromConfig(" in js

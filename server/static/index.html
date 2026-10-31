@@ -109,7 +109,15 @@
       <form class="config" onsubmit="return false">
         <label class="field">
           <span class="field-label">Epochs</span>
-          <input type="number" id="inputEpochs" class="field-input" value="4" min="1" max="10">
+          <input type="number" id="inputEpochs" class="field-input" value="2" min="1" max="10">
+        </label>
+        <label class="field">
+          <span class="field-label">Training data</span>
+          <select id="inputTelephonyMode" class="field-input">
+            <option value="paired" selected>Paired clean + phone (2 epochs)</option>
+            <option value="disjoint">Disjoint 50/50 (4 epochs)</option>
+            <option value="clean">Clean only (4 epochs)</option>
+          </select>
         </label>
         <label class="field">
           <span class="field-label">Batch size</span>
@@ -270,7 +278,7 @@
   </div>
 
   <script src="/static/benchmark_view.js?v=1"></script>
-  <script src="/static/run_view.js?v=2"></script>
-  <script src="/static/app.js?v=11"></script>
+  <script src="/static/run_view.js?v=3"></script>
+  <script src="/static/app.js?v=12"></script>
 </body>
 </html>

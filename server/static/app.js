@@ -4,7 +4,7 @@
  * epoch benchmark ladder, canary word diffs, and the training log.
  */
 
-const DEFAULT_EPOCHS = 4;
+const DEFAULT_EPOCHS = 2;
 const numberFormat = new Intl.NumberFormat("en-US");
 
 const el = {
@@ -46,6 +46,7 @@ const el = {
   smokeLogWrap: document.getElementById("smokeLogWrap"),
   smokeLog: document.getElementById("smokeLog"),
   inputEpochs: document.getElementById("inputEpochs"),
+  inputTelephonyMode: document.getElementById("inputTelephonyMode"),
   inputBatchSize: document.getElementById("inputBatchSize"),
   inputGradAccum: document.getElementById("inputGradAccum"),
   inputGradCheckpoint: document.getElementById("inputGradCheckpoint"),
@@ -150,6 +151,7 @@ function restoreRunConfig(config) {
   const values = formValuesFromConfig(config);
   const fields = [
     [el.inputEpochs, values.epochs],
+    [el.inputTelephonyMode, values.telephony_mode],
     [el.inputBatchSize, values.batch_size],
     [el.inputGradAccum, values.grad_accum],
     [el.inputEvalSteps, values.eval_steps],
@@ -1238,6 +1240,7 @@ async function startRun(freshStart) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         epochs: parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS,
+        telephony_mode: el.inputTelephonyMode ? el.inputTelephonyMode.value : "paired",
         batch_size: parseInt(el.inputBatchSize.value, 10) || 8,
         grad_accum: parseInt(el.inputGradAccum.value, 10) || 4,
         gradient_checkpointing: el.inputGradCheckpoint.value === "on",
@@ -1266,6 +1269,11 @@ el.btnStart.addEventListener("click", () => startRun(false));
 if (el.btnSmoke) el.btnSmoke.addEventListener("click", startSmokeRun);
 if (el.runSelect) {
   el.runSelect.addEventListener("change", () => selectRun(el.runSelect.value));
+}
+if (el.inputTelephonyMode) {
+  el.inputTelephonyMode.addEventListener("change", () => {
+    el.inputEpochs.value = epochsForTelephonyMode(el.inputTelephonyMode.value);
+  });
 }
 if (el.btnResume) el.btnResume.addEventListener("click", resumeRun);
 if (el.btnMerge) el.btnMerge.addEventListener("click", mergeRun);

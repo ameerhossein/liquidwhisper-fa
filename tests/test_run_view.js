@@ -13,6 +13,7 @@ const {
   isMergeAvailable,
   runLogUrl,
   formValuesFromConfig,
+  epochsForTelephonyMode,
   runViewState,
   resolvePickerSelection,
   shouldApplyPickerRefresh,
@@ -264,6 +265,19 @@ assert.deepStrictEqual(
 assert.deepStrictEqual(formValuesFromConfig(null), {});
 assert.deepStrictEqual(formValuesFromConfig(undefined), {});
 assert.deepStrictEqual(formValuesFromConfig("epochs=4"), {});
+
+// Training-data mode maps through and drives the epoch default: paired uses
+// two epochs, disjoint/clean use four, and a missing mode behaves as paired.
+assert.strictEqual(epochsForTelephonyMode("paired"), 2);
+assert.strictEqual(epochsForTelephonyMode("disjoint"), 4);
+assert.strictEqual(epochsForTelephonyMode("clean"), 4);
+assert.strictEqual(epochsForTelephonyMode(undefined), 2);
+assert.strictEqual(epochsForTelephonyMode(null), 2);
+assert.strictEqual(formValuesFromConfig({ telephony_mode: "clean" }).telephony_mode, "clean");
+assert.strictEqual(
+  formValuesFromConfig({ ...fullConfig, telephony_mode: "clean" }).telephony_mode,
+  "clean",
+);
 
 // runViewState drives Resume/Merge visibility in renderRun.
 const resumable = (status) =>
