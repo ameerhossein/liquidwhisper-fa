@@ -144,23 +144,23 @@ def test_progress_updates_every_100_steps_and_on_train_end(tmp_path):
     cb = _callback(run_dir, run_dir=str(run_dir))
     args, control = _args_control()
 
-    for step in range(1, 100):
+    for step in range(1, 10):
         cb.on_step_end(args, _state(step, max_steps=200), control)
     assert run_state.load_run(run_dir)["step_count"] == 0
 
-    cb.on_step_end(args, _state(100, max_steps=200), control)
+    cb.on_step_end(args, _state(10, max_steps=200), control)
     run = run_state.load_run(run_dir)
-    assert run["step_count"] == 100
-    assert run["last_step"] == 100
+    assert run["step_count"] == 10
+    assert run["last_step"] == 10
     assert run["last_step_at"] is not None
 
-    for step in range(101, 124):
+    for step in range(11, 24):
         cb.on_step_end(args, _state(step, max_steps=200), control)
-    cb.on_train_end(args, _state(123, max_steps=200), control)
+    cb.on_train_end(args, _state(23, max_steps=200), control)
 
     run = run_state.load_run(run_dir)
-    assert run["step_count"] == 123
-    assert run["last_step"] == 123
+    assert run["step_count"] == 23
+    assert run["last_step"] == 23
 
 
 def test_progress_is_skipped_without_run_dir(tmp_path):
@@ -184,10 +184,12 @@ def test_replayed_step_keeps_progress_count_unique(tmp_path):
     args, control = _args_control()
 
     # A resume from checkpoint-90 replays step 90 before reaching new steps.
-    # The local append counter reaches 100, but only 99 steps are unique.
+    # The replay appends a duplicate line but must not inflate the unique
+    # count or trigger a manifest flush on its own.
     cb.on_step_end(args, _state(90), control)
+    assert cb.step_count == 99
     run = run_state.load_run(run_dir)
-    assert run["step_count"] == 99
+    assert run["step_count"] == 0
 
     cb.on_train_end(args, _state(90), control)
     run = run_state.load_run(run_dir)
@@ -228,3 +230,54 @@ def test_on_train_end_does_not_claim_run_completed(tmp_path):
         (Path(tmp_path) / "live_telemetry.json").read_text(encoding="utf-8")
     )
     assert telemetry["status"] == "stopped"
+
+
+def test_replayed_step_does_not_inflate_telemetry_count(tmp_path):
+    run_dir = Path(tmp_path) / RUN_ID
+    run_state.create_run(tmp_path, config={}, trainer_args={}, run_id=RUN_ID)
+    for step in range(1, 11):
+        run_state.append_step(run_dir, {"step": step, "loss": 0.1})
+
+    cb = _callback(run_dir, run_dir=str(run_dir))
+    assert cb.step_count == 10
+    args, control = _args_control()
+    cb.on_step_end(args, _state(5, max_steps=100), control)
+
+    assert cb.step_count == 10
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["step_count"] == 10
+
+
+def test_telemetry_snapshots_include_step_count(tmp_path):
+    cb = _callback(tmp_path)
+    args, control = _args_control()
+    cb.on_step_end(args, _state(1, max_steps=10), control)
+
+    telemetry = json.loads(
+        (Path(tmp_path) / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["step_count"] == 1
+
+    cb.on_train_end(args, _state(1, max_steps=10), control)
+    telemetry = json.loads(
+        (Path(tmp_path) / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["step_count"] == 1
+
+
+def test_progress_flushes_every_10_steps(tmp_path):
+    run_dir = Path(tmp_path) / RUN_ID
+    run_state.create_run(tmp_path, config={}, trainer_args={}, run_id=RUN_ID)
+    cb = _callback(run_dir, run_dir=str(run_dir))
+    args, control = _args_control()
+
+    for step in range(1, 10):
+        cb.on_step_end(args, _state(step, max_steps=200), control)
+    assert run_state.load_run(run_dir)["step_count"] == 0
+
+    cb.on_step_end(args, _state(10, max_steps=200), control)
+    run = run_state.load_run(run_dir)
+    assert run["step_count"] == 10
+    assert run["last_step"] == 10

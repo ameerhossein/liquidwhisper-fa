@@ -143,6 +143,19 @@ merge_run_id: Optional[str] = None
 training_run_id: Optional[str] = None
 _monitor_task: Optional[asyncio.Task] = None
 
+# Short TTL caches for the 1s status/WebSocket path. The full ledger scan
+# (reconcile_all) and the merge no-child scan both walk every run directory;
+# caching them keeps the hot path cheap while lifecycle actions and the
+# 2s monitor force a fresh scan.
+_REFRESH_TTL_SECONDS = 1.5
+_MERGE_SCAN_TTL_SECONDS = 2.0
+_refresh_cache_at: float = 0.0
+_refresh_cache_summary: Optional[Dict[str, Any]] = None
+_merge_scan_at: float = 0.0
+_merge_scan_result: bool = False
+_log_exception_state: Dict[str, list] = {}
+_LOG_EXCEPTION_WINDOW_SECONDS = 60.0
+
 
 def _load_preflight_benchmarks(
     path: Optional[Path] = None,
@@ -264,7 +277,49 @@ def read_json_safely(path: Path, default: Any) -> Any:
 
 
 def _log_exception(context: str) -> None:
-    """Print one monitor/recovery failure to stderr instead of hiding it."""
+    """Print one monitor/recovery failure, rate-limited per context.
+
+    A persistent failure (e.g. a broken run directory polled every 2s) would
+    otherwise print a full traceback on every tick. Only the first failure
+    per context per 60s is printed; repeats are counted and reported with
+    the next emission.
+    """
+    global _log_exception_state
+    try:
+        now = time.monotonic()
+    except Exception:
+        now = time.time()
+    entry = _log_exception_state.get(context)
+    if entry is not None:
+        try:
+            last_emit, suppressed = entry
+        except (TypeError, ValueError):
+            last_emit, suppressed = now, 0
+        if (now - float(last_emit)) < _LOG_EXCEPTION_WINDOW_SECONDS:
+            try:
+                entry[1] = int(suppressed) + 1
+            except Exception:
+                pass
+            return
+        pending = 0
+        try:
+            pending = int(suppressed)
+        except (TypeError, ValueError):
+            pending = 0
+        _log_exception_state[context] = [now, 0]
+        try:
+            import traceback
+            suffix = (
+                f" (and {pending} similar suppressed)"
+                if pending
+                else ""
+            )
+            print(f"[cockpit] {context} failed{suffix}:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+        except Exception:
+            pass
+        return
+    _log_exception_state[context] = [now, 0]
     try:
         import traceback
         print(f"[cockpit] {context} failed:", file=sys.stderr)
@@ -287,6 +342,13 @@ def _unlink_quietly(path: Path) -> None:
         Path(path).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _invalidate_refresh_cache() -> None:
+    """Force the next cached scan to rescan after a ledger mutation."""
+    global _refresh_cache_at, _refresh_cache_summary
+    _refresh_cache_at = 0.0
+    _refresh_cache_summary = None
 
 
 def _reconcile_training_exit(exit_code: Optional[int]) -> None:
@@ -319,6 +381,8 @@ def _reconcile_training_exit(exit_code: Optional[int]) -> None:
         except Exception:
             # A broken manifest must never make the monitor crash.
             _log_exception(f"reconcile training exit for {run.get('run_id')}")
+        finally:
+            _invalidate_refresh_cache()
     training_run_id = None
 
 
@@ -362,6 +426,7 @@ def _training_running() -> bool:
                     run_state.reconcile(
                         _run_dir(run), pid_alive=False, exit_code=None
                     )
+                    _invalidate_refresh_cache()
     except Exception:
         pass
     return False
@@ -391,7 +456,13 @@ def _run_dir(run: Optional[Dict[str, Any]]) -> Path:
 
 
 def _run_paths(run: Optional[Dict[str, Any]]) -> Dict[str, Path]:
-    """Per-run files, or the legacy global files when no ledger run exists."""
+    """Per-run files, or the legacy global files when no ledger run exists.
+
+    A run may point ``paths.results_dir`` away from its run directory (CLI
+    runs with an explicit ``--results_dir``). Telemetry, benchmarks, loss
+    history, and the stop signal live under that directory; the log and PID
+    stay under the run directory so one run never overwrites another's log.
+    """
     if not run:
         return {
             "telemetry_file": TELEMETRY_FILE,
@@ -402,19 +473,32 @@ def _run_paths(run: Optional[Dict[str, Any]]) -> Dict[str, Path]:
             "stop_signal_file": STOP_SIGNAL_FILE,
         }
     run_dir = _run_dir(run)
+    raw_results = ((run or {}).get("paths") or {}).get("results_dir")
+    if raw_results:
+        results_dir = Path(str(raw_results))
+        if not results_dir.is_absolute():
+            results_dir = BASE_DIR / results_dir
+    else:
+        results_dir = run_dir
     return {
-        "telemetry_file": run_dir / "live_telemetry.json",
-        "benchmarks_file": run_dir / "epoch_benchmarks.json",
-        "loss_history_file": run_dir / "loss_history.json",
+        "telemetry_file": results_dir / "live_telemetry.json",
+        "benchmarks_file": results_dir / "epoch_benchmarks.json",
+        "loss_history_file": results_dir / "loss_history.json",
         "log_file": run_dir / "training_live.log",
         "pid_file": run_dir / "training.pid",
-        "stop_signal_file": run_dir / "stop_training.signal",
+        "stop_signal_file": results_dir / "stop_training.signal",
     }
 
 
 def _refresh_runs() -> Dict[str, Any]:
-    """Reconcile every run and refresh the active/latest/current view."""
+    """Reconcile every run and refresh the active/latest/current view.
+
+    This is the forced path used by lifecycle actions, startup recovery,
+    and the background monitor. Read-only status paths should prefer
+    :func:`_refresh_runs_cached`.
+    """
     global ACTIVE_RUN_ID, LATEST_RUN, CURRENT_RUN
+    global _refresh_cache_at, _refresh_cache_summary
     try:
         summary = run_state.reconcile_all(RUNS_DIR, is_alive=_is_process_running)
     except Exception:
@@ -428,7 +512,20 @@ def _refresh_runs() -> Dict[str, Any]:
             "latest_run": runs[0] if runs else None,
             "merge_run": None,
             "runs": runs,
+            "duplicates": [],
         }
+    if "duplicates" not in summary:
+        summary["duplicates"] = []
+    duplicates = summary.get("duplicates") or []
+    if duplicates:
+        try:
+            print(
+                f"[cockpit] warning: duplicate live trainer PIDs for runs: "
+                f"{', '.join(str(run_id) for run_id in duplicates)}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
     # `_merge_running()` owns live-merge busy gating: it also has the child
     # handle and the artifact checks. The summary's "merge_run" is advisory.
     active = summary.get("active_run")
@@ -436,7 +533,27 @@ def _refresh_runs() -> Dict[str, Any]:
     ACTIVE_RUN_ID = str(active.get("run_id")) if active else None
     LATEST_RUN = latest
     CURRENT_RUN = active or latest
+    try:
+        _refresh_cache_at = time.monotonic()
+    except Exception:
+        _refresh_cache_at = time.time()
+    _refresh_cache_summary = summary
     return summary
+
+
+def _refresh_runs_cached() -> Dict[str, Any]:
+    """Return the cached run scan when fresh, else do a forced refresh."""
+    global _refresh_cache_summary
+    try:
+        now = time.monotonic()
+    except Exception:
+        now = time.time()
+    if (
+        _refresh_cache_summary is not None
+        and (now - _refresh_cache_at) < _REFRESH_TTL_SECONDS
+    ):
+        return _refresh_cache_summary
+    return _refresh_runs()
 
 
 def _current_run() -> Optional[Dict[str, Any]]:
@@ -495,6 +612,32 @@ def _active_run_process_running() -> bool:
 def _steps_summary(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not run:
         return {"count": 0, "last_step": None, "last_saved_at": None}
+    # The active run reports its exact per-step count from live telemetry;
+    # historical runs report the deduplicated manifest count.
+    try:
+        if ACTIVE_RUN_ID is not None and str(run.get("run_id")) == ACTIVE_RUN_ID:
+            telemetry = read_json_safely(
+                _run_paths(run)["telemetry_file"], {}
+            )
+            if isinstance(telemetry, dict) and telemetry.get("step_count") is not None:
+                try:
+                    active_count = int(telemetry["step_count"])
+                except (TypeError, ValueError):
+                    active_count = None
+                if active_count is not None:
+                    last_step = telemetry.get("step", run.get("last_step"))
+                    try:
+                        last_step_i = int(last_step) if last_step is not None else None
+                    except (TypeError, ValueError):
+                        last_step_i = run.get("last_step")
+                    return {
+                        "count": active_count,
+                        "last_step": last_step_i,
+                        "last_saved_at": run.get("last_step_at")
+                        or telemetry.get("updated_at"),
+                    }
+    except Exception:
+        pass
     try:
         count = int(run.get("step_count") or 0)
     except (TypeError, ValueError):
@@ -570,7 +713,7 @@ async def _monitor_loop() -> None:
             # Poll known children first so a real exit code is applied before
             # the ledger rescan (which only knows PID liveness).
             _training_running()
-            _merge_running()
+            _merge_running(force=True)
             _refresh_runs()
         except asyncio.CancelledError:
             raise
@@ -609,9 +752,12 @@ async def _stop_monitor_task() -> None:
 
 def _recover_runs_on_startup() -> None:
     """Startup recovery: apply child exits, merge recovery, ledger rescan."""
+    def _forced_merge_scan() -> None:
+        _merge_running(force=True)
+
     steps = (
         ("startup training poll", _training_running),
-        ("startup merge recovery", _merge_running),
+        ("startup merge recovery", _forced_merge_scan),
         ("startup ledger refresh", _refresh_runs),
     )
     for context, step in steps:
@@ -886,7 +1032,14 @@ def _finish_merge(
                 if exit_code == 0:
                     detail = "merge exited 0 without complete artifacts"
                 elif exit_code is None and complete:
-                    detail = "merge artifacts predate the merge attempt"
+                    try:
+                        missing_started = float(stage.get("started_at"))
+                    except (TypeError, ValueError):
+                        missing_started = None
+                    if missing_started is None:
+                        detail = "merge stage start time is missing"
+                    else:
+                        detail = "merge artifacts predate the merge attempt"
                 elif exit_code is None:
                     detail = "merge process ended without artifacts"
                 else:
@@ -904,7 +1057,9 @@ def _finish_merge(
                     run_dir, lambda current: {**current, "merge_pid": None}
                 )
             except Exception:
-                pass
+                _log_exception(f"clear merge_pid for {run_id}")
+            finally:
+                _invalidate_refresh_cache()
     merge_run_id = None
 
 
@@ -927,14 +1082,17 @@ def _merge_pid_from_run(run: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def _merge_running() -> bool:
+def _merge_running(force: bool = False) -> bool:
     """Poll the merge child, or recover a merge PID from the ledger.
 
     With a live child handle the real exit code is observed. Without one (a
     server restart), every run's ``merge`` stage is inspected: a live PID
     means the merge continues, a dead PID is classified from its artifacts.
+    The no-child scan is cached for ~2s; lifecycle actions and the monitor
+    pass ``force=True``.
     """
     global merge_process, merge_run_id
+    global _merge_scan_at, _merge_scan_result
     if merge_process is not None:
         code = merge_process.poll()
         if code is None:
@@ -944,13 +1102,27 @@ def _merge_running() -> bool:
         _close_merge_log_fd()
         if run_id:
             _finish_merge(run_id, code, pid_known=True)
+        try:
+            _merge_scan_at = time.monotonic()
+        except Exception:
+            _merge_scan_at = time.time()
+        _merge_scan_result = False
         return False
+
+    if not force:
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = time.time()
+        if (now - _merge_scan_at) < _MERGE_SCAN_TTL_SECONDS:
+            return _merge_scan_result
 
     try:
         runs = run_state.list_runs(RUNS_DIR, limit=None)
     except Exception:
         _log_exception("scan runs for merge recovery")
         runs = []
+    result = False
     for run in runs:
         stage = _merge_stage(run)
         if stage is None or stage.get("status") != "running":
@@ -958,18 +1130,24 @@ def _merge_running() -> bool:
         pid = _merge_pid_from_run(run)
         if pid is not None and _is_process_running(pid):
             merge_run_id = str(run.get("run_id") or "") or None
-            return True
+            result = True
+            break
         _finish_merge(
             str(run.get("run_id") or ""),
             None,
             pid_known=pid is not None,
         )
-    return False
+    try:
+        _merge_scan_at = time.monotonic()
+    except Exception:
+        _merge_scan_at = time.time()
+    _merge_scan_result = result
+    return result
 
 
 def _any_job_running() -> bool:
     """Shared busy check: full run, smoke test, or merge."""
-    if _training_running() or _smoke_running() or _merge_running():
+    if _training_running() or _smoke_running() or _merge_running(force=True):
         return True
     _refresh_runs()
     return _active_run() is not None
@@ -1220,7 +1398,7 @@ async def get_status():
     # never reports a stale ``running`` run with ``process_running: false``.
     training_live = _training_running()
     _merge_running()
-    _refresh_runs()
+    _refresh_runs_cached()
     run = _current_run()
     paths = _run_paths(run)
     is_running = training_live or _active_run_process_running()
@@ -1357,7 +1535,7 @@ def _get_benchmark_rows(
 
 @app.get("/api/benchmarks")
 async def get_benchmarks():
-    _refresh_runs()
+    _refresh_runs_cached()
     run = _current_run()
     paths = _run_paths(run)
     return _get_benchmark_rows(
@@ -1369,14 +1547,14 @@ async def get_benchmarks():
 
 @app.get("/api/loss-history")
 async def get_loss_history():
-    _refresh_runs()
+    _refresh_runs_cached()
     paths = _run_paths(_current_run())
     return read_json_safely(paths["loss_history_file"], [])
 
 
 @app.get("/api/logs")
 async def get_logs(tail: int = 150):
-    _refresh_runs()
+    _refresh_runs_cached()
     paths = _run_paths(_current_run())
     log_file = paths["log_file"]
     if not log_file.exists():
@@ -1786,6 +1964,7 @@ def _spawn_trainer(
             )
         except Exception:
             pass
+        _invalidate_refresh_cache()
         raise HTTPException(status_code=500, detail=f"Failed to launch training: {e}")
 
     training_run_id = run_id
@@ -1809,6 +1988,7 @@ def _spawn_trainer(
             )
         except Exception:
             pass
+        _invalidate_refresh_cache()
         raise HTTPException(
             status_code=500, detail=f"Failed to record run attempt: {e}"
         )
@@ -1818,6 +1998,7 @@ def _spawn_trainer(
     except Exception:
         pass
     run_state.set_status(run_dir, "running", stop_requested_at=None)
+    _invalidate_refresh_cache()
 
     return {
         "status": "started",
@@ -2086,7 +2267,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     # Apply any known child exits and a possibly-dead merge attempt before
     # deciding whether a new merge may start.
     training_busy = _training_running()
-    merge_busy = _merge_running()
+    merge_busy = _merge_running(force=True)
     _refresh_runs()
     run = run_state.load_run(RUNS_DIR / run_id) or run
     run_dir = _run_dir(run)
@@ -2191,6 +2372,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
 
     run_state.update_run(run_dir, _reset_merge_stage)
     run_state.set_stage(run_dir, "merge", "running", detail="merging")
+    _invalidate_refresh_cache()
 
     merge_process = None
     try:
@@ -2247,6 +2429,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     run_state.update_run(
         run_dir, lambda current: {**current, "merge_pid": int(pid)}
     )
+    _invalidate_refresh_cache()
     return {
         "status": "started",
         "run_id": run_id,
@@ -2296,7 +2479,7 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/api/runs")
 async def list_runs(limit: int = 20):
-    summary = _refresh_runs()
+    summary = _refresh_runs_cached()
     try:
         capped = max(0, int(limit))
     except (TypeError, ValueError):
@@ -2311,7 +2494,7 @@ async def list_runs(limit: int = 20):
 
 @app.get("/api/runs/latest")
 async def latest_run():
-    _refresh_runs()
+    _refresh_runs_cached()
     return _run_payload(_current_run())
 
 
@@ -2328,10 +2511,14 @@ async def get_run_steps(run_id: str, tail: int = 2000):
         count = 2000
     count = max(0, min(count, 10000))
     run_dir = _run_dir(run)
+    raw_results = ((run or {}).get("paths") or {}).get("results_dir")
+    steps_dir = Path(str(raw_results)) if raw_results else run_dir
+    if not steps_dir.is_absolute():
+        steps_dir = BASE_DIR / steps_dir
     return {
         "run_id": run_id,
-        "total": run_state.step_count(run_dir),
-        "steps": run_state.read_steps(run_dir, tail=count),
+        "total": run_state.step_count(steps_dir),
+        "steps": run_state.read_steps(steps_dir, tail=count),
     }
 
 
@@ -2364,7 +2551,7 @@ async def get_run_logs(run_id: str, tail: int = 80):
 async def get_run(run_id: str):
     if not run_state.run_id_valid(run_id):
         raise HTTPException(status_code=404, detail="Run not found.")
-    _refresh_runs()
+    _refresh_runs_cached()
     run = run_state.load_run(RUNS_DIR / run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -2503,6 +2690,7 @@ async def stop_training(payload: Dict[str, Any] = None):
             run_state.update_run(run_dir, mark_stop)
         except FileNotFoundError:
             pass
+        _invalidate_refresh_cache()
         halt_requested = True
         pid = _run_pid(active)
         proc = None
@@ -2547,7 +2735,7 @@ async def websocket_telemetry(websocket: WebSocket):
             # Poll status, telemetry and send to client (1s cadence to save bandwidth)
             training_live = _training_running()
             _merge_running()
-            _refresh_runs()
+            _refresh_runs_cached()
             run = _current_run()
             paths = _run_paths(run)
             telemetry = read_json_safely(paths["telemetry_file"], {})

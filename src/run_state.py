@@ -759,13 +759,16 @@ def reconcile_all(
 
     active_index: int | None = None
     merge_index: int | None = None
+    live_indices: list[int] = []
     for index, (run_dir, run) in enumerate(entries):
         # Only a starting/running run can be active. A terminal run may keep a
         # stale current_pid; that PID can be reused by an unrelated process.
         if run.get("status") in _ACTIVE_RUN_STATUSES:
             pid = _run_training_pid(run_dir, run)
-            if active_index is None and pid is not None and alive(pid):
-                active_index = index
+            if pid is not None and alive(pid):
+                live_indices.append(index)
+                if active_index is None:
+                    active_index = index
         merge_pid = _as_pid(run.get("merge_pid"))
         if merge_index is None and merge_pid is not None and alive(merge_pid):
             merge_index = index
@@ -782,11 +785,18 @@ def reconcile_all(
         refreshed.append(run)
 
     latest_run = refreshed[0] if refreshed else None
+    duplicates = [
+        str(entries[index][1].get("run_id") or "")
+        for index in live_indices
+        if index != active_index
+    ]
+    duplicates = [run_id for run_id in duplicates if run_id]
     return {
         "active_run": refreshed[active_index] if active_index is not None else None,
         "latest_run": latest_run,
         "merge_run": refreshed[merge_index] if merge_index is not None else None,
         "runs": refreshed,
+        "duplicates": duplicates,
     }
 
 

@@ -104,9 +104,34 @@ class WebTelemetryCallback(TrainerCallback):
         self.last_step_time = time.time()
         self.step_durations: List[float] = []
         self.loss_history: List[Dict[str, Any]] = []
-        # steps.jsonl is the uncapped authority for the run's step history;
-        # the count is restored so resume progress stays monotonic.
-        self.step_count = run_state.step_count(self.results_dir)
+        # steps.jsonl is the uncapped authority for the run's step history.
+        # Load the set of seen steps once so checkpoint replay cannot inflate
+        # the count; only genuinely new steps increment it.
+        self._seen_steps: set = set()
+        try:
+            if os.path.exists(self.steps_file):
+                with open(
+                    self.steps_file, "r", encoding="utf-8", errors="replace"
+                ) as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        raw_step = record.get("step")
+                        if isinstance(raw_step, bool):
+                            continue
+                        try:
+                            self._seen_steps.add(int(raw_step))
+                        except (TypeError, ValueError):
+                            continue
+        except Exception:
+            self._seen_steps = set()
+        self.step_count = len(self._seen_steps)
         try:
             if os.path.exists(self.loss_history_file):
                 with open(self.loss_history_file, "r", encoding="utf-8") as f:
@@ -120,6 +145,7 @@ class WebTelemetryCallback(TrainerCallback):
         self._write_telemetry({
             "status": "initializing",
             "step": 0,
+            "step_count": self.step_count,
             "max_steps": 0,
             "epoch": 0.0,
             "loss": None,
@@ -245,10 +271,25 @@ class WebTelemetryCallback(TrainerCallback):
             # 500-point cap is only for the chart; steps.jsonl below is uncapped.
             self._write_json(self.loss_history_file, self.loss_history[-500:])
 
-        # 3. Save live snapshot
+        # 3. Persist this optimizer step first so the live snapshot below
+        # carries the exact unique-step count including the current step.
+        # Recorded before consuming a stop signal so the halting step still
+        # appears in the run ledger.
+        self._append_step_record(
+            state,
+            now=now,
+            avg_step_dt=avg_step_dt,
+            eta_seconds=eta_seconds,
+            latest_loss=latest_loss,
+            latest_loss_step=latest_loss_step,
+            latest_lr=latest_lr,
+        )
+
+        # 4. Save live snapshot
         telemetry_payload = {
             "status": "training",
             "step": state.global_step,
+            "step_count": self.step_count,
             "max_steps": state.max_steps,
             "epoch": round(state.epoch or 0.0, 2),
             "loss": latest_loss,
@@ -260,18 +301,6 @@ class WebTelemetryCallback(TrainerCallback):
             "updated_at": now
         }
         self._write_telemetry(telemetry_payload)
-
-        # 4. Persist this optimizer step. Recorded before consuming a stop
-        # signal so the halting step still appears in the run ledger.
-        self._append_step_record(
-            state,
-            now=now,
-            avg_step_dt=avg_step_dt,
-            eta_seconds=eta_seconds,
-            latest_loss=latest_loss,
-            latest_loss_step=latest_loss_step,
-            latest_lr=latest_lr,
-        )
 
         # 5. Check for web stop signal
         if os.path.exists(self.stop_signal_file):
@@ -309,16 +338,24 @@ class WebTelemetryCallback(TrainerCallback):
             "eta_seconds": eta_seconds,
             "attempt": self.attempt,
         })
-        self.step_count += 1
-        if self.run_dir and (self.step_count % 100 == 0):
+        try:
+            key = int(state.global_step)
+        except (TypeError, ValueError):
+            key = None
+        is_new = key is not None and key not in self._seen_steps
+        if is_new:
+            assert key is not None
+            self._seen_steps.add(key)
+            self.step_count += 1
+        if is_new and self.run_dir and (self.step_count % 10 == 0):
             self._set_run_progress(step=state.global_step, last_step_at=now)
 
     def _set_run_progress(self, *, step: int, last_step_at: float) -> None:
         """Refresh ``run.json`` progress, tolerating a plain ``--run_dir``.
 
-        The count comes from the deduplicated ``steps.jsonl`` on every flush:
-        a checkpoint resume replays steps already in the file, so the local
-        append counter would overcount unique optimizer steps.
+        The count is the exact unique-step total tracked in ``_seen_steps``:
+        a checkpoint resume replays steps already in the file without
+        inflating the count.
         """
         if not self.run_dir:
             return
@@ -330,7 +367,7 @@ class WebTelemetryCallback(TrainerCallback):
             run_state.set_progress(
                 self.run_dir,
                 step=step,
-                step_count=run_state.step_count(self.results_dir),
+                step_count=self.step_count,
                 last_step_at=last_step_at,
             )
         except (OSError, ValueError) as exc:
@@ -351,6 +388,7 @@ class WebTelemetryCallback(TrainerCallback):
         self._write_telemetry({
             "status": "evaluating_benchmark",
             "step": state.global_step,
+            "step_count": self.step_count,
             "max_steps": state.max_steps,
             "epoch": current_epoch,
             "eval_epoch": current_epoch,
@@ -365,6 +403,7 @@ class WebTelemetryCallback(TrainerCallback):
         self._write_telemetry({
             "status": "training",
             "step": state.global_step,
+            "step_count": self.step_count,
             "max_steps": state.max_steps,
             "epoch": current_epoch,
             "gpu": self._get_gpu_stats(),
@@ -647,7 +686,7 @@ class WebTelemetryCallback(TrainerCallback):
         print(f"[TelemetryCallback] Epoch {epoch_num} benchmarks saved to {self.benchmarks_file}")
 
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        # Final progress flush: every 100-step update is best-effort, so the
+        # Final progress flush: every 10-step update is best-effort, so the
         # last partial interval must not be lost.
         self._set_run_progress(step=state.global_step, last_step_at=time.time())
         # Training is not the run's end: the main script may still run post-eval.
@@ -656,6 +695,7 @@ class WebTelemetryCallback(TrainerCallback):
         self._write_telemetry({
             "status": "stopped" if self.halt_requested else "training",
             "step": state.global_step,
+            "step_count": self.step_count,
             "max_steps": state.max_steps,
             "epoch": round(state.epoch or 0.0, 2),
             "elapsed_seconds": int(time.time() - self.start_time),

@@ -1624,3 +1624,155 @@ def test_smoke_status_transient_failure_keeps_polling():
     assert "Smoke status unavailable" in js
     assert "scheduleSmokePoll(5000)" in js
     assert "if (el.btnSmoke)" in js
+
+
+def test_refresh_cached_reuses_scan_within_ttl(client, monkeypatch):
+    calls = []
+    orig = client.mod.run_state.reconcile_all
+
+    def counting(root, **kwargs):
+        calls.append(1)
+        return orig(root, **kwargs)
+
+    monkeypatch.setattr(client.mod.run_state, "reconcile_all", counting)
+    client.mod._refresh_runs_cached()
+    client.mod._refresh_runs_cached()
+    assert len(calls) == 1
+    client.mod._refresh_runs()
+    assert len(calls) == 2
+
+
+def test_merge_scan_cached_reuses_no_child_scan(client, monkeypatch):
+    calls = []
+    orig_list = client.mod.run_state.list_runs
+
+    def counting(root, limit=None):
+        calls.append(1)
+        return orig_list(root, limit=limit)
+
+    monkeypatch.setattr(client.mod.run_state, "list_runs", counting)
+    client.mod.merge_process = None
+    client.mod._merge_running()
+    client.mod._merge_running()
+    assert len(calls) == 1
+    client.mod._merge_running(force=True)
+    assert len(calls) == 2
+
+
+def test_log_exception_rate_limits(client, capsys):
+    ctx = "rate-limit-test-ctx-unique-1"
+    client.mod._log_exception(ctx)
+    client.mod._log_exception(ctx)
+    err = capsys.readouterr().err
+    assert err.count(ctx) == 1
+
+
+def test_log_exception_reports_suppressed_count(client, monkeypatch, capsys):
+    ctx = "rate-limit-suppressed-ctx-unique-1"
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        client.mod.time, "monotonic", lambda: clock["now"]
+    )
+    client.mod._log_exception(ctx)
+    assert capsys.readouterr().err.count(ctx) == 1
+    client.mod._log_exception(ctx)
+    assert capsys.readouterr().err.count(ctx) == 0
+    clock["now"] += 61.0
+    client.mod._log_exception(ctx)
+    err = capsys.readouterr().err
+    assert ctx in err
+    assert "suppress" in err.lower()
+
+
+def test_duplicate_live_pid_produces_warning(client, monkeypatch, capsys):
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: True)
+    _create_run(
+        client, pid=111111, status="running", run_id="20261030-194700-aaaaaa"
+    )
+    _create_run(
+        client, pid=222222, status="running", run_id="20261030-195700-bbbbbb"
+    )
+    summary = client.mod.run_state.reconcile_all(
+        client.mod.RUNS_DIR, is_alive=lambda pid: True
+    )
+    assert "duplicates" in summary
+    assert len(summary["duplicates"]) == 1
+    capsys.readouterr()
+    client.mod._refresh_runs()
+    assert "duplicate" in capsys.readouterr().err.lower()
+
+
+def test_finish_merge_missing_started_at_detail(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-777778"
+    )
+    run_dir = _mark_merge_running(client, run["run_id"], pid=None)
+    _write_merge_artifacts(client, run["run_id"])
+
+    def clear_started(current):
+        for stage in current.get("stages") or []:
+            if stage.get("name") == "merge":
+                stage.pop("started_at", None)
+        return current
+
+    run_state.update_run(run_dir, clear_started)
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+
+    assert client.mod._merge_running() is False
+    stage = run_state.load_run(run_dir)["stages"][3]
+    assert stage["status"] == "failed"
+    assert "missing" in stage["detail"].lower() or "start time" in stage["detail"].lower()
+
+
+def test_run_paths_honors_custom_results_dir(client, tmp_path):
+    run_id = "20261030-194700-aaaaab"
+    custom = tmp_path / "custom-results"
+    custom.mkdir()
+    run_state.create_run(
+        client.mod.RUNS_DIR,
+        config={},
+        trainer_args={},
+        run_id=run_id,
+        paths={"results_dir": str(custom)},
+    )
+    run = run_state.load_run(client.mod.RUNS_DIR / run_id)
+    paths = client.mod._run_paths(run)
+    assert paths["telemetry_file"] == custom / "live_telemetry.json"
+    assert paths["benchmarks_file"] == custom / "epoch_benchmarks.json"
+    assert paths["loss_history_file"] == custom / "loss_history.json"
+    assert paths["stop_signal_file"] == custom / "stop_training.signal"
+    assert paths["log_file"].parent == client.mod.RUNS_DIR / run_id
+    assert paths["pid_file"].parent == client.mod.RUNS_DIR / run_id
+
+
+def test_steps_summary_uses_active_telemetry_count(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps(
+            {
+                "status": "training",
+                "step": 42,
+                "step_count": 42,
+                "updated_at": 123.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    client.mod._refresh_runs()
+    run = run_state.load_run(run_dir)
+    summary = client.mod._steps_summary(run)
+    assert summary["count"] == 42
+
+    historical = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-cccccd"
+    )
+    historical_dir = client.mod.RUNS_DIR / historical["run_id"]
+    run_state.set_progress(historical_dir, step=7, step_count=7, last_step_at=1.0)
+    (historical_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "completed", "step": 99, "step_count": 99}),
+        encoding="utf-8",
+    )
+    historical_run = run_state.load_run(historical_dir)
+    historical_summary = client.mod._steps_summary(historical_run)
+    assert historical_summary["count"] == 7

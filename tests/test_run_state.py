@@ -636,3 +636,36 @@ def test_write_preflight_copy_is_atomic_and_readable(tmp_path):
     source.write_text(json.dumps({"clean_wer": 0.2}), encoding="utf-8")
     run_state.write_preflight_copy(run_dir, source)
     assert json.loads(dest.read_text(encoding="utf-8")) == {"clean_wer": 0.2}
+
+
+def test_reconcile_all_reports_duplicate_live_runs(tmp_path):
+    root = tmp_path / "runs"
+
+    older = _create(root, RUN_A)
+    older_dir = older["paths"]["run_dir"]
+    _set_created(older_dir, 100.0)
+    run_state.start_attempt(older_dir, 101)
+    run_state.set_status(older_dir, "running")
+
+    newer = _create(root, RUN_B)
+    newer_dir = newer["paths"]["run_dir"]
+    _set_created(newer_dir, 200.0)
+    run_state.start_attempt(newer_dir, 202)
+    run_state.set_status(newer_dir, "running")
+
+    summary = run_state.reconcile_all(root, is_alive=lambda pid: True)
+
+    assert summary["active_run"]["run_id"] == RUN_B
+    assert summary["duplicates"] == [RUN_A]
+
+
+def test_reconcile_all_duplicates_empty_with_single_live_run(tmp_path):
+    root = tmp_path / "runs"
+    run = _create(root, RUN_A)
+    run_dir = run["paths"]["run_dir"]
+    run_state.start_attempt(run_dir, 101)
+    run_state.set_status(run_dir, "running")
+
+    summary = run_state.reconcile_all(root, is_alive=lambda pid: pid == 101)
+    assert summary["duplicates"] == []
+    assert summary["active_run"]["run_id"] == RUN_A
