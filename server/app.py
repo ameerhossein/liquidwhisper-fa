@@ -151,6 +151,12 @@ hf_restore_process: Optional[subprocess.Popen] = None
 hf_restore_log_fd = None
 hf_restore_run_id: Optional[str] = None
 _hf_restore_last_state: str = "idle"
+# Restore status states that do not represent in-flight work. Every other
+# state is a phase reported by the child while it is still restoring, so a
+# restart must keep treating it as active.
+_HF_RESTORE_TERMINAL_STATES = frozenset(
+    ("idle", "completed", "failed", "interrupted")
+)
 _monitor_task: Optional[asyncio.Task] = None
 
 # Short TTL caches for the 1s status/WebSocket path. The full ledger scan
@@ -1318,8 +1324,11 @@ def _hf_restore_running() -> bool:
     """Poll the restore child and reconcile a stale persisted status.
 
     After a restart there is no child handle, so progress is recovered from
-    the status file. A ``running`` status whose recorded PID is dead (or was
-    never recorded) becomes ``interrupted`` and stops blocking new work.
+    the status file. Every non-terminal state (``running``, ``resolving``,
+    ``listing``, ``ledger``, ``checkpoint``, ``verify``, and any future phase)
+    means a restore may still be active. If its recorded PID is dead (or was
+    never recorded), the status becomes ``interrupted`` and stops blocking new
+    work.
     """
     global hf_restore_process, hf_restore_run_id, _hf_restore_last_state
     exited = False
@@ -1334,25 +1343,27 @@ def _hf_restore_running() -> bool:
 
     status = _hf_restore_status()
     state = str(status.get("state") or "idle")
-    if state == "running":
+    if state not in _HF_RESTORE_TERMINAL_STATES:
         pid = status.get("pid")
         try:
             pid_int = int(pid) if pid is not None else None
         except (TypeError, ValueError):
             pid_int = None
-        if pid_int is not None and _is_process_running(pid_int):
+        # With no child handle, a live PID means the restore survived the
+        # server restart. With a handle, poll() has already proven the child
+        # exited, so even a reused PID must not keep the phase alive.
+        if not exited and pid_int is not None and _is_process_running(pid_int):
             hf_restore_run_id = (
                 str(status.get("run_id") or "") or hf_restore_run_id
             )
-            _hf_restore_last_state = "running"
+            _hf_restore_last_state = state
             return True
 
         status["state"] = "interrupted"
-        if not status.get("message"):
-            status["message"] = (
-                "restore process is no longer running; the status was "
-                "left at 'running'"
-            )
+        status["message"] = (
+            f"restore process is no longer running; phase '{state}' was "
+            "marked interrupted"
+        )
         try:
             _write_hf_restore_status(status)
         except Exception:

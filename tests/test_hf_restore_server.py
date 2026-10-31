@@ -118,6 +118,50 @@ def test_stale_running_restore_status_becomes_interrupted(client, monkeypatch):
     assert status["state"] == "interrupted"
 
 
+RESTORE_PHASES = (
+    "running",
+    "resolving",
+    "listing",
+    "ledger",
+    "checkpoint",
+    "verify",
+    "future_phase",
+)
+
+
+@pytest.mark.parametrize("state", RESTORE_PHASES)
+def test_live_restore_phase_is_treated_as_running(client, state):
+    client.mod._hf_restore_status_file().write_text(
+        json.dumps({"state": state, "run_id": RUN, "pid": os.getpid()})
+    )
+    assert client.mod._hf_restore_running() is True
+
+
+@pytest.mark.parametrize("state", RESTORE_PHASES)
+def test_dead_restore_phase_becomes_interrupted(client, monkeypatch, state):
+    client.mod._hf_restore_status_file().write_text(
+        json.dumps({"state": state, "run_id": RUN, "pid": 999999})
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    assert client.mod._hf_restore_running() is False
+    status = json.loads(client.mod._hf_restore_status_file().read_text())
+    assert status["state"] == "interrupted"
+    assert status["run_id"] == RUN
+    assert status["message"]
+
+
+def test_restore_refused_while_restart_recovered_phase_is_live(client):
+    client.mod._hf_restore_status_file().write_text(
+        json.dumps({"state": "checkpoint", "run_id": RUN, "pid": os.getpid()})
+    )
+    assert client.mod._any_job_running() is True
+    res = client.post(
+        "/api/hf/restore", json={"run_id": "20261031-130000-abcdef"}
+    )
+    assert res.status_code == 400
+    assert client.launched == []
+
+
 # --- hardening around the global constraints -------------------------------
 
 
