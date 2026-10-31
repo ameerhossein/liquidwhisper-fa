@@ -34,6 +34,7 @@ try:
 except Exception:
     pass
 from src import paths as _managed_paths  # noqa: E402
+from src import run_state  # noqa: E402
 
 
 def _default_results_dir() -> Path:
@@ -51,6 +52,14 @@ RESULTS_DIR = _default_results_dir()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+# One self-contained directory per run. The default follows ASR_RESULTS_DIR,
+# so it inherits the RunPod persistent-volume behavior; ASR_RUNS_DIR overrides.
+RUNS_DIR = Path(_managed_paths.resolve_runs_dir(None)).expanduser()
+if not RUNS_DIR.is_absolute():
+    RUNS_DIR = BASE_DIR / RUNS_DIR
+RUNS_DIR = RUNS_DIR.resolve()
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEMETRY_FILE = RESULTS_DIR / "live_telemetry.json"
 BENCHMARKS_FILE = RESULTS_DIR / "epoch_benchmarks.json"
@@ -102,15 +111,24 @@ smoke_last_exit_code: Optional[int] = None
 ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 
+# Run-ledger view: refreshed by the API/WebSocket paths and before every
+# start/resume/stop so a live run is found after a server restart.
+ACTIVE_RUN_ID: Optional[str] = None
+LATEST_RUN: Optional[Dict[str, Any]] = None
+CURRENT_RUN: Optional[Dict[str, Any]] = None
 
-def _load_preflight_benchmarks() -> List[Dict[str, Any]]:
+
+def _load_preflight_benchmarks(
+    path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     """Baseline rows from the measured preflight cache, empty when absent.
 
     The trainer writes ``results/baselines/preflight.json`` after evaluating
     BuzzASR and Whisper on the same rows. There is no hardcoded fallback: a
     missing or malformed cache means the API has no measured baseline yet.
     """
-    data = read_json_safely(PREFLIGHT_FILE, {})
+    preflight_file = Path(path) if path is not None else PREFLIGHT_FILE
+    data = read_json_safely(preflight_file, {})
     models = data.get("models") if isinstance(data, dict) else None
     if not isinstance(models, dict):
         return []
@@ -145,6 +163,26 @@ def _is_process_running(pid: Optional[int] = None) -> bool:
         return False
 
 
+def _terminate_child(pid: Optional[int]) -> None:
+    """Terminate a spawned child's process group, never our own group."""
+    try:
+        pid_i = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid_i = None
+    if pid_i is None or pid_i == os.getpid():
+        return
+    try:
+        if sys.platform != "win32":
+            os.killpg(os.getpgid(pid_i), signal.SIGTERM)
+        else:
+            os.kill(pid_i, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid_i, signal.SIGTERM)
+        except Exception:
+            pass
+
+
 def _check_auth(config: Optional[Dict[str, Any]]) -> None:
     """Optional token gate: set ASR_COCKPIT_TOKEN env to require it.
 
@@ -162,8 +200,10 @@ def _check_auth(config: Optional[Dict[str, Any]]) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing cockpit token.")
 
 
-def get_default_benchmarks() -> List[Dict[str, Any]]:
-    return _load_preflight_benchmarks()
+def get_default_benchmarks(
+    preflight_file: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    return _load_preflight_benchmarks(preflight_file)
 
 
 def read_json_safely(path: Path, default: Any) -> Any:
@@ -195,6 +235,122 @@ def _training_running() -> bool:
     except Exception:
         pass
     return False
+
+
+def _fake_trainer_enabled() -> bool:
+    return (os.environ.get("ASR_FAKE_TRAINER", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _trainer_script_path() -> Path:
+    name = "dev_fake_trainer.py" if _fake_trainer_enabled() else "train_lora.py"
+    return BASE_DIR / "scripts" / name
+
+
+def _run_dir(run: Optional[Dict[str, Any]]) -> Path:
+    """Directory backing *run*, preferring the manifest's recorded path."""
+    raw = ((run or {}).get("paths") or {}).get("run_dir")
+    if raw:
+        return Path(str(raw))
+    run_id = str((run or {}).get("run_id") or "")
+    return RUNS_DIR / run_id
+
+
+def _run_paths(run: Optional[Dict[str, Any]]) -> Dict[str, Path]:
+    """Per-run files, or the legacy global files when no ledger run exists."""
+    if not run:
+        return {
+            "telemetry_file": TELEMETRY_FILE,
+            "benchmarks_file": BENCHMARKS_FILE,
+            "loss_history_file": LOSS_HISTORY_FILE,
+            "log_file": LOG_FILE,
+            "pid_file": PID_FILE,
+            "stop_signal_file": STOP_SIGNAL_FILE,
+        }
+    run_dir = _run_dir(run)
+    return {
+        "telemetry_file": run_dir / "live_telemetry.json",
+        "benchmarks_file": run_dir / "epoch_benchmarks.json",
+        "loss_history_file": run_dir / "loss_history.json",
+        "log_file": run_dir / "training_live.log",
+        "pid_file": run_dir / "training.pid",
+        "stop_signal_file": run_dir / "stop_training.signal",
+    }
+
+
+def _refresh_runs() -> Dict[str, Any]:
+    """Reconcile every run and refresh the active/latest/current view."""
+    global ACTIVE_RUN_ID, LATEST_RUN, CURRENT_RUN
+    try:
+        summary = run_state.reconcile_all(RUNS_DIR, is_alive=_is_process_running)
+    except Exception:
+        # A broken run directory must never take status/start/stop down.
+        try:
+            runs = run_state.list_runs(RUNS_DIR)
+        except Exception:
+            runs = []
+        summary = {
+            "active_run": None,
+            "latest_run": runs[0] if runs else None,
+            "merge_run": None,
+            "runs": runs,
+        }
+    active = summary.get("active_run")
+    latest = summary.get("latest_run")
+    ACTIVE_RUN_ID = str(active.get("run_id")) if active else None
+    LATEST_RUN = latest
+    CURRENT_RUN = active or latest
+    return summary
+
+
+def _current_run() -> Optional[Dict[str, Any]]:
+    """The active run, else the latest run, else ``None`` (legacy mode)."""
+    return CURRENT_RUN if CURRENT_RUN is not None else LATEST_RUN
+
+
+def _active_run() -> Optional[Dict[str, Any]]:
+    if ACTIVE_RUN_ID is None:
+        return None
+    run = CURRENT_RUN
+    if run is not None and str(run.get("run_id")) == ACTIVE_RUN_ID:
+        return run
+    if LATEST_RUN is not None and str(LATEST_RUN.get("run_id")) == ACTIVE_RUN_ID:
+        return LATEST_RUN
+    return None
+
+
+def _active_run_process_running() -> bool:
+    """True when a run recovered from the ledger owns a live PID.
+
+    Used after a server restart, when there is no child handle to poll.
+    ``last_exit_code`` distinguishes a just-exited child from an unobserved
+    process: once the server has seen an exit, PID liveness is not consulted.
+    """
+    if training_process is not None or last_exit_code is not None:
+        return False
+    try:
+        pid = int((_active_run() or {}).get("current_pid"))
+    except (TypeError, ValueError):
+        return False
+    return _is_process_running(pid)
+
+
+def _steps_summary(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not run:
+        return {"count": 0, "last_step": None, "last_saved_at": None}
+    try:
+        count = int(run.get("step_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return {
+        "count": count,
+        "last_step": run.get("last_step"),
+        "last_saved_at": run.get("last_step_at"),
+    }
 
 
 def _abs_output_path(path: str) -> Path:
@@ -321,11 +477,32 @@ def _read_log_tail(path: Path, tail: int = 30) -> List[str]:
 
 
 def _any_training_running() -> bool:
-    return _training_running() or _smoke_running()
+    if _training_running() or _smoke_running():
+        return True
+    _refresh_runs()
+    return _active_run() is not None
 
 
-def _derive_status(telemetry: Dict[str, Any], is_running: bool) -> Dict[str, Any]:
+def _derive_status(
+    telemetry: Dict[str, Any],
+    is_running: bool,
+    run: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Map raw telemetry plus process state to the status shown in the UI."""
+    if run is not None:
+        status = telemetry.get("status") or "idle"
+        run_status = str(run.get("status") or "")
+        if run_status in ("starting", "running"):
+            if status in ("idle", "running"):
+                status = "training"
+            if run.get("stop_requested_at") and status in ACTIVE_STATUSES:
+                status = "stopping"
+        elif run_status in ("completed", "stopped", "failed", "interrupted"):
+            status = run_status
+        telemetry["status"] = status
+        return telemetry
+
+    # Legacy path (no ledger run): keep the in-memory halt behavior.
     status = telemetry.get("status") or "idle"
     if is_running:
         if status in ("idle", "running"):
@@ -426,9 +603,11 @@ def _sanitize_output_dir(raw: str) -> str:
     """Confine output_dir to repo or persistent-volume roots.
 
     Allows relative paths under BASE_DIR (legacy behavior) plus absolute
-    paths under /workspace, /runpod-volume, /mnt, or colon-separated
-    ASR_ALLOWED_OUTPUT_ROOTS. Returns absolute path as string so the trainer
-    can write checkpoints directly to the persistent volume (auto-resumable).
+    paths under /workspace, /runpod-volume, /mnt, colon-separated
+    ASR_ALLOWED_OUTPUT_ROOTS, or the managed runs root. A self-contained run's
+    output lives under the runs root even when that root is elsewhere.
+    Returns absolute path as string so the trainer can write checkpoints
+    directly to the persistent volume (auto-resumable).
     """
     raw = (raw or _default_output_dir()).strip() or _default_output_dir()
     extra_roots = [r for r in os.environ.get("ASR_ALLOWED_OUTPUT_ROOTS", "").split(":") if r.strip()]
@@ -438,6 +617,10 @@ def _sanitize_output_dir(raw: str) -> str:
             allowed_abs.append(Path(r).resolve())
         except Exception:
             continue
+    try:
+        allowed_abs.append(RUNS_DIR.resolve())
+    except Exception:
+        pass
     if os.path.isabs(raw):
         p = Path(raw).resolve()
         if p == BASE_DIR.resolve() or BASE_DIR.resolve() in p.parents:
@@ -519,9 +702,12 @@ async def serve_index():
 
 @app.get("/api/status")
 async def get_status():
-    is_running = _training_running()
+    _refresh_runs()
+    run = _current_run()
+    paths = _run_paths(run)
+    is_running = _training_running() or _active_run_process_running()
 
-    telemetry = read_json_safely(TELEMETRY_FILE, {
+    telemetry = read_json_safely(paths["telemetry_file"], {
         "status": "running" if is_running else "idle",
         "step": 0,
         "max_steps": 0,
@@ -533,9 +719,13 @@ async def get_status():
         "gpu": get_gpu_info()
     })
 
-    telemetry = _derive_status(telemetry, is_running)
+    telemetry = _derive_status(telemetry, is_running, run)
     telemetry["process_running"] = is_running
     telemetry["gpu"] = telemetry.get("gpu") or get_gpu_info()
+    telemetry["run"] = run
+    telemetry["active_run_id"] = ACTIVE_RUN_ID
+    telemetry["steps"] = _steps_summary(run)
+    telemetry["storage"] = run_state.storage_info(RUNS_DIR)
     return telemetry
 
 
@@ -627,34 +817,53 @@ def _drop_stale_baselines(rows: Any) -> List[Dict[str, Any]]:
     ]
 
 
-def _get_benchmark_rows(*, persist_defaults: bool = False) -> List[Dict[str, Any]]:
+def _get_benchmark_rows(
+    *,
+    persist_defaults: bool = False,
+    benchmarks_file: Optional[Path] = None,
+    preflight_file: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     """Return benchmark rows shared by the REST endpoint and the live socket."""
-    rows = _drop_stale_baselines(read_json_safely(BENCHMARKS_FILE, None))
+    path = Path(benchmarks_file) if benchmarks_file is not None else BENCHMARKS_FILE
+    rows = _drop_stale_baselines(read_json_safely(path, None))
     if rows:
         return rows
-    rows = get_default_benchmarks()
+    rows = get_default_benchmarks(preflight_file)
     if rows and persist_defaults:
-        with open(BENCHMARKS_FILE, "w", encoding="utf-8") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(rows, f, indent=2, ensure_ascii=False)
     return rows
 
 
 @app.get("/api/benchmarks")
 async def get_benchmarks():
-    return _get_benchmark_rows(persist_defaults=True)
+    _refresh_runs()
+    run = _current_run()
+    paths = _run_paths(run)
+    return _get_benchmark_rows(
+        persist_defaults=True,
+        benchmarks_file=paths["benchmarks_file"],
+        preflight_file=_run_preflight_file(run),
+    )
 
 
 @app.get("/api/loss-history")
 async def get_loss_history():
-    return read_json_safely(LOSS_HISTORY_FILE, [])
+    _refresh_runs()
+    paths = _run_paths(_current_run())
+    return read_json_safely(paths["loss_history_file"], [])
 
 
 @app.get("/api/logs")
 async def get_logs(tail: int = 150):
-    if not LOG_FILE.exists():
+    _refresh_runs()
+    paths = _run_paths(_current_run())
+    log_file = paths["log_file"]
+    if not log_file.exists():
         return {"logs": ["Log buffer empty. Training has not started."]}
     try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
             return {"logs": [line.rstrip() for line in lines[-tail:]]}
     except Exception as e:
@@ -791,13 +1000,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     try:
         _smoke_pid_file().write_text(str(smoke_process.pid), encoding="utf-8")
     except Exception as e:
-        try:
-            os.killpg(os.getpgid(smoke_process.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                smoke_process.terminate()
-            except Exception:
-                pass
+        _terminate_child(smoke_process.pid)
         _close_smoke_log_fd()
         raise HTTPException(
             status_code=500, detail=f"Failed to record smoke PID: {e}"
@@ -812,15 +1015,100 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     }
 
 
-@app.post("/api/train/start")
-async def start_training(config: Dict[str, Any] = None):
-    global training_process, training_log_fd, last_exit_code, halt_requested
-    _check_auth(config)
-    _check_audio_backend_or_400()
-    if _any_training_running():
-        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+_TRAINER_VALUE_ARGS = (
+    "config",
+    "base_model",
+    "dataset_name",
+    "epochs",
+    "batch_size",
+    "grad_accum",
+    "learning_rate",
+    "warmup_steps",
+    "lr_scheduler_type",
+    "eval_steps",
+    "save_steps",
+    "save_total_limit",
+    "eval_batch_size",
+    "max_benchmark_samples",
+    "preflight_samples",
+    "num_proc",
+    "telephony_prob",
+    "telephony_seed",
+    "phone_seed",
+    "lora_r",
+    "lora_alpha",
+    "lora_dropout",
+    "max_train_samples",
+    "max_eval_samples",
+    "prep_cache_dir",
+)
+_TRAINER_LIST_ARGS = ("telephony_profiles",)
+_TRAINER_BOOL_ARGS = (
+    "telephony_use_ffmpeg",
+    "phone_benchmark",
+    "run_post_test_eval",
+    "run_epoch_benchmark",
+    "enable_telemetry",
+    "gradient_checkpointing",
+    "auto_resume",
+    "fresh_start",
+    "overwrite_preflight",
+    "reuse_prep",
+    "overwrite_prep_cache",
+)
 
-    config = config or {}
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(value)
+
+
+def _build_trainer_command(
+    *,
+    trainer_args: Dict[str, Any],
+    run_dir: Path,
+    output_dir: str,
+    results_dir: str,
+    preflight_cache_dir: Path,
+    post_eval_only: bool = False,
+    resume_from_checkpoint: Optional[str] = None,
+) -> List[str]:
+    """Rebuild the trainer command from a run's stored argument mapping."""
+    cmd = [
+        sys.executable,
+        "-u",
+        str(_trainer_script_path()),
+        "--run_dir", str(run_dir),
+        "--preflight_cache_dir", str(preflight_cache_dir),
+        "--output_dir", str(output_dir),
+        "--results_dir", str(results_dir),
+    ]
+    for key in _TRAINER_VALUE_ARGS:
+        value = trainer_args.get(key)
+        if value is None or value == "":
+            continue
+        cmd += [f"--{key}", str(value)]
+    for key in _TRAINER_LIST_ARGS:
+        value = trainer_args.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, tuple, set)):
+            value = ",".join(str(item) for item in value)
+        cmd += [f"--{key}", str(value)]
+    for key in _TRAINER_BOOL_ARGS:
+        if key not in trainer_args:
+            continue
+        cmd.append(f"--{key}" if _as_bool(trainer_args.get(key)) else f"--no-{key}")
+    if resume_from_checkpoint:
+        cmd += ["--resume_from_checkpoint", str(resume_from_checkpoint)]
+    if post_eval_only:
+        cmd.append("--post_eval_only")
+    return cmd
+
+
+def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and normalize a new-run payload (legacy rules unchanged)."""
     try:
         epochs_i = int(config.get("epochs", 4))
         batch_i = int(config.get("batch_size", 8))
@@ -830,10 +1118,7 @@ async def start_training(config: Dict[str, Any] = None):
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 1000)
         max_bench_i = int(max_bench) if max_bench not in (None, "") else 1000
-        # Preprocessing workers for datasets.map (fork-based). Default 8;
-        # capped at os.cpu_count(). Each worker pins torch to one thread and
-        # the ffmpeg probe is cached, so workers scale. Override via POST
-        # {"num_proc": N} with N in 1..16.
+        # Preprocessing workers for datasets.map (fork-based). Default 8.
         num_proc_i = int(config.get("num_proc", 8))
         tele_f = float(config.get("telephony_prob", 0.5))
     except (ValueError, TypeError):
@@ -857,81 +1142,46 @@ async def start_training(config: Dict[str, Any] = None):
     if not (1 <= eval_steps_i <= 10000):
         raise HTTPException(status_code=400, detail="eval_steps must be 1..10000.")
     ckpt_raw = config.get("gradient_checkpointing", False)
-    gradient_ckpt = (str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")) if isinstance(ckpt_raw, str) else bool(ckpt_raw)
+    gradient_ckpt = (
+        str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(ckpt_raw, str)
+        else bool(ckpt_raw)
+    )
     if batch_i > 8 and not gradient_ckpt:
         raise HTTPException(status_code=400, detail="batch_size above 8 needs gradient_checkpointing on; without it batch 16 runs out of memory on a 48 GB GPU.")
-
-    output_dir = _sanitize_output_dir(str(config.get("output_dir", None) or _default_output_dir()))
-    results_cfg = (config.get("results_dir", "") or "")
-    results_dir = _sanitize_output_dir(str(results_cfg).strip()) if str(results_cfg).strip() else str(RESULTS_DIR)
     dataset_name = str(config.get("dataset_name", "shekar-ai/Neyshekar")).strip() or "shekar-ai/Neyshekar"
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
-    try:
-        smoke_output = _abs_output_path(_smoke_output_dir()).resolve()
-        smoke_results = _smoke_results_dir().resolve()
-    except Exception:
-        smoke_output = None
-        smoke_results = None
-    if smoke_output is not None and _abs_output_path(output_dir).resolve() == smoke_output:
-        raise HTTPException(status_code=400, detail="output_dir must not be the smoke-test directory.")
-    if smoke_results is not None and _abs_output_path(results_dir).resolve() == smoke_results:
-        raise HTTPException(status_code=400, detail="results_dir must not be the smoke-test directory.")
     # Resume controls: default auto-resume ON so pod restarts continue from
-    # persistent-volume checkpoints. Send {"fresh_start": true} for clean run,
-    # or {"resume_from_checkpoint": "<path|last>"} to force a checkpoint.
+    # checkpoints. Send {"fresh_start": true} for a clean run, or
+    # {"resume_from_checkpoint": "<path|last>"} to force a checkpoint.
     fresh_start = bool(config.get("fresh_start", config.get("fresh", False)))
     resume_explicit = str(config.get("resume_from_checkpoint", "") or "").strip()
     auto_resume = config.get("auto_resume", True)
-    auto_resume_on = (str(auto_resume).strip().lower() not in ("0", "false", "no", "off", "")) if isinstance(auto_resume, str) else bool(auto_resume)
+    auto_resume_on = (_as_bool(auto_resume) if isinstance(auto_resume, str) else bool(auto_resume))
     if fresh_start:
         auto_resume_on = False
+    return {
+        "epochs": epochs_i,
+        "batch_size": batch_i,
+        "grad_accum": accum_i,
+        "eval_steps": eval_steps_i,
+        "learning_rate": lr_f,
+        "eval_batch_size": eval_bs_i,
+        "max_benchmark_samples": max_bench_i,
+        "num_proc": num_proc_i,
+        "telephony_prob": tele_f,
+        "gradient_checkpointing": gradient_ckpt,
+        "dataset_name": dataset_name,
+        "fresh_start": fresh_start,
+        "resume_explicit": resume_explicit,
+        "auto_resume": auto_resume_on,
+    }
 
-    # Remove any old stop signal
-    if STOP_SIGNAL_FILE.exists():
-        STOP_SIGNAL_FILE.unlink(missing_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-u",  # unbuffered: stream prints to training_live.log during long imports/downloads
-        str(BASE_DIR / "scripts" / "train_lora.py"),
-        "--base_model", "BuzzASR/persian",
-        "--dataset_name", dataset_name,
-        "--output_dir", output_dir,
-        "--results_dir", results_dir,
-        "--epochs", str(epochs_i),
-        "--batch_size", str(batch_i),
-        "--grad_accum", str(accum_i),
-        "--learning_rate", str(lr_f),
-        "--eval_batch_size", str(eval_bs_i),
-        "--max_benchmark_samples", str(max_bench_i),
-        "--preflight_samples", str(max_bench_i),
-        "--num_proc", str(num_proc_i),
-        "--telephony_prob", str(tele_f),
-        "--enable_telemetry",
-        "--run_epoch_benchmark",
-        "--eval_steps", str(eval_steps_i),
-        "--save_steps", str(eval_steps_i),
-        "--gradient_checkpointing" if gradient_ckpt else "--no-gradient_checkpointing",
-    ]
-    if resume_explicit:
-        cmd += ["--resume_from_checkpoint", resume_explicit]
-    if auto_resume_on:
-        cmd += ["--auto_resume"]
-    else:
-        cmd += ["--no-auto_resume"]
-    if fresh_start:
-        cmd += ["--fresh_start"]
-
-    _close_log_fd()
-    training_log_fd = open(LOG_FILE, "w", encoding="utf-8")
-    training_log_fd.write(f"=== Persian ASR Training Job Launched at {time.ctime()} ===\n")
-    training_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
-    training_log_fd.flush()
-
-    last_exit_code = None
-    halt_requested = False
-    TELEMETRY_FILE.write_text(json.dumps({
+def _write_initial_telemetry(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
         "status": "initializing",
         "step": 0,
         "max_steps": 0,
@@ -941,6 +1191,56 @@ async def start_training(config: Dict[str, Any] = None):
         "speed_s_per_step": 0.0,
         "eta_seconds": 0,
     }), encoding="utf-8")
+
+
+def _spawn_trainer(
+    *,
+    run_id: str,
+    run_dir: Path,
+    paths: Dict[str, Any],
+    trainer_args: Dict[str, Any],
+    post_eval_only: bool,
+    reason: str,
+    response_config: Dict[str, Any],
+    resume_from_checkpoint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Spawn one trainer attempt and record it in the run ledger."""
+    global training_process, training_log_fd, last_exit_code, halt_requested
+
+    file_paths = _run_paths({"run_id": run_id, "paths": paths})
+    log_file = Path(file_paths["log_file"])
+    pid_file = Path(file_paths["pid_file"])
+    stop_signal = Path(file_paths["stop_signal_file"])
+    telemetry_file = Path(file_paths["telemetry_file"])
+
+    # A resumed run must not consume a stale halt request.
+    try:
+        stop_signal.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    _close_log_fd()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    training_log_fd = open(log_file, "w", encoding="utf-8")
+    training_log_fd.write(f"=== Persian ASR Training Job Launched at {time.ctime()} ===\n")
+    training_log_fd.write(f"Run: {run_id} ({reason})\n")
+    training_log_fd.flush()
+
+    last_exit_code = None
+    halt_requested = False
+    _write_initial_telemetry(telemetry_file)
+
+    cmd = _build_trainer_command(
+        trainer_args=trainer_args,
+        run_dir=run_dir,
+        output_dir=str(paths["output_dir"]),
+        results_dir=str(paths["results_dir"]),
+        preflight_cache_dir=_preflight_cache_dir_for_paths(paths),
+        post_eval_only=post_eval_only,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
+    training_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
+    training_log_fd.flush()
 
     training_process = None
     try:
@@ -958,47 +1258,333 @@ async def start_training(config: Dict[str, Any] = None):
         except Exception:
             pass
         _close_log_fd()
+        try:
+            run_state.set_status(
+                run_dir, "failed", failed_stage="training", last_error=str(e)
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Failed to launch training: {e}")
+
+    # Record the attempt before any other bookkeeping so the trainer's
+    # callback (which may start immediately) sees the correct attempt number.
     try:
-        PID_FILE.write_text(str(training_process.pid), encoding="utf-8")
+        run_state.start_attempt(run_dir, training_process.pid, reason)
+    except Exception as e:
+        try:
+            training_log_fd.write(f"\n!!! Failed to record run attempt: {e}\n")
+            training_log_fd.flush()
+        except Exception:
+            pass
+        _terminate_child(training_process.pid)
+        _close_log_fd()
+        try:
+            run_state.set_status(
+                run_dir, "failed", failed_stage="training", last_error=str(e)
+            )
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=500, detail=f"Failed to record run attempt: {e}"
+        )
+
+    try:
+        pid_file.write_text(str(training_process.pid), encoding="utf-8")
     except Exception:
         pass
+    run_state.set_status(run_dir, "running", stop_requested_at=None)
 
     return {
         "status": "started",
+        "run_id": run_id,
         "pid": training_process.pid,
-        "config": {
-            "epochs": str(epochs_i),
-            "batch_size": str(batch_i),
-            "learning_rate": str(lr_f),
-            "grad_accum": str(accum_i),
-            "eval_steps": str(eval_steps_i),
-            "gradient_checkpointing": gradient_ckpt,
-            "num_proc": str(num_proc_i),
-            "telephony_prob": str(tele_f),
-            "output_dir": output_dir,
-            "results_dir": results_dir,
-            "auto_resume": auto_resume_on,
-            "fresh_start": fresh_start,
-            "resume_from_checkpoint": resume_explicit or None
-        }
+        "config": response_config,
+        "paths": {key: str(value) for key, value in paths.items()},
+        "storage": run_state.storage_info(RUNS_DIR),
     }
 
 
-async def _escalate_halt(proc: subprocess.Popen) -> None:
+def _preflight_cache_dir_for_paths(paths: Dict[str, Any]) -> Path:
+    raw = (paths or {}).get("preflight_cache")
+    if raw:
+        p = Path(str(raw))
+        if p.name == "preflight.json":
+            return p.parent.parent
+        return p
+    return RUNS_DIR / "_shared"
+
+
+def _run_preflight_file(run: Optional[Dict[str, Any]]) -> Path:
+    """Run-local preflight copy, else the shared cache, else the legacy file."""
+    if not run:
+        return PREFLIGHT_FILE
+    run_copy = _run_dir(run) / "baselines" / "preflight.json"
+    if run_copy.is_file():
+        return run_copy
+    shared = (
+        _preflight_cache_dir_for_paths(run.get("paths") or {})
+        / "baselines"
+        / "preflight.json"
+    )
+    return shared if shared.is_file() else run_copy
+
+
+def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
+    _check_audio_backend_or_400()
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+
+    results_cfg = (config.get("results_dir", "") or "")
+    if str(results_cfg).strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "results_dir is managed per run for a cockpit run; "
+                "omit it or relocate the runs root with ASR_RUNS_DIR."
+            ),
+        )
+
+    values = _normalize_start_config(config)
+    run_id = run_state.new_run_id()
+    run_dir = RUNS_DIR / run_id
+    output_dir = str(run_dir / "output")
+    explicit_output = str(config.get("output_dir", "") or "").strip()
+    if explicit_output:
+        output_dir = _sanitize_output_dir(explicit_output)
+
+    try:
+        smoke_output = _abs_output_path(_smoke_output_dir()).resolve()
+    except Exception:
+        smoke_output = None
+    if smoke_output is not None and _abs_output_path(output_dir).resolve() == smoke_output:
+        raise HTTPException(status_code=400, detail="output_dir must not be the smoke-test directory.")
+
+    preflight_cache_dir = RUNS_DIR / "_shared"
+    preflight_cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "run_dir": str(run_dir),
+        "output_dir": output_dir,
+        "results_dir": str(run_dir),
+        "merged_dir": str(run_dir / "merged"),
+        "preflight_cache": str(preflight_cache_dir / "baselines" / "preflight.json"),
+    }
+    trainer_args = {
+        "base_model": "BuzzASR/persian",
+        "dataset_name": values["dataset_name"],
+        "output_dir": output_dir,
+        "results_dir": str(run_dir),
+        "epochs": values["epochs"],
+        "batch_size": values["batch_size"],
+        "grad_accum": values["grad_accum"],
+        "learning_rate": values["learning_rate"],
+        "warmup_steps": 500,
+        "lr_scheduler_type": "cosine",
+        "eval_steps": values["eval_steps"],
+        "save_steps": values["eval_steps"],
+        "save_total_limit": 2,
+        "eval_batch_size": values["eval_batch_size"],
+        "max_benchmark_samples": values["max_benchmark_samples"],
+        "preflight_samples": values["max_benchmark_samples"],
+        "num_proc": values["num_proc"],
+        "telephony_prob": values["telephony_prob"],
+        "telephony_profiles": ["customer"],
+        "telephony_seed": 42,
+        "telephony_use_ffmpeg": True,
+        "phone_benchmark": True,
+        "phone_seed": 1234,
+        "gradient_checkpointing": values["gradient_checkpointing"],
+        "run_post_test_eval": True,
+        "run_epoch_benchmark": True,
+        "enable_telemetry": True,
+        "lora_r": 64,
+        "lora_alpha": 128,
+        "lora_dropout": 0.05,
+        "auto_resume": values["auto_resume"],
+        "fresh_start": values["fresh_start"],
+        "run_dir": str(run_dir),
+    }
+    if values["resume_explicit"]:
+        trainer_args["resume_from_checkpoint"] = values["resume_explicit"]
+    run_config = {
+        "base_model": "BuzzASR/persian",
+        "dataset_name": values["dataset_name"],
+        "epochs": values["epochs"],
+        "batch_size": values["batch_size"],
+        "grad_accum": values["grad_accum"],
+        "learning_rate": values["learning_rate"],
+        "eval_batch_size": values["eval_batch_size"],
+        "eval_steps": values["eval_steps"],
+        "save_steps": values["eval_steps"],
+        "max_benchmark_samples": values["max_benchmark_samples"],
+        "preflight_samples": values["max_benchmark_samples"],
+        "num_proc": values["num_proc"],
+        "telephony_prob": values["telephony_prob"],
+        "gradient_checkpointing": values["gradient_checkpointing"],
+        "auto_resume": values["auto_resume"],
+        "fresh_start": values["fresh_start"],
+        "resume_from_checkpoint": values["resume_explicit"] or None,
+        "output_dir": output_dir,
+        "results_dir": str(run_dir),
+    }
+    run = run_state.create_run(
+        RUNS_DIR,
+        config=run_config,
+        trainer_args=trainer_args,
+        paths=paths,
+        run_id=run_id,
+        source="fake" if _fake_trainer_enabled() else "cockpit",
+    )
+    response_config = {
+        "epochs": str(values["epochs"]),
+        "batch_size": str(values["batch_size"]),
+        "learning_rate": str(values["learning_rate"]),
+        "grad_accum": str(values["grad_accum"]),
+        "eval_steps": str(values["eval_steps"]),
+        "gradient_checkpointing": values["gradient_checkpointing"],
+        "num_proc": str(values["num_proc"]),
+        "telephony_prob": str(values["telephony_prob"]),
+        "output_dir": output_dir,
+        "results_dir": str(run_dir),
+        "auto_resume": values["auto_resume"],
+        "fresh_start": values["fresh_start"],
+        "resume_from_checkpoint": values["resume_explicit"] or None,
+    }
+    return _spawn_trainer(
+        run_id=run_id,
+        run_dir=run_dir,
+        paths=run["paths"],
+        trainer_args=trainer_args,
+        post_eval_only=False,
+        reason="initial",
+        response_config=response_config,
+        resume_from_checkpoint=values["resume_explicit"] or None,
+    )
+
+
+def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    if not run_state.run_id_valid(run_id):
+        raise HTTPException(status_code=404, detail="Run not found.")
+    _check_audio_backend_or_400()
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+
+    run_dir = RUNS_DIR / run_id
+    run = run_state.load_run(run_dir)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    status = str(run.get("status") or "")
+    if status not in ("interrupted", "stopped", "failed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} cannot resume from status '{status or 'unknown'}'.",
+        )
+
+    stored_paths = dict(run.get("paths") or {})
+    output_dir = str(stored_paths.get("output_dir") or (run_dir / "output"))
+    results_dir = str(stored_paths.get("results_dir") or run_dir)
+    preflight_cache_dir = _preflight_cache_dir_for_paths(stored_paths)
+    paths = {
+        "run_dir": str(run_dir),
+        "output_dir": output_dir,
+        "results_dir": results_dir,
+        "merged_dir": str(stored_paths.get("merged_dir") or (run_dir / "merged")),
+        "preflight_cache": str(preflight_cache_dir / "baselines" / "preflight.json"),
+    }
+
+    trainer_args = dict(run.get("trainer_args") or {})
+    trainer_args.pop("resume_from_checkpoint", None)
+    trainer_args.update({
+        "run_dir": str(run_dir),
+        "output_dir": output_dir,
+        "results_dir": results_dir,
+        "fresh_start": False,
+        "auto_resume": True,
+    })
+
+    stages = {str(item.get("name")): item for item in run.get("stages") or []}
+    training_status = str((stages.get("training") or {}).get("status") or "pending")
+    post_eval_status = str((stages.get("post_eval") or {}).get("status") or "pending")
+    post_eval_only = training_status == "completed" and post_eval_status != "completed"
+
+    trainer_args["run_dir"] = str(run_dir)
+    response_config = {
+        "epochs": str(trainer_args.get("epochs", "")),
+        "batch_size": str(trainer_args.get("batch_size", "")),
+        "learning_rate": str(trainer_args.get("learning_rate", "")),
+        "grad_accum": str(trainer_args.get("grad_accum", "")),
+        "eval_steps": str(trainer_args.get("eval_steps", "")),
+        "gradient_checkpointing": _as_bool(trainer_args.get("gradient_checkpointing", False)),
+        "num_proc": str(trainer_args.get("num_proc", "")),
+        "telephony_prob": str(trainer_args.get("telephony_prob", "")),
+        "output_dir": output_dir,
+        "results_dir": results_dir,
+        "auto_resume": True,
+        "fresh_start": False,
+        "resume_from_checkpoint": None,
+    }
+    preflight_cache_dir.mkdir(parents=True, exist_ok=True)
+    return _spawn_trainer(
+        run_id=run_id,
+        run_dir=run_dir,
+        paths=paths,
+        trainer_args=trainer_args,
+        post_eval_only=post_eval_only,
+        reason="resume",
+        response_config=response_config,
+        resume_from_checkpoint=None,
+    )
+
+
+def _start_run(
+    *,
+    config: Dict[str, Any],
+    resume_run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    config = config or {}
+    _check_auth(config)
+    if resume_run_id is not None:
+        return _start_resume_run(config, resume_run_id)
+    return _start_new_run(config)
+
+
+@app.post("/api/train/start")
+async def start_training(config: Dict[str, Any] = None):
+    return _start_run(config=config or {})
+
+
+@app.post("/api/runs/{run_id}/resume")
+async def resume_run(run_id: str, config: Dict[str, Any] = None):
+    return _start_run(config=config or {}, resume_run_id=run_id)
+
+
+async def _escalate_halt(
+    proc: subprocess.Popen,
+    telemetry_file: Optional[Path] = None,
+) -> None:
     """Wait for the trainer to checkpoint and exit; SIGTERM only after the grace period."""
     deadline = time.time() + HALT_GRACE_SECONDS
+    telemetry_path = Path(telemetry_file) if telemetry_file is not None else TELEMETRY_FILE
     while proc.poll() is None:
         if time.time() >= deadline:
-            if read_json_safely(TELEMETRY_FILE, {}).get("status") in ("stopped", "completed"):
+            if read_json_safely(telemetry_path, {}).get("status") in ("stopped", "completed"):
                 return
-            try:
-                if sys.platform != "win32":
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
+            if sys.platform == "win32":
+                try:
                     proc.terminate()
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            else:
+                _terminate_child(proc.pid)
+            return
+        await asyncio.sleep(2)
+
+
+async def _escalate_halt_pid(pid: int) -> None:
+    """Escalate against a run PID recovered from the ledger after a restart."""
+    deadline = time.time() + HALT_GRACE_SECONDS
+    while _is_process_running(pid):
+        if time.time() >= deadline:
+            _terminate_child(pid)
             return
         await asyncio.sleep(2)
 
@@ -1007,6 +1593,57 @@ async def _escalate_halt(proc: subprocess.Popen) -> None:
 async def stop_training(payload: Dict[str, Any] = None):
     global halt_requested
     _check_auth(payload)
+    _refresh_runs()
+    active = _active_run()
+
+    if active is not None:
+        run_id = str(active.get("run_id"))
+        run_dir = RUNS_DIR / run_id
+        paths = _run_paths(active)
+        try:
+            paths["stop_signal_file"].parent.mkdir(parents=True, exist_ok=True)
+            paths["stop_signal_file"].write_text("stop", encoding="utf-8")
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to write stop signal: {e}"
+            )
+
+        def mark_stop(run: dict) -> dict:
+            run["stop_requested_at"] = time.time()
+            current = run.get("current_stage")
+            for stage in run.get("stages") or []:
+                if (
+                    stage.get("name") == current
+                    and stage.get("status") == "running"
+                ):
+                    stage["detail"] = "halt requested"
+            return run
+
+        try:
+            run_state.update_run(run_dir, mark_stop)
+        except FileNotFoundError:
+            pass
+        halt_requested = True
+        pid = active.get("current_pid")
+        proc = None
+        if training_process is not None:
+            try:
+                if pid is None or int(training_process.pid) == int(pid):
+                    proc = training_process
+            except (TypeError, ValueError):
+                proc = None
+        if proc is not None:
+            asyncio.create_task(
+                _escalate_halt(proc, paths["telemetry_file"])
+            )
+        elif pid is not None:
+            try:
+                asyncio.create_task(_escalate_halt_pid(int(pid)))
+            except (TypeError, ValueError):
+                pass
+        return {"status": "stopping", "run_id": run_id}
+
+    # Legacy fallback: no ledger run, keep the pre-run behavior.
     if not _training_running():
         return {"status": "not_running"}
     halt_requested = True
@@ -1024,12 +1661,18 @@ async def websocket_telemetry(websocket: WebSocket):
     try:
         while True:
             # Poll status, telemetry and send to client (1s cadence to save bandwidth)
-            telemetry = read_json_safely(TELEMETRY_FILE, {})
-            benchmarks = _get_benchmark_rows()
-            loss_hist = read_json_safely(LOSS_HISTORY_FILE, [])
+            _refresh_runs()
+            run = _current_run()
+            paths = _run_paths(run)
+            telemetry = read_json_safely(paths["telemetry_file"], {})
+            benchmarks = _get_benchmark_rows(
+                benchmarks_file=paths["benchmarks_file"],
+                preflight_file=_run_preflight_file(run),
+            )
+            loss_hist = read_json_safely(paths["loss_history_file"], [])
 
-            is_running = _training_running()
-            telemetry = _derive_status(telemetry, is_running)
+            is_running = _training_running() or _active_run_process_running()
+            telemetry = _derive_status(telemetry, is_running, run)
             telemetry["process_running"] = is_running
             # WS clients otherwise never get a fresh GPU reading (the trainer
             # only rewrites telemetry on steps); mirror /api/status behavior.
@@ -1039,6 +1682,8 @@ async def websocket_telemetry(websocket: WebSocket):
                 "telemetry": telemetry,
                 "benchmarks": benchmarks,
                 "loss_history": loss_hist[-100:],  # last 100 points for crisp SVG chart
+                "run": run,
+                "steps": _steps_summary(run),
                 "timestamp": time.time()
             }
             await websocket.send_json(payload)

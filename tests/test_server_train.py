@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from src import run_state
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -26,6 +28,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("ASR_ALLOWED_OUTPUT_ROOTS", str(tmp_path))
     monkeypatch.delenv("ASR_COCKPIT_TOKEN", raising=False)
+    monkeypatch.delenv("ASR_RUNS_DIR", raising=False)
+    monkeypatch.delenv("ASR_FAKE_TRAINER", raising=False)
     spec = importlib.util.spec_from_file_location("server_app", ROOT / "server" / "app.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["server_app"] = mod
@@ -34,7 +38,7 @@ def client(tmp_path, monkeypatch):
     launched = []
 
     class _FakeProcess:
-        pid = 999_999
+        pid = os.getpid()
 
         def poll(self):
             return None
@@ -53,6 +57,29 @@ def client(tmp_path, monkeypatch):
 
 def _flags(cmd):
     return dict(zip(cmd[:-1], cmd[1:]))
+
+
+def _run_json(client, run_id):
+    return json.loads(
+        (client.mod.RUNS_DIR / run_id / "run.json").read_text(encoding="utf-8")
+    )
+
+
+def _write_run(client, run_id=None, **fields):
+    """Update the newest run manifest (or *run_id*) and return it."""
+    if run_id is None:
+        runs = sorted(
+            path.name
+            for path in client.mod.RUNS_DIR.iterdir()
+            if (path / "run.json").is_file()
+        )
+        assert runs, "no run manifest to update"
+        run_id = runs[-1]
+    path = client.mod.RUNS_DIR / run_id / "run.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(fields)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data
 
 
 def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
@@ -426,6 +453,131 @@ def test_full_start_rejects_smoke_output_path(client):
     )
     assert res.status_code == 400
     assert client.launched == []
+
+
+def test_start_creates_self_contained_run(client):
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 200, res.text
+    run_id = res.json()["run_id"]
+    run_dir = client.mod.RUNS_DIR / run_id
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "running"
+    assert run["paths"]["results_dir"] == str(run_dir)
+    assert run["paths"]["output_dir"] == str(run_dir / "output")
+    flags = _flags(client.launched[0])
+    assert flags["--run_dir"] == str(run_dir)
+    assert flags["--preflight_cache_dir"] == str(client.mod.RUNS_DIR / "_shared")
+    assert flags["--output_dir"] == str(run_dir / "output")
+    assert flags["--results_dir"] == str(run_dir)
+    assert run["trainer_args"]["epochs"] == 4
+
+
+def test_start_rejects_explicit_results_dir(client):
+    res = client.post(
+        "/api/train/start", json={"results_dir": "/tmp/elsewhere"}
+    )
+    assert res.status_code == 400
+    assert "results_dir" in res.json()["detail"]
+    assert client.launched == []
+
+
+def test_start_uses_fake_trainer_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("ASR_FAKE_TRAINER", "1")
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 200, res.text
+    cmd = client.launched[0]
+    assert Path(cmd[2]).name == "dev_fake_trainer.py"
+    run = _run_json(client, res.json()["run_id"])
+    assert run["source"] == "fake"
+
+
+def test_resume_forces_auto_resume_and_drops_checkpoint(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+
+    def seed_args(run):
+        run["trainer_args"].update({
+            "fresh_start": True,
+            "auto_resume": False,
+            "resume_from_checkpoint": "last",
+        })
+        return run
+
+    run_state.update_run(run_dir, seed_args)
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 200, res.text
+    cmd = client.launched[-1]
+    assert "--auto_resume" in cmd
+    assert "--no-auto_resume" not in cmd
+    assert "--resume_from_checkpoint" not in cmd
+    assert "--fresh_start" not in cmd
+
+
+def test_sanitize_output_dir_allows_custom_runs_root(
+    client, tmp_path, monkeypatch
+):
+    outside_runs = tmp_path.parent / f"{tmp_path.name}-custom-runs"
+    monkeypatch.setattr(client.mod, "RUNS_DIR", outside_runs)
+    target = outside_runs / "20261031-000000-abcdef" / "output"
+    assert client.mod._sanitize_output_dir(str(target)) == str(target.resolve())
+
+
+def test_status_includes_run_and_storage(client):
+    client.post("/api/train/start", json={})
+    body = client.get("/api/status").json()
+    assert body["run"]["run_id"]
+    assert body["active_run_id"] == body["run"]["run_id"]
+    assert body["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
+    assert body["steps"]["count"] == 0
+
+
+def test_resume_reuses_paths_and_appends_attempt(client):
+    start = client.post("/api/train/start", json={}).json()
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 200, res.text
+    run = run_state.load_run(client.mod.RUNS_DIR / start["run_id"])
+    assert len(run["attempts"]) == 2
+    flags = _flags(client.launched[-1])
+    assert flags["--output_dir"] == run["paths"]["output_dir"]
+    assert "--auto_resume" in client.launched[-1]
+
+
+def test_resume_after_training_completed_uses_post_eval_only(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "failed")
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 200, res.text
+    assert "--post_eval_only" in client.launched[-1]
+
+
+def test_resume_rejects_completed_run(client):
+    start = client.post("/api/train/start", json={}).json()
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+    _write_run(
+        client, start["run_id"], status="completed", current_pid=None
+    )
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 400
+    assert "cannot resume" in res.json()["detail"]
+    assert len(client.launched) == 1
+
+
+def test_stop_writes_run_stop_signal(client):
+    start = client.post("/api/train/start", json={}).json()
+    res = client.post("/api/train/stop", json={})
+    assert res.status_code == 200
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    assert (run_dir / "stop_training.signal").exists()
+    assert run_state.load_run(run_dir)["stop_requested_at"] is not None
 
 
 def test_smoke_status_reports_running_after_start(client):
