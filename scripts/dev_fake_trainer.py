@@ -869,6 +869,21 @@ def main(argv: list[str] | None = None) -> int:
     # Post-eval (also the only stage in --post_eval_only mode)
     # ------------------------------------------------------------------
     run_state.set_stage(run_dir, "post_eval", "running", detail="fake benchmark")
+    post_eval_step = start_step if post_eval_only else last_completed_step
+    _write_json(
+        telemetry_path,
+        _telemetry(
+            status="evaluating_benchmark",
+            step=post_eval_step,
+            max_steps=post_eval_step,
+            epoch=epoch,
+            loss=loss,
+            learning_rate=0.0,
+            speed=delay,
+            eta_seconds=0,
+            elapsed_seconds=int(time.time() - started_at),
+        ),
+    )
     log("post-eval started")
     if fail_stage == "post_eval":
         return _fail(

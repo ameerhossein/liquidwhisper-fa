@@ -12,6 +12,9 @@ import os
 import sys
 import argparse
 import json
+import shutil
+import time
+from contextlib import contextmanager, nullcontext
 
 # Must precede any HF tokenizer import: forked datasets.map workers deadlock
 # if the parent created tokenizers with parallelism enabled (see src/data.py).
@@ -363,15 +366,20 @@ def _copy_preflight_to_run(run_dir: Path, cache_dir: Path) -> Path:
     )
 
 
+_DETAIL_UNSET = object()
+
+
 def _mark_run_stage(
     run_dir: Optional[str | Path],
     name: str,
     status: str,
-    detail: Optional[str] = None,
+    detail: Any = _DETAIL_UNSET,
 ) -> Optional[Dict[str, Any]]:
     """Record one stage transition, or no-op for a plain CLI run."""
     if not run_dir:
         return None
+    if detail is _DETAIL_UNSET:
+        return run_state.set_stage(run_dir, name, status)
     return run_state.set_stage(run_dir, name, status, detail=detail)
 
 
@@ -405,7 +413,8 @@ def _halt_run(run_dir, results_dir: str, stage: str) -> None:
         _mark_run_stage(run_dir, later, "skipped")
     # Mark the halted stage last so current_stage points at what was stopped.
     _mark_run_stage(run_dir, stage, "stopped", detail="halt requested")
-    _mark_run_status(run_dir, "stopped")
+    _mark_run_status(run_dir, "stopped", failed_stage=None)
+    _write_telemetry_status(results_dir, "stopped")
     try:
         os.remove(os.path.join(results_dir, "stop_training.signal"))
     except OSError:
@@ -424,6 +433,253 @@ def _run_attempt_number(run_dir: Optional[str | Path]) -> int:
         return int(attempts[-1].get("attempt") or 1)
     except (TypeError, ValueError, AttributeError):
         return 1
+
+
+def _is_cockpit_spawned() -> bool:
+    """True when the server already owns the log/PID files for this process."""
+    return (os.environ.get("ASR_COCKPIT_SPAWNED", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+class _TeeStream:
+    """Write to the original stream and a run log at the same time."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            try:
+                stream.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._streams[0].fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._streams[0], "encoding", "utf-8")
+
+    def __getattr__(self, name):
+        return getattr(self._streams[0], name)
+
+
+@contextmanager
+def _tee_run_log(path: Path):
+    """Mirror stdout/stderr to *path* while keeping console output."""
+    handle = Path(path).open("a", encoding="utf-8", buffering=1)
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = _TeeStream(old_out, handle)
+    sys.stderr = _TeeStream(old_err, handle)
+    try:
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        sys.stdout, sys.stderr = old_out, old_err
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _write_telemetry_status(
+    results_dir: Optional[str | Path],
+    status: str,
+    *,
+    run_dir: Optional[str | Path] = None,
+    **fields: Any,
+) -> None:
+    """Update ``live_telemetry.json`` without discarding existing metrics."""
+    if not results_dir:
+        return
+    path = Path(results_dir) / "live_telemetry.json"
+    payload: dict[str, Any] = {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if isinstance(existing, dict):
+            payload = existing
+    except (OSError, ValueError):
+        payload = {}
+    if run_dir:
+        run = run_state.load_run(run_dir) or {}
+        run_step = int(run.get("last_step") or 0)
+        if payload.get("step") in (None, 0) and run_step:
+            payload["step"] = run_step
+        if payload.get("max_steps") in (None, 0) and run_step:
+            payload["max_steps"] = run_step
+    payload.update(fields)
+    payload["status"] = status
+    payload["updated_at"] = time.time()
+    try:
+        _write_json_atomic(path, payload)
+    except Exception as exc:
+        print(f"Warning: failed to write telemetry status {status}: {exc}")
+
+
+def _cli_run_config(args) -> dict:
+    keys = (
+        "base_model",
+        "dataset_name",
+        "epochs",
+        "batch_size",
+        "grad_accum",
+        "learning_rate",
+        "eval_steps",
+        "save_steps",
+        "max_benchmark_samples",
+        "preflight_samples",
+        "num_proc",
+        "telephony_prob",
+        "gradient_checkpointing",
+        "fresh_start",
+        "auto_resume",
+        "output_dir",
+        "results_dir",
+    )
+    return {key: _json_safe(getattr(args, key, None)) for key in keys}
+
+
+def _ensure_cli_run(run_dir: Path, args) -> dict:
+    """Create the ledger for a CLI ``--run_dir`` when it does not exist yet."""
+    import time as _time
+
+    run = run_state.load_run(run_dir)
+    if run is not None:
+        return run
+    output_dir = Path(args.output_dir).resolve()
+    results_dir = Path(args.results_dir).resolve()
+    raw_cache = getattr(args, "preflight_cache_dir", None)
+    cache_dir = Path(raw_cache).resolve() if raw_cache else results_dir
+    paths = {
+        "run_dir": str(run_dir),
+        "output_dir": str(output_dir),
+        "results_dir": str(results_dir),
+        "merged_dir": str(run_dir / "merged"),
+        "preflight_cache": str(cache_dir / "baselines" / "preflight.json"),
+    }
+    trainer_args = {str(key): _json_safe(value) for key, value in vars(args).items()}
+    config = _cli_run_config(args)
+    kwargs = dict(
+        config=config,
+        trainer_args=trainer_args,
+        paths=paths,
+        source="cli",
+    )
+    if run_state.run_id_valid(run_dir.name):
+        return run_state.create_run(run_dir.parent, run_id=run_dir.name, **kwargs)
+
+    # Manual CLI runs may use a non-canonical directory name. Create a
+    # canonical ledger, move it into place, and repoint the manifest.
+    temporary_id = run_state.new_run_id(now=_time.time())
+    run_state.create_run(run_dir.parent, run_id=temporary_id, **kwargs)
+    generated = run_dir.parent / temporary_id
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generated, run_dir, dirs_exist_ok=True)
+    finally:
+        shutil.rmtree(generated, ignore_errors=True)
+
+    def repoint(current: dict) -> dict:
+        current["run_id"] = run_dir.name
+        current["paths"] = {**(current.get("paths") or {}), **paths}
+        return current
+
+    return run_state.update_run(run_dir, repoint)
+
+
+def _ensure_cli_attempt(run_dir: Path, run: dict) -> None:
+    """Record this process as an attempt unless the server already did."""
+    pid = os.getpid()
+    attempts = (run or {}).get("attempts") or []
+    open_attempts = [item for item in attempts if item.get("ended_at") is None]
+    if open_attempts:
+        try:
+            same_pid = int(open_attempts[-1].get("pid") or 0) == pid
+        except (TypeError, ValueError):
+            same_pid = False
+        if same_pid:
+            if int((run or {}).get("current_pid") or 0) != pid:
+                run_state.update_run(
+                    run_dir,
+                    lambda current: {**current, "current_pid": pid},
+                )
+            return
+        # A dead earlier attempt must not stay open forever.
+        run_state.finalize_attempt(
+            run_dir, exit_code=None, reason="process_lost"
+        )
+    run_state.start_attempt(
+        run_dir, pid, reason="initial" if not attempts else "resume"
+    )
+
+
+def _write_cli_pid(run_dir: Path) -> None:
+    try:
+        (run_dir / "training.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: could not write {run_dir / 'training.pid'}: {exc}")
+
+
+def _finalize_cli_run(run_dir: Path, exit_code: int) -> None:
+    """Close the CLI attempt and remove its PID file on every exit path."""
+    try:
+        run = run_state.load_run(run_dir)
+        if run is not None:
+            if run.get("stop_requested_at") or run.get("status") == "stopped":
+                reason = "halted"
+            elif exit_code == 0:
+                reason = "completed"
+            else:
+                reason = "nonzero_exit"
+            run_state.finalize_attempt(
+                run_dir, exit_code=exit_code, reason=reason
+            )
+    except Exception as exc:
+        print(f"Warning: could not finalize run attempt: {exc}", file=sys.stderr)
+    try:
+        (run_dir / "training.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _clear_previous_state(output_dir: str, results_dir: Optional[str] = None) -> None:
@@ -589,6 +845,42 @@ def _is_halt_requested(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and str(exc) == "halt requested"
 
 
+def _run_post_eval_stage(
+    *,
+    run_dir: Optional[str | Path],
+    results_dir: Optional[str | Path],
+    evaluate: Callable[[], None],
+    detail: Optional[str] = None,
+) -> bool:
+    """Run one post-eval attempt, converting a halt into a stopped run.
+
+    Returns ``True`` on success and ``False`` when the user halted. The
+    post-eval stage is an active telemetry status from start to finish so the
+    cockpit never reports a completed run while evaluation is still running.
+    """
+    _mark_run_stage(run_dir, "post_eval", "running", detail=detail)
+    _write_telemetry_status(
+        results_dir, "evaluating_benchmark", run_dir=run_dir
+    )
+    try:
+        evaluate()
+    except Exception as exc:
+        if _is_halt_requested(exc):
+            print("Stop signal received during post-eval; halting run.")
+            _halt_run(run_dir, results_dir, "post_eval")
+            return False
+        _mark_run_stage(
+            run_dir, "post_eval", "failed", detail=f"post-eval failed: {exc}"
+        )
+        _mark_run_status(
+            run_dir, "failed", failed_stage="post_eval", last_error=str(exc)
+        )
+        _write_telemetry_status(results_dir, "failed")
+        raise
+    _mark_run_stage(run_dir, "post_eval", "completed", detail=None)
+    return True
+
+
 def _run_post_eval_only(args) -> None:
     """Run only the full-test report from an existing ``best_adapter``.
 
@@ -615,11 +907,12 @@ def _run_post_eval_only(args) -> None:
         _mark_run_status(
             run_dir, "failed", failed_stage="post_eval", last_error=message
         )
+        _write_telemetry_status(results_dir, "failed")
         raise SystemExit(message)
 
     _mark_run_status(run_dir, "running")
-    _mark_run_stage(run_dir, "post_eval", "running", detail="post-eval only")
-    try:
+
+    def evaluate() -> None:
         print(f"Post-eval-only: loading processor from {adapter_path}...")
         processor = WhisperProcessor.from_pretrained(str(adapter_path))
         normalizer = PersianTextNormalizer()
@@ -663,32 +956,80 @@ def _run_post_eval_only(args) -> None:
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
             should_stop=lambda: os.path.exists(stop_signal),
         )
-    except Exception as exc:
-        if _is_halt_requested(exc):
-            print("Stop signal received during post-eval; halting run.")
-            _halt_run(run_dir, results_dir, "post_eval")
-            return
-        _mark_run_stage(
-            run_dir, "post_eval", "failed", detail=f"post-eval failed: {exc}"
-        )
-        _mark_run_status(
-            run_dir, "failed", failed_stage="post_eval", last_error=str(exc)
-        )
-        raise
-    _mark_run_stage(run_dir, "post_eval", "completed")
+
+    if not _run_post_eval_stage(
+        run_dir=run_dir,
+        results_dir=results_dir,
+        evaluate=evaluate,
+        detail="post-eval only",
+    ):
+        return
     _mark_run_status(
         run_dir, "completed", failed_stage=None, last_error=None
     )
+    _write_telemetry_status(results_dir, "completed")
 
 
 def main():
     args = parse_args()
-    args.telephony_profiles = _parse_telephony_profiles(getattr(args, "telephony_profiles", "customer"))
+    args.telephony_profiles = _parse_telephony_profiles(
+        getattr(args, "telephony_profiles", "customer")
+    )
+    explicit_results = getattr(args, "results_dir", None) not in (None, "")
+    run_dir = (
+        Path(args.run_dir).expanduser().resolve()
+        if getattr(args, "run_dir", None)
+        else None
+    )
+    if run_dir is not None:
+        # A CLI ledger run is self-contained: telemetry/benchmarks and the
+        # default output live under the run unless explicitly overridden.
+        if not explicit_results:
+            args.results_dir = str(run_dir)
+        if str(args.output_dir).strip() == _default_output_dir():
+            args.output_dir = str(run_dir / "output")
     args.output_dir = _resolve_output_dir(args.output_dir)
     args.results_dir = _resolve_results_dir(getattr(args, "results_dir", None))
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
 
+    if run_dir is not None and not bool(getattr(args, "post_eval_only", False)):
+        if bool(getattr(args, "fresh_start", False)):
+            _clear_previous_state(args.output_dir, results_dir=args.results_dir)
+
+    if run_dir is not None:
+        run = _ensure_cli_run(run_dir, args)
+        # Persist the full effective namespace before any stage work so Resume
+        # can recreate the exact LoRA/scheduler/telephony settings.
+        _record_trainer_args(run_dir, args)
+        _mark_run_status(run_dir, "running")
+        # The server records the attempt before spawning its child; a standalone
+        # CLI invocation owns its own attempt and PID file.
+        if not _is_cockpit_spawned():
+            _ensure_cli_attempt(run_dir, run)
+        _write_cli_pid(run_dir)
+
+    exit_code = 0
+    tee = (
+        _tee_run_log(run_dir / "training_live.log")
+        if run_dir is not None and not _is_cockpit_spawned()
+        else nullcontext()
+    )
+    try:
+        with tee:
+            _run_training(args, run_dir)
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        if run_dir is not None:
+            _finalize_cli_run(run_dir, exit_code)
+
+
+def _run_training(args, run_dir):
     # Post-eval-only resume: never repeat dataset prep, preflight, or training,
     # and never replay optimizer steps.
     if bool(getattr(args, "post_eval_only", False)):
@@ -696,16 +1037,6 @@ def main():
             print("Note: --fresh_start is ignored with --post_eval_only.")
         _run_post_eval_only(args)
         return
-
-    if bool(getattr(args, "fresh_start", False)):
-        _clear_previous_state(args.output_dir, results_dir=args.results_dir)
-
-    run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
-    if run_dir is not None:
-        # Persist the full effective namespace before any stage work so Resume
-        # can recreate the exact LoRA/scheduler/telephony settings.
-        _record_trainer_args(run_dir, args)
-        _mark_run_status(run_dir, "running")
 
     stop_signal = os.path.join(args.results_dir, "stop_training.signal")
     if os.path.exists(stop_signal):
@@ -1065,7 +1396,7 @@ def main():
         print("\nTraining halted by user request; skipping post-training evaluation.")
         _halt_run(run_dir, args.results_dir, "training")
     else:
-        _mark_run_stage(run_dir, "training", "completed")
+        _mark_run_stage(run_dir, "training", "completed", detail=None)
 
     # 10. Save Best Adapter & Processor
     best_save_path = os.path.join(args.output_dir, "best_adapter")
@@ -1082,8 +1413,8 @@ def main():
         print("\n=======================================================")
         print(" Running Post-Training Full Benchmark on Complete Test Set...")
         print("=======================================================")
-        _mark_run_stage(run_dir, "post_eval", "running")
-        try:
+
+        def evaluate() -> None:
             _run_post_training_evaluation(
                 model=trainer.model,
                 processor=processor,
@@ -1098,26 +1429,25 @@ def main():
                 phone_benchmark=bool(getattr(args, "phone_benchmark", True)),
                 phone_seed=int(getattr(args, "phone_seed", 1234) or 1234),
                 telephony_profiles=args.telephony_profiles,
-                telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
+                telephony_use_ffmpeg=bool(args.telephony_use_ffmpeg),
                 should_stop=lambda: os.path.exists(stop_signal),
             )
-        except Exception as exc:
-            if _is_halt_requested(exc):
-                print("\nStop signal received during post-eval; halting run.")
-                _halt_run(run_dir, args.results_dir, "post_eval")
-                return
-            _mark_run_stage(run_dir, "post_eval", "failed",
-                            detail=f"post-eval failed: {exc}")
-            _mark_run_status(run_dir, "failed", failed_stage="post_eval",
-                             last_error=str(exc))
-            raise
-        _mark_run_stage(run_dir, "post_eval", "completed")
+
+        if not _run_post_eval_stage(
+            run_dir=run_dir,
+            results_dir=args.results_dir,
+            evaluate=evaluate,
+        ):
+            return
     else:
-        _mark_run_stage(run_dir, "post_eval", "skipped")
+        _mark_run_stage(run_dir, "post_eval", "skipped", detail=None)
 
     # Overall completion requires training completed and post-eval
     # completed/skipped; merge is tracked separately and never blocks this.
-    _mark_run_status(run_dir, "completed")
+    _mark_run_status(
+        run_dir, "completed", failed_stage=None, last_error=None
+    )
+    _write_telemetry_status(args.results_dir, "completed")
 
 
 def _format_delta(value: Optional[float]) -> str:
@@ -1361,6 +1691,9 @@ def _run_post_training_evaluation(
             }
         except Exception as e:
             print(f"[Final Report] Phone pass failed ({e}); report will be clean-only.")
+
+    # A halt can arrive during the phone pass; never write a report after it.
+    _check_halt()
 
     # 3. Read epoch benchmark history & trainer logs
     epoch_benchmarks = []

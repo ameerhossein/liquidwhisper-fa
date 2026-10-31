@@ -124,7 +124,7 @@ SMOKE_DIR_NAME = "smoke-test"
 smoke_process: Optional[subprocess.Popen] = None
 smoke_log_fd = None
 smoke_last_exit_code: Optional[int] = None
-ACTIVE_STATUSES = ("initializing", "training", "evaluating_benchmark")
+ACTIVE_STATUSES = ("initializing", "training", "evaluating", "evaluating_benchmark")
 HALT_GRACE_SECONDS = int(os.environ.get("ASR_HALT_GRACE_SECONDS", "900") or 900)
 MONITOR_INTERVAL_SECONDS = 2.0
 
@@ -190,23 +190,44 @@ def _is_process_running(pid: Optional[int] = None) -> bool:
 
 
 def _terminate_child(pid: Optional[int]) -> None:
-    """Terminate a spawned child's process group, never our own group."""
+    """Terminate a spawned child without ever signalling our own group.
+
+    A stale/reused PID must not take the cockpit down: refuse the whole-process
+    group when it is the server's own, and fall back to a direct signal when the
+    target is not a group leader.
+    """
     try:
         pid_i = int(pid) if pid is not None else None
     except (TypeError, ValueError):
         pid_i = None
     if pid_i is None or pid_i == os.getpid():
         return
-    try:
-        if sys.platform != "win32":
-            os.killpg(os.getpgid(pid_i), signal.SIGTERM)
-        else:
-            os.kill(pid_i, signal.SIGTERM)
-    except Exception:
+    if sys.platform == "win32":
         try:
             os.kill(pid_i, signal.SIGTERM)
         except Exception:
             pass
+        return
+    try:
+        target_pgid = os.getpgid(pid_i)
+        own_pgid = os.getpgid(0)
+    except Exception:
+        target_pgid = None
+        own_pgid = None
+    if target_pgid is not None and own_pgid is not None:
+        if target_pgid == own_pgid:
+            # Never killpg the server's own process group.
+            return
+        if target_pgid == pid_i:
+            try:
+                os.killpg(target_pgid, signal.SIGTERM)
+                return
+            except Exception:
+                pass
+    try:
+        os.kill(pid_i, signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def _check_auth(config: Optional[Dict[str, Any]]) -> None:
@@ -271,9 +292,11 @@ def _unlink_quietly(path: Path) -> None:
 def _reconcile_training_exit(exit_code: Optional[int]) -> None:
     """Apply the observed child exit (or a dead PID) to the run ledger.
 
-    ``run_state.reconcile`` owns the classification: a requested halt wins,
-    a known exit code distinguishes failed/completed, and ``None`` means the
-    process was lost (interrupted) when no terminal writer ran.
+    ``run_state.reconcile`` owns the status classification: a requested halt
+    wins, a known exit code distinguishes failed/completed, and ``None`` means
+    the process was lost (interrupted) when no terminal writer ran.  The
+    attempt is finalized even when the trainer already wrote a terminal status,
+    so a graceful exit never leaves ``current_pid`` behind for PID reuse.
     """
     global training_run_id
     run = _run_for_training_exit()
@@ -283,6 +306,11 @@ def _reconcile_training_exit(exit_code: Optional[int]) -> None:
             run_state.reconcile(
                 _run_dir(run),
                 pid_alive=False,
+                exit_code=exit_code,
+                reason="process_exit" if exit_code is not None else None,
+            )
+            run_state.finalize_attempt(
+                _run_dir(run),
                 exit_code=exit_code,
                 reason="process_exit" if exit_code is not None else None,
             )
@@ -427,6 +455,27 @@ def _active_run() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _run_pid(run: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The run's trainer PID, falling back to ``<run>/training.pid``.
+
+    CLI runs and older attempts may have no ``current_pid`` in the manifest.
+    """
+    if not run:
+        return None
+    try:
+        pid = int(run.get("current_pid"))
+        if pid > 0:
+            return pid
+    except (TypeError, ValueError):
+        pass
+    try:
+        pid_file = _run_paths(run)["pid_file"]
+        pid = int(pid_file.read_text(encoding="utf-8").strip() or "0")
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
 def _active_run_process_running() -> bool:
     """True when a run recovered from the ledger owns a live PID.
 
@@ -436,11 +485,11 @@ def _active_run_process_running() -> bool:
     """
     if training_process is not None or last_exit_code is not None:
         return False
-    try:
-        pid = int((_active_run() or {}).get("current_pid"))
-    except (TypeError, ValueError):
+    run = _active_run()
+    if run is None or str(run.get("status") or "") not in ("starting", "running"):
         return False
-    return _is_process_running(pid)
+    pid = _run_pid(run)
+    return pid is not None and _is_process_running(pid)
 
 
 def _steps_summary(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -479,13 +528,10 @@ def _run_adapter_exists(run: Optional[Dict[str, Any]]) -> bool:
 
 
 def _run_process_running(run: Optional[Dict[str, Any]]) -> bool:
-    if not run:
+    if not run or str(run.get("status") or "") not in ("starting", "running"):
         return False
-    try:
-        pid = int(run.get("current_pid"))
-    except (TypeError, ValueError):
-        return False
-    return _is_process_running(pid)
+    pid = _run_pid(run)
+    return pid is not None and _is_process_running(pid)
 
 
 def _run_payload(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -493,9 +539,9 @@ def _run_payload(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not run:
         return {
             "run": None,
-            "telemetry": {},
-            "benchmarks": [],
-            "loss_history": [],
+            "telemetry": read_json_safely(TELEMETRY_FILE, {}),
+            "benchmarks": _get_benchmark_rows(),
+            "loss_history": read_json_safely(LOSS_HISTORY_FILE, []),
             "steps": _steps_summary(None),
             "storage": run_state.storage_info(RUNS_DIR),
             "process_running": False,
@@ -944,8 +990,25 @@ def _derive_status(
         status = telemetry.get("status") or "idle"
         run_status = str(run.get("status") or "")
         if run_status in ("starting", "running"):
-            if status in ("idle", "running"):
+            stages = {
+                str(stage.get("name")): str(stage.get("status") or "pending")
+                for stage in run.get("stages") or []
+            }
+            post_eval_running = stages.get("post_eval") == "running"
+            training_running = stages.get("training") == "running"
+            if post_eval_running or status in ("evaluating", "evaluating_benchmark"):
+                status = "evaluating_benchmark"
+            elif status in ("idle", "running"):
                 status = "training"
+            elif status in ("completed", "stopped"):
+                # A terminal telemetry snapshot must never mask a live run:
+                # on_train_end writes before post-eval starts.
+                if training_running:
+                    status = "training"
+                elif stages.get("training") == "completed":
+                    status = "evaluating_benchmark"
+                else:
+                    status = "training"
             if run.get("stop_requested_at") and status in ACTIVE_STATUSES:
                 status = "stopping"
         elif run_status in ("completed", "stopped", "failed", "interrupted"):
@@ -1707,6 +1770,7 @@ def _spawn_trainer(
             stdout=training_log_fd,
             stderr=subprocess.STDOUT,
             cwd=str(BASE_DIR),
+            env={**os.environ, "ASR_COCKPIT_SPAWNED": "1"},
             preexec_fn=os.setsid if sys.platform != "win32" else None
         )
     except Exception as e:
@@ -1765,6 +1829,12 @@ def _spawn_trainer(
     }
 
 
+def _shared_preflight_cache_dir() -> Path:
+    """Shared preflight cache root; fake runs never touch the real cache."""
+    name = "_shared-fake" if _fake_trainer_enabled() else "_shared"
+    return RUNS_DIR / name
+
+
 def _preflight_cache_dir_for_paths(paths: Dict[str, Any]) -> Path:
     raw = (paths or {}).get("preflight_cache")
     if raw:
@@ -1772,7 +1842,7 @@ def _preflight_cache_dir_for_paths(paths: Dict[str, Any]) -> Path:
         if p.name == "preflight.json":
             return p.parent.parent
         return p
-    return RUNS_DIR / "_shared"
+    return _shared_preflight_cache_dir()
 
 
 def _run_preflight_file(run: Optional[Dict[str, Any]]) -> Path:
@@ -1822,7 +1892,7 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
     if smoke_output is not None and _abs_output_path(output_dir).resolve() == smoke_output:
         raise HTTPException(status_code=400, detail="output_dir must not be the smoke-test directory.")
 
-    preflight_cache_dir = RUNS_DIR / "_shared"
+    preflight_cache_dir = _shared_preflight_cache_dir()
     preflight_cache_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "run_dir": str(run_dir),
@@ -2233,7 +2303,10 @@ async def list_runs(limit: int = 20):
         capped = 20
     capped = min(capped, 200)
     runs = summary.get("runs") or []
-    return {"runs": [_run_summary(run) for run in runs[:capped]]}
+    return {
+        "runs": [_run_summary(run) for run in runs[:capped]],
+        "storage": run_state.storage_info(RUNS_DIR),
+    }
 
 
 @app.get("/api/runs/latest")
@@ -2304,16 +2377,60 @@ async def merge_run(run_id: str, config: Dict[str, Any] = None):
     return _start_merge(run_id)
 
 
+def _escalation_run(run_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if run_dir is None:
+        return None
+    try:
+        return run_state.load_run(run_dir)
+    except Exception:
+        return None
+
+
+def _run_is_terminal(run: Optional[Dict[str, Any]]) -> bool:
+    return bool(run) and str(run.get("status") or "") in (
+        "completed",
+        "stopped",
+        "failed",
+        "interrupted",
+    )
+
+
+def _halt_target_finished(
+    telemetry_file: Optional[Path],
+    run: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when the halt target already finished.
+
+    A ledger run decides from its own stage/status: telemetry ``completed`` is
+    written before post-eval, so it must not end the grace escalation while the
+    run is still active. Only the legacy (no-ledger) path trusts telemetry.
+    """
+    if run is not None:
+        return _run_is_terminal(run)
+    telemetry_path = Path(telemetry_file) if telemetry_file is not None else TELEMETRY_FILE
+    return read_json_safely(telemetry_path, {}).get("status") in (
+        "stopped",
+        "completed",
+    )
+
+
 async def _escalate_halt(
     proc: subprocess.Popen,
     telemetry_file: Optional[Path] = None,
+    run_dir: Optional[Path] = None,
 ) -> None:
     """Wait for the trainer to checkpoint and exit; SIGTERM only after the grace period."""
     deadline = time.time() + HALT_GRACE_SECONDS
-    telemetry_path = Path(telemetry_file) if telemetry_file is not None else TELEMETRY_FILE
     while proc.poll() is None:
         if time.time() >= deadline:
-            if read_json_safely(telemetry_path, {}).get("status") in ("stopped", "completed"):
+            run = _escalation_run(run_dir)
+            if run is not None:
+                if _run_is_terminal(run):
+                    return
+                current_pid = _run_pid(run)
+                if current_pid is not None and int(current_pid) != int(proc.pid):
+                    return
+            elif _halt_target_finished(telemetry_file):
                 return
             if sys.platform == "win32":
                 try:
@@ -2329,13 +2446,23 @@ async def _escalate_halt(
 async def _escalate_halt_pid(
     pid: int,
     telemetry_file: Optional[Path] = None,
+    run_dir: Optional[Path] = None,
 ) -> None:
     """Escalate against a run PID recovered from the ledger after a restart."""
     deadline = time.time() + HALT_GRACE_SECONDS
-    telemetry_path = Path(telemetry_file) if telemetry_file is not None else TELEMETRY_FILE
     while _is_process_running(pid):
         if time.time() >= deadline:
-            if read_json_safely(telemetry_path, {}).get("status") in ("stopped", "completed"):
+            run = _escalation_run(run_dir)
+            if run is not None:
+                if _run_is_terminal(run):
+                    return
+                current_pid = _run_pid(run)
+                if current_pid is None or int(current_pid) != int(pid):
+                    # The run no longer owns this PID; do not signal a reuse.
+                    return
+                if str(run.get("status") or "") not in ("starting", "running"):
+                    return
+            elif _halt_target_finished(telemetry_file):
                 return
             _terminate_child(pid)
             return
@@ -2377,7 +2504,7 @@ async def stop_training(payload: Dict[str, Any] = None):
         except FileNotFoundError:
             pass
         halt_requested = True
-        pid = active.get("current_pid")
+        pid = _run_pid(active)
         proc = None
         if training_process is not None:
             try:
@@ -2387,12 +2514,14 @@ async def stop_training(payload: Dict[str, Any] = None):
                 proc = None
         if proc is not None:
             asyncio.create_task(
-                _escalate_halt(proc, paths["telemetry_file"])
+                _escalate_halt(proc, paths["telemetry_file"], run_dir)
             )
         elif pid is not None:
             try:
                 asyncio.create_task(
-                    _escalate_halt_pid(int(pid), paths["telemetry_file"])
+                    _escalate_halt_pid(
+                        int(pid), paths["telemetry_file"], run_dir
+                    )
                 )
             except (TypeError, ValueError):
                 pass

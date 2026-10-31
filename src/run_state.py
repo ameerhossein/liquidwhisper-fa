@@ -68,6 +68,7 @@ _ACTIVE_RUN_STATUSES = frozenset(("starting", "running"))
 
 _RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 _STARTING_GRACE_SECONDS = 15.0
+_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +114,25 @@ def _as_pid(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return pid if pid > 0 else None
+
+
+def _pid_file_pid(run_dir: str | Path) -> int | None:
+    """Read ``<run_dir>/training.pid`` when a manifest has no ``current_pid``."""
+    try:
+        text = (Path(run_dir) / "training.pid").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return None
+    return _as_pid(text)
+
+
+def _run_training_pid(run_dir: str | Path, run: dict) -> int | None:
+    """The PID owning *run*: manifest ``current_pid`` or the run PID file."""
+    pid = _as_pid(run.get("current_pid"))
+    if pid is not None:
+        return pid
+    return _pid_file_pid(run_dir)
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -345,10 +365,14 @@ def set_stage(
     run_dir: str | Path,
     name: str,
     status: str,
-    detail: str | None = None,
+    detail: Any = _UNSET,
     **fields: Any,
 ) -> dict:
-    """Update one pipeline stage and append a ``stage`` event."""
+    """Update one pipeline stage and append a ``stage`` event.
+
+    Omit *detail* to leave the existing detail untouched, or pass ``None`` to
+    clear stale failure text when a resumed stage finishes successfully.
+    """
     if name not in STAGES:
         raise ValueError(f"invalid stage name: {name!r}")
     if status not in STAGE_STATUSES:
@@ -362,8 +386,11 @@ def set_stage(
             stages.append(stage)
 
         stage["status"] = status
-        if detail is not None:
-            stage["detail"] = detail
+        if detail is not _UNSET:
+            if detail is None:
+                stage.pop("detail", None)
+            else:
+                stage["detail"] = detail
         for key, value in fields.items():
             stage[key] = value
 
@@ -381,7 +408,7 @@ def set_stage(
 
     run = update_run(run_dir, mutate)
     event: dict[str, Any] = {"type": "stage", "stage": name, "status": status}
-    if detail is not None:
+    if detail is not _UNSET and detail is not None:
         event["detail"] = detail
     event.update(fields)
     append_event(run_dir, event)
@@ -488,6 +515,28 @@ def _finish_open_attempt(run: dict, exit_code: int | None, reason: str) -> None:
             break
 
 
+def _attempt_reason(
+    run: dict,
+    exit_code: int | None,
+    requested: str | None = None,
+) -> str:
+    """Classify why an attempt ended.
+
+    A user halt always wins. Otherwise a known exit code is authoritative;
+    *requested* only labels an attempt with no observable exit (for example a
+    process-lost scan or a caller-supplied classification).
+    """
+    if run.get("stop_requested_at") or run.get("status") == "stopped":
+        return "halted"
+    if requested == "halted":
+        return "halted"
+    if exit_code == 0:
+        return "completed"
+    if exit_code is not None:
+        return "nonzero_exit"
+    return requested or "process_lost"
+
+
 def start_attempt(
     run_dir: str | Path,
     pid: int,
@@ -528,6 +577,29 @@ def finish_attempt(
 
     def mutate(run: dict) -> dict:
         _finish_open_attempt(run, exit_code, reason)
+        run["current_pid"] = None
+        return run
+
+    return update_run(run_dir, mutate)
+
+
+def finalize_attempt(
+    run_dir: str | Path,
+    *,
+    exit_code: int | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Close the open attempt without changing a terminal run status.
+
+    The server calls this after observing a child exit even when the trainer
+    already wrote ``completed``/``stopped``/``failed``.  A requested halt always
+    wins; otherwise the exit code maps to ``completed``/``nonzero_exit`` and an
+    unobserved exit becomes ``process_lost``.
+    """
+
+    def mutate(run: dict) -> dict:
+        final_reason = _attempt_reason(run, exit_code, reason)
+        _finish_open_attempt(run, exit_code, final_reason)
         run["current_pid"] = None
         return run
 
@@ -595,7 +667,6 @@ def _reconcile_run(
     stop_requested = bool(run.get("stop_requested_at"))
     if stop_requested:
         new_status = "stopped"
-        attempt_reason = "halted"
         if running_stage is not None:
             running_stage["status"] = "stopped"
             running_stage["ended_at"] = now
@@ -609,11 +680,9 @@ def _reconcile_run(
             "skipped",
         ):
             new_status = "completed"
-            attempt_reason = "completed"
         else:
             new_status = "failed"
             failed_stage = "post_eval" if training_status == "completed" else "training"
-            attempt_reason = "exit_zero"
             _mark_stage(stages, failed_stage, "failed", now)
     elif exit_code is not None:
         new_status = "failed"
@@ -621,11 +690,9 @@ def _reconcile_run(
             failed_stage = str(running_stage.get("name") or "training")
         else:
             failed_stage = "training"
-        attempt_reason = "nonzero_exit"
         _mark_stage(stages, failed_stage, "failed", now)
     else:
         new_status = "interrupted"
-        attempt_reason = "process_lost"
         if running_stage is not None:
             running_stage["status"] = "interrupted"
             running_stage["ended_at"] = now
@@ -634,7 +701,7 @@ def _reconcile_run(
     run["failed_stage"] = failed_stage
     run["ended_at"] = now
     run["current_pid"] = None
-    final_reason = "halted" if stop_requested else (reason or attempt_reason)
+    final_reason = _attempt_reason(run, exit_code, reason)
     _finish_open_attempt(run, exit_code, final_reason)
     return run
 
@@ -692,10 +759,13 @@ def reconcile_all(
 
     active_index: int | None = None
     merge_index: int | None = None
-    for index, (_run_dir, run) in enumerate(entries):
-        pid = _as_pid(run.get("current_pid"))
-        if active_index is None and pid is not None and alive(pid):
-            active_index = index
+    for index, (run_dir, run) in enumerate(entries):
+        # Only a starting/running run can be active. A terminal run may keep a
+        # stale current_pid; that PID can be reused by an unrelated process.
+        if run.get("status") in _ACTIVE_RUN_STATUSES:
+            pid = _run_training_pid(run_dir, run)
+            if active_index is None and pid is not None and alive(pid):
+                active_index = index
         merge_pid = _as_pid(run.get("merge_pid"))
         if merge_index is None and merge_pid is not None and alive(merge_pid):
             merge_index = index
@@ -703,7 +773,7 @@ def reconcile_all(
     refreshed: list[dict] = []
     for run_dir, run in entries:
         if run.get("status") in _ACTIVE_RUN_STATUSES:
-            pid = _as_pid(run.get("current_pid"))
+            pid = _run_training_pid(run_dir, run)
             if pid is None or not alive(pid):
                 try:
                     run = reconcile(run_dir, pid_alive=False, exit_code=None)

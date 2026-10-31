@@ -208,3 +208,23 @@ def test_on_step_end_consumes_stop_signal_and_records_halted_step(tmp_path):
     assert not (tmp_path / "stop_training.signal").exists()
     # The step that consumed the halt still finished and gets its record.
     assert [record["step"] for record in _records(tmp_path)] == [7]
+
+
+def test_on_train_end_does_not_claim_run_completed(tmp_path):
+    cb = _callback(tmp_path)
+    args, control = _args_control()
+
+    cb.on_train_end(args, _state(10, max_steps=10), control)
+
+    telemetry = json.loads(
+        (Path(tmp_path) / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    # Post-eval may still be ahead; only the main script may mark completion.
+    assert telemetry["status"] == "training"
+
+    cb.halt_requested = True
+    cb.on_train_end(args, _state(10, max_steps=10), control)
+    telemetry = json.loads(
+        (Path(tmp_path) / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "stopped"

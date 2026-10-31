@@ -650,8 +650,11 @@ class WebTelemetryCallback(TrainerCallback):
         # Final progress flush: every 100-step update is best-effort, so the
         # last partial interval must not be lost.
         self._set_run_progress(step=state.global_step, last_step_at=time.time())
+        # Training is not the run's end: the main script may still run post-eval.
+        # Writing "completed" here made the cockpit claim success while a
+        # post-eval pass was still running (and defeated halt escalation).
         self._write_telemetry({
-            "status": "stopped" if self.halt_requested else "completed",
+            "status": "stopped" if self.halt_requested else "training",
             "step": state.global_step,
             "max_steps": state.max_steps,
             "epoch": round(state.epoch or 0.0, 2),
@@ -659,4 +662,4 @@ class WebTelemetryCallback(TrainerCallback):
             "gpu": self._get_gpu_stats(),
             "updated_at": time.time()
         })
-        print("\n[TelemetryCallback] Training complete. Web telemetry finalized.")
+        print("\n[TelemetryCallback] Training loop finished. Web telemetry updated.")

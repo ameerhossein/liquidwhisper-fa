@@ -1,6 +1,7 @@
 """Offline tests for trainer run-ledger stages and preflight plumbing."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -190,6 +191,64 @@ def test_main_halts_before_data_prep_when_signal_exists(tmp_path, monkeypatch):
     assert stages["post_eval"]["status"] == "skipped"
     assert stages["merge"]["status"] == "skipped"
     assert not (run_dir / "stop_training.signal").exists()
+    assert run["current_pid"] is None
+    assert run["attempts"][-1]["reason"] == "halted"
+
+
+def test_main_cli_run_dir_is_self_contained_and_finalizes(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / RUN_ID
+    args = SimpleNamespace(
+        run_dir=str(run_dir),
+        output_dir=train_lora._default_output_dir(),
+        results_dir=None,
+        fresh_start=False,
+        post_eval_only=False,
+        telephony_profiles="customer",
+    )
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    observed = {}
+
+    def fake_run(parsed, current_run_dir):
+        run = run_state.load_run(current_run_dir)
+        observed["results_dir"] = parsed.results_dir
+        observed["output_dir"] = parsed.output_dir
+        observed["run_dir"] = str(current_run_dir)
+        observed["current_pid"] = run["current_pid"]
+        observed["attempts"] = list(run["attempts"])
+        observed["pid_file"] = (
+            Path(current_run_dir) / "training.pid"
+        ).read_text(encoding="utf-8")
+        # The run-scoped results directory is what the callback writes into.
+        run_state.append_step(current_run_dir, {"step": 1, "loss": 0.5})
+        run_state.set_status(
+            current_run_dir, "completed", failed_stage=None, last_error=None
+        )
+
+    monkeypatch.setattr(train_lora, "_run_training", fake_run)
+
+    train_lora.main()
+
+    expected_run = run_dir.resolve()
+    assert observed["run_dir"] == str(expected_run)
+    assert observed["results_dir"] == str(expected_run)
+    assert observed["output_dir"] == str(expected_run / "output")
+    assert observed["current_pid"] == os.getpid()
+    assert observed["pid_file"] == str(os.getpid())
+    assert len(observed["attempts"]) == 1
+    assert observed["attempts"][0]["pid"] == os.getpid()
+
+    run = run_state.load_run(expected_run)
+    assert run["source"] == "cli"
+    assert run["status"] == "completed"
+    assert run["paths"]["results_dir"] == str(expected_run)
+    assert run["paths"]["output_dir"] == str(expected_run / "output")
+    assert run["current_pid"] is None
+    assert run["attempts"][-1]["ended_at"] is not None
+    assert run["attempts"][-1]["reason"] == "completed"
+    assert (expected_run / "steps.jsonl").is_file()
+    assert not (expected_run / "training.pid").exists()
 
 
 def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch):
@@ -211,6 +270,9 @@ def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch)
     assert run["status"] == "failed"
     assert run["failed_stage"] == "preflight"
     assert run["last_error"] == "processor boom"
+    assert run["current_pid"] is None
+    assert run["attempts"][-1]["ended_at"] is not None
+    assert run["attempts"][-1]["exit_code"] == 1
     stage = _stages(run_dir)["preflight"]
     assert stage["status"] == "failed"
 
@@ -291,6 +353,13 @@ def test_post_eval_only_calls_report_without_training(tmp_path, monkeypatch):
     run_state.set_status(
         run_dir, "failed", failed_stage="post_eval", last_error="prior boom"
     )
+    run_state.set_progress(
+        run_dir, step=100, step_count=100, last_step_at=123.0
+    )
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "initializing", "step": 0, "max_steps": 0}),
+        encoding="utf-8",
+    )
 
     args = _main_args(tmp_path, run_dir, post_eval_only=True)
     train_lora._run_post_eval_only(args)
@@ -310,7 +379,14 @@ def test_post_eval_only_calls_report_without_training(tmp_path, monkeypatch):
     assert run["status"] == "completed"
     assert run["failed_stage"] is None
     assert run["last_error"] is None
-    assert _stages(run_dir)["post_eval"]["status"] == "completed"
+    post_eval = _stages(run_dir)["post_eval"]
+    assert post_eval["status"] == "completed"
+    assert "detail" not in post_eval
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "completed"
+    assert telemetry["step"] == 100
     # Post-eval-only must never replay or append optimizer steps.
     assert not (run_dir / "steps.jsonl").exists()
 
@@ -482,6 +558,51 @@ def test_post_training_evaluation_halts_between_passes_on_eval_device(
     # The signal was consumed between the clean and phone passes.
     assert model.generate_calls == 1
     assert len(stop_calls) == 2
+
+
+def test_post_eval_halt_after_phone_pass_writes_no_report_and_marks_stopped(
+    tmp_path, monkeypatch
+):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    signal = run_dir / "stop_training.signal"
+    signal.write_text("stop", encoding="utf-8")
+    model = _FakeEvalModel()
+    stop_calls = []
+
+    def should_stop():
+        stop_calls.append(1)
+        return len(stop_calls) >= 3
+
+    def evaluate():
+        _exercise_post_training_eval(
+            train_lora,
+            monkeypatch,
+            tmp_path,
+            model,
+            should_stop=should_stop,
+        )
+
+    completed = train_lora._run_post_eval_stage(
+        run_dir=run_dir,
+        results_dir=run_dir,
+        evaluate=evaluate,
+    )
+
+    assert completed is False
+    # Clean + phone passes ran; the third check halted before the report.
+    assert model.generate_calls == 2
+    assert len(stop_calls) == 3
+    assert not (tmp_path / "output" / "final_evaluation_report.json").exists()
+    assert not (tmp_path / "output" / "final_evaluation_report.md").exists()
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "stopped"
+    assert _stages(run_dir)["post_eval"]["status"] == "stopped"
+    assert not signal.exists()
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "stopped"
 
 
 def test_post_eval_only_honors_stop_signal_before_start(tmp_path, monkeypatch):

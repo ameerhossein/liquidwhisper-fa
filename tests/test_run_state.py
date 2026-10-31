@@ -359,6 +359,63 @@ def test_finish_attempt_clears_current_pid(tmp_path):
     assert attempt["reason"] == "completed"
 
 
+def test_finalize_attempt_closes_terminal_run_without_changing_status(tmp_path):
+    run = _create(tmp_path)
+    run_dir = run["paths"]["run_dir"]
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
+    run_state.set_status(run_dir, "completed")
+    run_state.start_attempt(run_dir, 6161)
+    run_state.update_run(
+        run_dir, lambda current: {**current, "current_pid": 6161}
+    )
+
+    finalized = run_state.finalize_attempt(run_dir, exit_code=0)
+
+    attempt = finalized["attempts"][-1]
+    assert finalized["status"] == "completed"
+    assert finalized["current_pid"] is None
+    assert attempt["ended_at"] is not None
+    assert attempt["exit_code"] == 0
+    assert attempt["reason"] == "completed"
+
+
+def test_finalize_attempt_maps_exit_and_requested_halt(tmp_path):
+    failed_run = _create(tmp_path, run_id=RUN_A)
+    failed_dir = failed_run["paths"]["run_dir"]
+    run_state.set_status(failed_dir, "failed")
+    run_state.start_attempt(failed_dir, 6162)
+    failed = run_state.finalize_attempt(failed_dir, exit_code=3)
+    assert failed["attempts"][-1]["reason"] == "nonzero_exit"
+    assert failed["attempts"][-1]["exit_code"] == 3
+
+    halt_run = _create(tmp_path, run_id=RUN_B)
+    halt_dir = halt_run["paths"]["run_dir"]
+    run_state.set_status(halt_run["paths"]["run_dir"], "running")
+    run_state.start_attempt(halt_dir, 6163)
+    run_state.update_run(
+        halt_dir, lambda current: {**current, "stop_requested_at": time.time()}
+    )
+    halted = run_state.finalize_attempt(
+        halt_dir, exit_code=0, reason="completed"
+    )
+    assert halted["attempts"][-1]["reason"] == "halted"
+
+
+def test_set_stage_can_clear_stale_detail(tmp_path):
+    run = _create(tmp_path)
+    run_dir = run["paths"]["run_dir"]
+    run_state.set_stage(run_dir, "training", "failed", detail="prior boom")
+    run_state.set_stage(run_dir, "training", "completed")
+    assert _stages_by_name(run_state.load_run(run_dir))["training"]["detail"] == (
+        "prior boom"
+    )
+    cleared = run_state.set_stage(
+        run_dir, "training", "completed", detail=None
+    )
+    assert "detail" not in _stages_by_name(cleared)["training"]
+
+
 def test_reconcile_classifies_failed_and_interrupted(tmp_path):
     failed_run = _create(tmp_path, run_id=RUN_A)
     failed_dir = failed_run["paths"]["run_dir"]
@@ -470,6 +527,38 @@ def test_reconcile_all_finds_older_live_run(tmp_path):
     by_id = {run["run_id"]: run for run in summary["runs"]}
     assert by_id[RUN_A]["status"] == "running"
     assert by_id[RUN_B]["status"] == "interrupted"
+
+
+def test_reconcile_all_ignores_terminal_run_with_reused_live_pid(tmp_path):
+    root = tmp_path / "runs"
+    run = _create(root, RUN_A)
+    run_dir = run["paths"]["run_dir"]
+    run_state.start_attempt(run_dir, 1234)
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
+    run_state.set_status(run_dir, "completed")
+    # The PID now belongs to an unrelated live process (PID reuse).
+    run_state.update_run(
+        run_dir, lambda current: {**current, "current_pid": 1234}
+    )
+
+    summary = run_state.reconcile_all(root, is_alive=lambda pid: pid == 1234)
+
+    assert summary["active_run"] is None
+    assert summary["latest_run"]["status"] == "completed"
+
+
+def test_reconcile_all_finds_pid_file_only_cli_run(tmp_path):
+    root = tmp_path / "runs"
+    run = _create(root, RUN_A)
+    run_dir = Path(run["paths"]["run_dir"])
+    run_state.set_status(run_dir, "running")
+    (run_dir / "training.pid").write_text("4321", encoding="utf-8")
+
+    summary = run_state.reconcile_all(root, is_alive=lambda pid: pid == 4321)
+
+    assert summary["active_run"]["run_id"] == RUN_A
+    assert summary["runs"][0]["status"] == "running"
 
 
 def test_reconcile_all_treats_is_alive_errors_as_alive(tmp_path):

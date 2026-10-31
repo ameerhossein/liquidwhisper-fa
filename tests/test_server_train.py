@@ -736,6 +736,19 @@ def test_start_uses_fake_trainer_when_enabled(client, monkeypatch):
     assert run["source"] == "fake"
 
 
+def test_fake_run_uses_isolated_preflight_cache(client, monkeypatch):
+    monkeypatch.setenv("ASR_FAKE_TRAINER", "1")
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 200, res.text
+    flags = _flags(client.launched[0])
+    expected = client.mod.RUNS_DIR / "_shared-fake"
+    assert Path(flags["--preflight_cache_dir"]) == expected
+    run = _run_json(client, res.json()["run_id"])
+    assert run["paths"]["preflight_cache"] == str(
+        expected / "baselines" / "preflight.json"
+    )
+
+
 def test_resume_forces_auto_resume_and_drops_checkpoint(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]
@@ -871,11 +884,33 @@ def test_smoke_status_reports_running_after_start(client):
 
 
 def test_runs_endpoint_returns_empty_list_without_runs(client):
-    assert client.get("/api/runs").json() == {"runs": []}
+    body = client.get("/api/runs").json()
+    assert body["runs"] == []
+    assert body["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
 
 
 def test_latest_run_is_null_without_runs(client):
     assert client.get("/api/runs/latest").json()["run"] is None
+
+
+def test_latest_run_without_ledger_falls_back_to_legacy_files(client):
+    client.mod.TELEMETRY_FILE.write_text(
+        json.dumps({"status": "training", "step": 5}), encoding="utf-8"
+    )
+    client.mod.BENCHMARKS_FILE.write_text(
+        json.dumps([{"epoch": "Epoch 1", "normalized_wer": 15.0}]),
+        encoding="utf-8",
+    )
+    client.mod.LOSS_HISTORY_FILE.write_text(
+        json.dumps([{"step": 5, "loss": 0.5}]), encoding="utf-8"
+    )
+
+    body = client.get("/api/runs/latest").json()
+
+    assert body["run"] is None
+    assert body["telemetry"]["step"] == 5
+    assert body["benchmarks"][0]["epoch"] == "Epoch 1"
+    assert body["loss_history"] == [{"step": 5, "loss": 0.5}]
 
 
 def test_run_endpoints_reject_invalid_and_missing_ids(client):
@@ -965,7 +1000,7 @@ def test_training_nonzero_exit_marks_run_failed(client, monkeypatch):
     assert run["failed_stage"] == "training"
     assert run["current_pid"] is None
     assert run["attempts"][-1]["exit_code"] == 7
-    assert run["attempts"][-1]["reason"] == "process_exit"
+    assert run["attempts"][-1]["reason"] == "nonzero_exit"
     assert run["stages"][1]["status"] == "failed"
     assert client.mod.last_exit_code == 7
 
@@ -995,6 +1030,196 @@ def test_training_exit_after_stop_request_marks_stopped(client, monkeypatch):
     assert run["status"] == "stopped"
     assert run["attempts"][-1]["reason"] == "halted"
     assert run["stages"][1]["status"] == "stopped"
+
+
+def test_terminal_trainer_exit_closes_attempt_and_clears_pid(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "completed")
+    # The trainer writes its terminal status before the process exits.
+    run_state.set_status(run_dir, "completed")
+    assert run_state.load_run(run_dir)["current_pid"] is not None
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = _ExitedProcess(0)
+
+    assert client.mod._training_running() is False
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "completed"
+    assert run["current_pid"] is None
+    attempt = run["attempts"][-1]
+    assert attempt["ended_at"] is not None
+    assert attempt["exit_code"] == 0
+    assert attempt["reason"] == "completed"
+    assert not (run_dir / "training.pid").exists()
+
+
+def test_completed_run_with_reused_live_pid_is_not_active(client, monkeypatch):
+    run = _create_run(
+        client,
+        pid=os.getpid(),
+        status="completed",
+        run_id="20261030-194700-dedede",
+    )
+    monkeypatch.setattr(
+        client.mod, "_is_process_running", lambda pid=None: pid == os.getpid()
+    )
+
+    client.mod._refresh_runs()
+
+    assert client.mod.ACTIVE_RUN_ID is None
+    assert client.mod._active_run_process_running() is False
+    saved = run_state.load_run(client.mod.RUNS_DIR / run["run_id"])
+    assert client.mod._run_process_running(saved) is False
+
+
+def test_refresh_detects_pid_file_only_cli_run(client, monkeypatch):
+    run_id = "20261030-194700-c1c1c1"
+    run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}, run_id=run_id
+    )
+    run_dir = client.mod.RUNS_DIR / run_id
+    run_state.set_status(run_dir, "running")
+    (run_dir / "training.pid").write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(
+        client.mod, "_is_process_running", lambda pid=None: pid == os.getpid()
+    )
+
+    client.mod._refresh_runs()
+
+    assert client.mod.ACTIVE_RUN_ID == run_id
+    assert client.mod._active_run_process_running() is True
+
+
+def test_derive_status_maps_running_post_eval_to_evaluating(client):
+    run = {
+        "status": "running",
+        "stages": [
+            {"name": "preflight", "status": "completed"},
+            {"name": "training", "status": "completed"},
+            {"name": "post_eval", "status": "running"},
+        ],
+    }
+    derived = client.mod._derive_status({"status": "completed"}, True, run)
+    assert derived["status"] == "evaluating_benchmark"
+
+
+def test_terminate_child_refuses_own_process_group(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        client.mod.os, "getpgid", lambda pid: 1234 if pid in (0, 4242) else 9999
+    )
+    monkeypatch.setattr(
+        client.mod.os, "killpg", lambda *args: calls.append(("killpg", args))
+    )
+    monkeypatch.setattr(
+        client.mod.os, "kill", lambda *args: calls.append(("kill", args))
+    )
+
+    client.mod._terminate_child(4242)
+
+    assert calls == []
+
+
+def test_terminate_child_falls_back_for_non_group_leader(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        client.mod.os, "getpgid", lambda pid: 1234 if pid == 0 else 9999
+    )
+    monkeypatch.setattr(
+        client.mod.os, "killpg", lambda *args: calls.append(("killpg", args))
+    )
+    monkeypatch.setattr(
+        client.mod.os, "kill", lambda *args: calls.append(("kill", args))
+    )
+
+    client.mod._terminate_child(4243)
+
+    assert calls == [("kill", (4243, client.mod.signal.SIGTERM))]
+
+
+def test_escalate_halt_pid_kills_running_post_eval_despite_completed_telemetry(
+    client, tmp_path, monkeypatch
+):
+    run_id = "20261030-194700-e5e5e5"
+    run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}, run_id=run_id
+    )
+    run_dir = client.mod.RUNS_DIR / run_id
+    run_state.start_attempt(run_dir, 12345)
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "running")
+    run_state.set_status(run_dir, "running")
+    telemetry = tmp_path / "run-telemetry.json"
+    telemetry.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    terminated = []
+    monkeypatch.setattr(client.mod, "HALT_GRACE_SECONDS", 0)
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: True)
+    monkeypatch.setattr(
+        client.mod, "_terminate_child", lambda pid: terminated.append(pid)
+    )
+
+    asyncio.run(
+        client.mod._escalate_halt_pid(12345, telemetry, run_dir)
+    )
+
+    assert terminated == [12345]
+
+
+def test_escalate_halt_kills_running_post_eval_after_grace(client, tmp_path, monkeypatch):
+    run_id = "20261030-194700-a7a7a7"
+    run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}, run_id=run_id
+    )
+    run_dir = client.mod.RUNS_DIR / run_id
+    run_state.start_attempt(run_dir, 24680)
+    run_state.set_stage(run_dir, "training", "completed")
+    run_state.set_stage(run_dir, "post_eval", "running")
+    run_state.set_status(run_dir, "running")
+    telemetry = tmp_path / "run-telemetry.json"
+    telemetry.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    terminated = []
+
+    class _RunningProc:
+        pid = 24680
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(client.mod, "HALT_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        client.mod, "_terminate_child", lambda pid: terminated.append(pid)
+    )
+
+    asyncio.run(client.mod._escalate_halt(_RunningProc(), telemetry, run_dir))
+
+    assert terminated == [24680]
+
+
+def test_escalate_halt_pid_skips_reused_pid(client, tmp_path, monkeypatch):
+    run_id = "20261030-194700-f6f6f6"
+    run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}, run_id=run_id
+    )
+    run_dir = client.mod.RUNS_DIR / run_id
+    run_state.start_attempt(run_dir, 30001)
+    run_state.set_stage(run_dir, "post_eval", "running")
+    run_state.set_status(run_dir, "running")
+    telemetry = tmp_path / "run-telemetry.json"
+    telemetry.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    terminated = []
+    monkeypatch.setattr(client.mod, "HALT_GRACE_SECONDS", 0)
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: True)
+    monkeypatch.setattr(
+        client.mod, "_terminate_child", lambda pid: terminated.append(pid)
+    )
+
+    asyncio.run(
+        client.mod._escalate_halt_pid(30002, telemetry, run_dir)
+    )
+
+    assert terminated == []
 
 
 def test_status_polls_child_before_refresh(client, monkeypatch):

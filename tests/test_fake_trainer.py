@@ -86,6 +86,23 @@ def _stages(run_dir):
     return {stage["name"]: stage for stage in run["stages"]}
 
 
+def test_fake_trainer_does_not_overwrite_real_shared_cache(tmp_path):
+    runs = tmp_path / "runs"
+    real_cache = runs / "_shared" / "baselines" / "preflight.json"
+    real_cache.parent.mkdir(parents=True)
+    sentinel = json.dumps({"models": {"buzzasr_base": {"normalized_wer": 1.0}}})
+    real_cache.write_text(sentinel, encoding="utf-8")
+    fake_cache = runs / "_shared-fake"
+    run_dir = runs / RUN_ID
+
+    result = _run_trainer(run_dir, fake_cache)
+
+    assert result.returncode == 0, result.stderr
+    assert real_cache.read_text(encoding="utf-8") == sentinel
+    assert (fake_cache / "baselines" / "preflight.json").is_file()
+    assert run_state.load_run(run_dir)["status"] == "completed"
+
+
 def test_fake_trainer_completes_and_writes_steps(tmp_path):
     run_dir = tmp_path / "runs" / RUN_ID
     cache_dir = tmp_path / "cache"
