@@ -46,11 +46,12 @@ python scripts/train_lora.py \
     --batch_size 8 \
     --grad_accum 4 \
     --learning_rate 1e-4 \
-    --epochs 4 \
+    --epochs 2 \
     --warmup_steps 500 \
     --eval_steps 1000 \
     --save_steps 1000 \
     --max_benchmark_samples 1000 \
+    --telephony_mode paired \
     --telephony_prob 0.5 \
     --no-gradient_checkpointing \
     --num_proc 4 \

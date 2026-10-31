@@ -46,6 +46,7 @@ def _main_args(tmp_path, run_dir, **overrides):
         lora_alpha=128,
         batch_size=8,
         grad_accum=4,
+        telephony_mode="paired",
         telephony_prob=0.0,
         telephony_use_ffmpeg=True,
         phone_benchmark=False,
@@ -962,6 +963,9 @@ def test_main_marks_preflight_failed_when_baseline_fails(
             raise AssertionError("cached prep must skip raw loads")
 
         def prepare_dataset_split(self, *a, **k):
+            raise AssertionError("cached prep must skip re-prep")
+
+        def prepare_paired_dataset(self, *a, **k):
             raise AssertionError("cached prep must skip re-prep")
 
     monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)

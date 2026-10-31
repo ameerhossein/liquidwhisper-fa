@@ -24,7 +24,7 @@ training:
   batch_size: 8
   grad_accum: 4           # Effective batch size = 32
   learning_rate: 1.0e-4
-  epochs: 4
+  epochs: 2
   warmup_steps: 500
   lr_scheduler_type: "cosine"
   eval_steps: 1000
@@ -42,8 +42,10 @@ training:
   results_dir: "/workspace/stt-outputs/results"
 
 # Iranian telephony augmentation (measured customer channel).
-# prob=0.5 means half the train samples are phone-simulated on-the-fly.
+# mode=paired trains on clean + phone copies of every utterance.
+# prob applies only to mode=disjoint (share of samples phone-simulated on the fly).
 telephony:
+  mode: paired
   prob: 0.5
   profiles: ["customer"]
   seed: 42

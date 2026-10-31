@@ -107,7 +107,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8, help="Per-device train batch size")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective batch: batch_size * grad_accum)")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate for LoRA")
-    parser.add_argument("--epochs", type=int, default=4, help="Total training epochs")
+    parser.add_argument("--epochs", type=int, default=2, help="Total training epochs (paired default; disjoint/clean use 4 for equal compute)")
     parser.add_argument("--warmup_steps", type=int, default=500, help="Linear warmup steps")
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="Learning-rate schedule (e.g. cosine, linear)")
     parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate every N steps")
@@ -129,7 +129,13 @@ def parse_args():
     parser.add_argument("--post_eval_only", action=argparse.BooleanOptionalAction, default=False, help="Run only the post-training evaluation from the existing adapter (cockpit resume).")
     parser.add_argument("--enable_telemetry", "--enable-telemetry", action=argparse.BooleanOptionalAction, default=True, help="Enable real-time telemetry for Web UI (--no-enable-telemetry to disable)")
     parser.add_argument("--run_epoch_benchmark", "--run-epoch-benchmark", action=argparse.BooleanOptionalAction, default=True, help="Run test benchmark after each epoch (--no-run-epoch-benchmark to disable)")
-    parser.add_argument("--telephony_prob", type=float, default=0.5, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed default).")
+    parser.add_argument("--telephony_prob", type=float, default=0.5, help="Share of train samples phone-simulated on-the-fly (0=clean only, 0.5=mixed default). Applies only to --telephony_mode disjoint.")
+    parser.add_argument(
+        "--telephony_mode",
+        choices=("paired", "disjoint", "clean"),
+        default="paired",
+        help="paired=clean+phone rows (2 epochs), disjoint=50/50 coin, clean=no augmentation",
+    )
     parser.add_argument("--telephony_profiles", type=str, default="customer", help="Comma-separated phone profiles: customer (default); legacy gated,mobile,pstn also accepted")
     parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
     parser.add_argument("--telephony_use_ffmpeg", "--telephony-use-ffmpeg", action=argparse.BooleanOptionalAction, default=True, help="Use true ffmpeg AMR-NB codec when available; G.711 A-law storage is always exact")
@@ -202,6 +208,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "overwrite_preflight": "overwrite_preflight",
         "overwrite-preflight": "overwrite_preflight",
         "prob": "telephony_prob", "telephony_prob": "telephony_prob",
+        "mode": "telephony_mode", "telephony_mode": "telephony_mode",
         "profiles": "telephony_profiles", "telephony_profiles": "telephony_profiles",
         "seed": "telephony_seed", "telephony_seed": "telephony_seed",
         "use_ffmpeg": "telephony_use_ffmpeg", "telephony_use_ffmpeg": "telephony_use_ffmpeg",
@@ -278,7 +285,7 @@ def _label_format(base_model: str):
         return persian_label_ids(json.load(f))
 
 
-def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> Dict[str, Any]:
+def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, telephony_prob: float) -> Dict[str, Any]:
     """Fingerprint for a prepared split. Any change forces re-prep."""
     try:
         profiles = list(getattr(args, "telephony_profiles", []) or [])
@@ -290,7 +297,8 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_prob: float) -> D
         "base_model": getattr(args, "base_model", ""),
         "split": split,
         "max_samples": max_samples,
-        "telephony_prob": float(telephony_prob or 0.0),
+        "telephony_mode": telephony_mode,
+        "telephony_prob": None if telephony_mode == "paired" else float(telephony_prob or 0.0),
         "telephony_profiles": sorted(str(p) for p in profiles),
         "telephony_seed": int(getattr(args, "telephony_seed", 42) or 42),
         "telephony_use_ffmpeg": bool(getattr(args, "telephony_use_ffmpeg", True)),
@@ -583,6 +591,7 @@ def _cli_run_config(args) -> dict:
         "max_benchmark_samples",
         "preflight_samples",
         "num_proc",
+        "telephony_mode",
         "telephony_prob",
         "telephony_profiles",
         "telephony_seed",
@@ -1135,12 +1144,13 @@ def _run_training(args, run_dir):
         # Feature extraction + tokenization need only the processor, so prep
         # runs first (train gets phone augmentation, eval stays clean).
         label_prefix_ids, label_eos_id = _label_format(args.base_model)
+        mode = getattr(args, "telephony_mode", "paired")
         train_pipeline = PersianASRDataPipeline(
             processor=processor,
             dataset_name=args.dataset_name,
             normalizer=normalizer,
             num_proc=args.num_proc,
-            telephony_prob=float(getattr(args, "telephony_prob", 0.0) or 0.0),
+            telephony_prob=0.0 if mode != "disjoint" else float(getattr(args, "telephony_prob", 0.0) or 0.0),
             telephony_profiles=args.telephony_profiles,
             telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
@@ -1180,14 +1190,15 @@ def _run_training(args, run_dir):
             os.makedirs(prep_cache_dir, exist_ok=True)
         except Exception:
             pass
-        train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), float(getattr(args, "telephony_prob", 0.0) or 0.0))
-        eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), 0.0)
+        train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), mode, getattr(args, "telephony_prob", 0.0))
+        eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), "clean", 0.0)
         if reuse_prep and not overwrite_prep:
             train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
             eval_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "validation"), eval_fp)
-            if train_dataset is not None and float(getattr(args, "telephony_prob", 0.0) or 0.0) > 0:
-                print("Note: reused train prep freezes phone augmentation to the cached draw; "
-                      "use --overwrite_prep_cache for a fresh random draw.")
+            if train_dataset is not None and mode != "clean":
+                halves = ", both halves" if mode == "paired" else ""
+                print(f"Note: reused train prep freezes the cached draw (mode={mode}{halves}); "
+                      "use --overwrite_prep_cache for a fresh draw.")
         need_train = train_dataset is None
         need_eval = eval_dataset is None
 
@@ -1200,7 +1211,13 @@ def _run_training(args, run_dir):
 
         if need_train:
             assert raw_train is not None
-            train_dataset = train_pipeline.prepare_dataset_split(raw_train)
+            if mode == "paired":
+                train_dataset = train_pipeline.prepare_paired_dataset(raw_train)
+                print(f"Paired train set: {len(train_dataset) // 2} clean + "
+                      f"{len(train_dataset) // 2} phone = {len(train_dataset)} rows")
+            else:
+                train_dataset = train_pipeline.prepare_dataset_split(raw_train)
+                print(f"Train set: {len(train_dataset)} rows (mode={mode})")
             _save_prep_cache(train_dataset, os.path.join(prep_cache_dir, "train"), train_fp)
         if need_eval:
             assert raw_eval is not None

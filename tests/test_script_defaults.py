@@ -50,6 +50,8 @@ def test_train_lora_parser_matches_fast_l40s_defaults(monkeypatch):
     assert args.gradient_checkpointing is False
     assert args.max_benchmark_samples == 1000
     assert args.preflight_samples is None
+    assert args.epochs == 2
+    assert args.telephony_mode == "paired"
     assert args.telephony_prob == 0.5
     assert args.lr_scheduler_type == "cosine"
 
@@ -97,12 +99,14 @@ def test_l40s_config_matches_fast_defaults():
     training = cfg["training"]
     assert training["batch_size"] == 8
     assert training["grad_accum"] == 4
+    assert training["epochs"] == 2
     assert training["eval_steps"] == 1000
     assert training["save_steps"] == 1000
     assert training["gradient_checkpointing"] is False
     assert training["max_benchmark_samples"] == 1000
     assert training["preflight_samples"] == 1000
     assert training["lr_scheduler_type"] == "cosine"
+    assert cfg["telephony"]["mode"] == "paired"
     assert cfg["telephony"]["prob"] == 0.5
 
 
@@ -111,9 +115,11 @@ def test_run_train_script_matches_fast_defaults():
     for expected in (
         "--batch_size 8",
         "--grad_accum 4",
+        "--epochs 2",
         "--eval_steps 1000",
         "--save_steps 1000",
         "--max_benchmark_samples 1000",
+        "--telephony_mode paired",
         "--telephony_prob 0.5",
         "--no-gradient_checkpointing",
     ):
@@ -184,6 +190,7 @@ def test_cli_run_config_captures_full_resume_fields(monkeypatch):
         "max_benchmark_samples",
         "preflight_samples",
         "num_proc",
+        "telephony_mode",
         "telephony_prob",
         "gradient_checkpointing",
         "fresh_start",
@@ -211,3 +218,37 @@ def test_cli_run_config_captures_full_resume_fields(monkeypatch):
     assert config["lora_r"] == args.lora_r
     assert config["warmup_steps"] == args.warmup_steps
     assert config["telephony_seed"] == args.telephony_seed
+    assert config["telephony_mode"] == "paired"
+
+
+def test_prep_fingerprint_includes_mode(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import _prep_fingerprint, parse_args
+
+    monkeypatch.setattr(sys, "argv", ["train_lora.py"])
+    args = parse_args()
+    paired = _prep_fingerprint(args, "train", None, "paired", 0.5)
+    disjoint = _prep_fingerprint(args, "train", None, "disjoint", 0.5)
+    clean = _prep_fingerprint(args, "train", None, "clean", 0.0)
+    assert paired["telephony_mode"] == "paired"
+    assert paired["telephony_prob"] is None
+    assert paired != disjoint and disjoint != clean and paired != clean
+
+    args.telephony_mode = "paired"
+    validation_a = _prep_fingerprint(args, "validation", None, "clean", 0.0)
+    args.telephony_mode = "disjoint"
+    validation_b = _prep_fingerprint(args, "validation", None, "clean", 0.0)
+    assert validation_a == validation_b
+
+
+def test_paired_fingerprint_ignores_telephony_prob(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import _prep_fingerprint, parse_args
+
+    monkeypatch.setattr(sys, "argv", ["train_lora.py"])
+    args = parse_args()
+    assert _prep_fingerprint(args, "train", None, "paired", 0.5) == _prep_fingerprint(
+        args, "train", None, "paired", 0.9
+    )
