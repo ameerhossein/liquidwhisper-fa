@@ -9,8 +9,10 @@ Handles:
 """
 
 import os
+import shutil
 import time
 import json
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
@@ -702,3 +704,110 @@ class WebTelemetryCallback(TrainerCallback):
             "updated_at": time.time()
         })
         print("\n[TelemetryCallback] Training loop finished. Web telemetry updated.")
+
+
+class HFMirrorCallback(TrainerCallback):
+    """Enqueue Hugging Face mirror uploads without ever blocking training.
+
+    The trainer already writes full ``checkpoint-<step>`` folders every
+    ``save_steps``; this callback only mirrors those, plus lightweight adapter
+    snapshots every ``snapshot_steps`` optimizer steps. A step that saves a
+    full checkpoint is skipped so the same weights are never saved twice.
+
+    Every upload is best effort: the mirror enqueues background work and a
+    snapshot failure is logged rather than raised.
+    """
+
+    def __init__(
+        self,
+        mirror: Any,
+        *,
+        model: Any,
+        processor: Any,
+        output_dir: str,
+        snapshot_steps: int = 250,
+        save_steps: int = 1000,
+    ):
+        self.mirror = mirror
+        self.model = model
+        self.processor = processor
+        self.output_dir = Path(output_dir)
+        self.snapshots_dir = self.output_dir / "adapter_snapshots"
+        try:
+            self.snapshot_steps = max(0, int(snapshot_steps))
+        except (TypeError, ValueError):
+            self.snapshot_steps = 250
+        try:
+            self.save_steps = int(save_steps)
+        except (TypeError, ValueError):
+            self.save_steps = 1000
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.mirror.enqueue_ledger("training")
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        try:
+            step = int(state.global_step)
+        except (TypeError, ValueError):
+            return control
+
+        # ``snapshot_steps=0`` disables periodic snapshots. A step that the
+        # Trainer saves as a full checkpoint is skipped: the checkpoint upload
+        # already carries the same adapter weights.
+        if (
+            self.snapshot_steps <= 0
+            or step <= 0
+            or step % self.snapshot_steps != 0
+        ):
+            return control
+        if self.save_steps > 0 and step % self.save_steps == 0:
+            return control
+
+        final_dir = self.snapshots_dir / f"step-{step:06d}"
+        staging_dir = self.snapshots_dir / f".staging-step-{step:06d}"
+        try:
+            self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            self.model.save_pretrained(str(staging_dir))
+            self.processor.save_pretrained(str(staging_dir))
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+            os.replace(staging_dir, final_dir)
+        except Exception as exc:
+            # Snapshotting is best effort: a full disk or a failing
+            # save_pretrained must never stop training.
+            print(
+                f"[HFMirrorCallback] Warning: failed to save adapter snapshot "
+                f"at step {step}: {exc}"
+            )
+            try:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir)
+            except OSError:
+                pass
+            return control
+
+        try:
+            self.mirror.enqueue_adapter_snapshot(final_dir, step)
+        except Exception as exc:
+            print(
+                f"[HFMirrorCallback] Warning: could not enqueue adapter "
+                f"snapshot at step {step}: {exc}"
+            )
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        try:
+            step = int(state.global_step)
+        except (TypeError, ValueError):
+            return control
+        checkpoint = self.output_dir / f"checkpoint-{step}"
+        if checkpoint.is_dir():
+            self.mirror.enqueue_checkpoint(checkpoint, step)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.mirror.enqueue_ledger("training")
+        return control
