@@ -29,7 +29,7 @@ assert.strictEqual(stageMap(run).get("post_eval").status, "completed");
 assert.strictEqual(runStatusLabel(run), "Run completed");
 assert.strictEqual(savedStepsLabel({ count: 1234 }), "1,234 steps saved");
 assert.strictEqual(isMergeAvailable(run, true), true);
-assert.strictEqual(isMergeAvailable({ ...run, status: "running" }, true), false);
+assert.strictEqual(isMergeAvailable({ ...run, status: "running" }, true), true);
 assert.strictEqual(isMergeAvailable(run, false), false);
 
 // Missing stages and stage metadata normalize to pending.
@@ -68,6 +68,22 @@ assert.strictEqual(savedStepsLabel({ count: 1 }), "1 step saved");
 assert.strictEqual(savedStepsLabel({ count: "2500" }), "2,500 steps saved");
 assert.strictEqual(savedStepsLabel({ count: "not-a-number" }), "0 steps saved");
 assert.strictEqual(savedStepsLabel(null), "0 steps saved");
+const lastSavedAt = 1761846420;
+const lastSavedLabel = savedStepsLabel({ count: 12, last_saved_at: lastSavedAt });
+const expectedLastAt = new Date(lastSavedAt * 1000).toLocaleTimeString([], {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+assert.strictEqual(lastSavedLabel, `12 steps saved · last at ${expectedLastAt}`);
+assert.strictEqual(
+  savedStepsLabel({ count: 12, last_saved_at: "not-a-time" }),
+  "12 steps saved",
+);
+assert.strictEqual(
+  savedStepsLabel({ count: 12, last_saved_at: null }),
+  "12 steps saved",
+);
 
 const mergeable = {
   status: "completed",
@@ -87,12 +103,31 @@ assert.strictEqual(
 );
 assert.strictEqual(
   isMergeAvailable({ ...mergeable, status: "interrupted" }, true),
-  false,
-  "only completed runs may merge",
+  true,
+  "training completion is what matters, not the overall run status",
 );
 assert.strictEqual(
   isMergeAvailable({ ...mergeable, status: "failed" }, true),
+  true,
+  "a failed post-eval must not hide a completed training adapter",
+);
+assert.strictEqual(
+  isMergeAvailable({ ...mergeable, status: "stopped" }, true),
+  true,
+  "a stopped post-eval must not hide a completed training adapter",
+);
+assert.strictEqual(
+  isMergeAvailable(
+    {
+      ...mergeable,
+      stages: mergeable.stages.map((stage) =>
+        stage.name === "training" ? { ...stage, status: "failed" } : stage,
+      ),
+    },
+    true,
+  ),
   false,
+  "merge requires the training stage to be completed",
 );
 assert.strictEqual(
   isMergeAvailable({ ...mergeable, status: "completed" }, 0),

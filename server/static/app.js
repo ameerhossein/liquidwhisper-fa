@@ -321,13 +321,13 @@ async function refreshRunList() {
       loadRunState();
     }
   } catch (e) {
-    // Legacy/local demo server without the run ledger API, or a transient
-    // failure: never leave the picker on Latest while a historical run is
-    // still the rendered view.
-    setRunPickerAvailable(false);
-    selectedRunId = "latest";
-    viewingHistorical = false;
-    loadRunState();
+    // A transient /api/runs failure must not discard a historical view: keep
+    // the rendered run and repair only the picker on the next poll. Only the
+    // very first legacy failure (no options yet) hides the picker.
+    if (lastRunListSignature === null && el.runSelect && el.runSelect.options.length <= 1) {
+      setRunPickerAvailable(false);
+    }
+    console.error("Failed to refresh run list", e);
   }
 }
 
@@ -353,7 +353,9 @@ async function selectRun(runId) {
     const payload = await res.json();
     if (token !== runViewToken) return;
     if (!payload || !payload.run) {
-      // Legacy/local demo without a run ledger: keep the pre-run cockpit.
+      // Legacy/local demo without a run ledger: keep the pre-run cockpit but
+      // still surface a non-persistent runs-root warning.
+      updateStorageWarning(payload && payload.storage);
       selectedRunId = "latest";
       hideRunUi();
       return;
@@ -403,7 +405,9 @@ async function loadRunState() {
     const payload = await res.json();
     if (token !== runViewToken) return;
     if (!payload || !payload.run) {
-      // Legacy/local demo without a run ledger: keep the pre-run cockpit.
+      // Legacy/local demo without a run ledger: keep the pre-run cockpit but
+      // still surface a non-persistent runs-root warning.
+      updateStorageWarning(payload && payload.storage);
       hideRunUi();
       return;
     }
@@ -676,6 +680,7 @@ function connectWebSocket() {
             if (data.run) {
               applyLiveRun(data);
             } else {
+              updateStorageWarning(data.storage);
               hideRunUi();
             }
           }
@@ -717,6 +722,24 @@ async function pollTelemetryFallback() {
   }
 }
 
+// While a historical run is pinned, only the Start/Halt controls follow the
+// live job; the rendered run content stays frozen.
+async function pollLiveControls() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    const tel = await res.json();
+    const status = String((tel && tel.status) || "");
+    const running =
+      !!tel.process_running ||
+      ["initializing", "training", "stopping", "evaluating", "evaluating_benchmark"].includes(status);
+    fullRunRunning = running;
+    syncRunButtons(status === "stopping");
+  } catch (e) {
+    // Keep the previous control state; the next poll retries.
+  }
+}
+
 // Run status
 
 function totalEpochs(tel) {
@@ -743,9 +766,11 @@ const STATE_LABELS = {
   training: "Training",
   stopping: "Stopping (saving checkpoint)",
   evaluating: "Evaluating on held-out test",
+  evaluating_benchmark: "Evaluating on held-out test",
   stopped: "Stopped",
   completed: "Run completed",
   failed: "Run failed (see log)",
+  interrupted: "Run interrupted",
 };
 
 function syncRunButtons(stopping = false) {
@@ -794,7 +819,7 @@ function updateTelemetry(tel, historical = false) {
   const maxSteps = tel.max_steps || 0;
   const epoch = tel.epoch || 0;
   const total = totalEpochs(tel);
-  const started = running || step > 0 || ["completed", "stopped", "failed"].includes(status);
+  const started = running || step > 0 || ["completed", "stopped", "failed", "interrupted"].includes(status);
   const pct = maxSteps ? Math.min(100, (step / maxSteps) * 100) : 0;
 
   renderTicks(total);
@@ -1272,9 +1297,10 @@ window.addEventListener("DOMContentLoaded", () => {
   loadRunState();
   setInterval(() => {
     if (viewingHistorical) {
-      // Only the picker follows the live ledger while a historical run is
-      // pinned; the rendered content stays historical.
+      // Only the picker and the live Start/Halt controls follow the ledger
+      // while a historical run is pinned; the rendered content stays historical.
       refreshRunList();
+      pollLiveControls();
       return;
     }
     if (!wsActive) loadRunState();

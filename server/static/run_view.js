@@ -55,7 +55,18 @@ function savedStepsLabel(steps) {
   let count = steps && steps.count != null ? Number(steps.count) : 0;
   if (!Number.isFinite(count) || count < 0) count = 0;
   count = Math.floor(count);
-  return `${count.toLocaleString("en-US")} step${count === 1 ? "" : "s"} saved`;
+  const label = `${count.toLocaleString("en-US")} step${count === 1 ? "" : "s"} saved`;
+  if (!steps || steps.last_saved_at == null) return label;
+  const seconds = Number(steps.last_saved_at);
+  if (!Number.isFinite(seconds) || seconds <= 0) return label;
+  const date = new Date(seconds * 1000);
+  if (isNaN(date.getTime())) return label;
+  const time = date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `${label} · last at ${time}`;
 }
 
 function runLogUrl(runId, historical = false) {
@@ -67,8 +78,9 @@ function runLogUrl(runId, historical = false) {
 }
 
 function isMergeAvailable(run, adapterExists = false) {
-  if (!run || !adapterExists || run.status !== "completed") return false;
+  if (!run || !adapterExists) return false;
   const stages = stageMap(run);
+  if (stages.get("training").status !== "completed") return false;
   if (stages.get("merge").status === "completed") return false;
   for (const stage of stages.values()) {
     if (stage.status === "running") return false;

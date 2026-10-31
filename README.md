@@ -73,22 +73,33 @@ otherwise the repo-local `results/runs`. `ASR_RUNS_DIR` overrides it.
   If a training checkpoint exists it auto-resumes; if training already
   completed but post-eval did not, it runs post-eval only
   (`--post_eval_only`) instead of retraining.
-* **Merge.** After training completes and post-eval is terminal, the cockpit's
-  Merge action (or `POST /api/runs/<run_id>/merge`) writes the standalone
-  merged model to `<run_dir>/merged/` (`config.json`, `model.safetensors`,
-  tokenizer files). Merging needs `output/best_adapter/adapter_config.json`.
+* **Merge.** Once the **training stage is completed** and
+  `output/best_adapter/adapter_config.json` exists, the cockpit offers Merge
+  even when post-eval failed or was stopped (the overall run status may be
+  `completed`, `failed`, or `stopped`). No stage may still be running, and a
+  run whose merge stage already completed is not offered again. The Merge
+  action (or `POST /api/runs/<run_id>/merge`) writes the standalone merged
+  model to `<run_dir>/merged/` (`config.json`, `model.safetensors`, tokenizer
+  files).
 
 A runs root outside `/workspace` or `/runpod-volume` is **not persistent**: the
 cockpit shows `Runs are not on persistent storage (<path>). Set ASR_RUNS_DIR to
 a /workspace path.` Repo-local runs survive a server restart but not a pod
 restart.
 
+**Upgrading an existing deployment:** finish any legacy (pre-ledger) training
+run before upgrading. The cockpit resumes and reconciles runs from `run.json`;
+a process with only the legacy global results PID file is still detected, but
+it has no attempt history to resume or merge.
+
 ### GPU-Free Development (CPU Only)
 
 Set `ASR_FAKE_TRAINER=1` to exercise the full cockpit lifecycle without CUDA.
 The server spawns `scripts/dev_fake_trainer.py` and `scripts/dev_fake_merge.py`
 instead of the real trainer/merge; runs are marked `source: "fake"` and write
-placeholder artifacts only.
+placeholder artifacts only. Fake runs use `<runs root>/_shared-fake` for their
+preflight cache, so the real `_shared/baselines/preflight.json` is never
+overwritten.
 
 ```bash
 # Isolated ledger; fake trainer, no GPU.
@@ -233,6 +244,7 @@ tmux new -s train_asr
 * `--learning_rate 1e-4`: Optimal for LoRA.
 * `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).
+* `--run_dir <dir>`: self-contained CLI run ledger. When `--results_dir` is not given it defaults to the run directory, and a default `--output_dir` becomes `<run>/output`. The trainer records its PID/attempt, writes `<run>/training.pid`, tees stdout/stderr to `<run>/training_live.log`, and closes the attempt at exit; the cockpit detects the live CLI run from the pid file. Explicit `--results_dir`/`--output_dir` still win.
 * `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows. Set both to `0` (`--preflight_samples 0 --max_benchmark_samples 0`) for the full 2,149-sample test set; keep them aligned.
 * `--no-enable-telemetry / --no-run-epoch-benchmark`: disable live telemetry or epoch eval.
 * Training keeps punctuation in targets; eval strips it for standardized WER (intentional, see `src/data.py`).

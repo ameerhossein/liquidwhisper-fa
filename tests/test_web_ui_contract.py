@@ -104,6 +104,27 @@ def test_historical_run_content_is_scoped():
     assert '@app.get("/api/runs/{run_id}/logs")' in server
 
 
+def test_storage_warning_is_outside_run_head():
+    html = (ROOT / "server/static/index.html").read_text()
+    run_head = html.index('id="runHead"')
+    section_end = html.index("</section>", run_head)
+    warning = html.index('id="storageWarning"')
+    assert warning > section_end, "the warning must render before the first run"
+
+
+def test_historical_view_keeps_live_controls_and_picker_failure_local():
+    js = (ROOT / "server/static/app.js").read_text()
+    assert "async function pollLiveControls(" in js
+    assert "pollLiveControls();" in js
+    assert "interrupted: \"Run interrupted\"" in js
+    refresh = js.index("async function refreshRunList(")
+    select = js.index("async function selectRun(")
+    refresh_body = js[refresh:select]
+    catch_body = refresh_body.split("catch (e)")[-1]
+    assert "viewingHistorical = false" not in catch_body
+    assert "loadRunState()" not in catch_body
+
+
 def test_stepper_markup_matches_stage_order():
     html = (ROOT / "server/static/index.html").read_text()
     stages = re.findall(r'data-stage="([^"]+)"', html)
