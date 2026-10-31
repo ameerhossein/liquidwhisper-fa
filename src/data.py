@@ -8,6 +8,7 @@ Supports:
 - Streaming and subset slicing for quick testing
 """
 
+import copy
 import os
 import random
 from typing import Optional, Dict, Any, List, Sequence
@@ -26,13 +27,14 @@ try:
 except Exception:
     pass
 try:
-    from datasets import load_dataset, Audio, DatasetDict, Dataset
+    from datasets import load_dataset, Audio, DatasetDict, Dataset, concatenate_datasets
     _DATASETS_AVAILABLE = True
 except ImportError:
     load_dataset = None  # type: ignore
     Audio = None  # type: ignore
     DatasetDict = dict  # type: ignore
     Dataset = object  # type: ignore
+    concatenate_datasets = None  # type: ignore
     _DATASETS_AVAILABLE = False
 from src.normalizer import PersianTextNormalizer
 
@@ -260,6 +262,9 @@ class PersianASRDataPipeline:
         self._tele_base_seed = telephony_seed if telephony_seed is not None else random.SystemRandom().randrange(2 ** 31)
         self._tele_rng = random.Random(self._tele_base_seed)
         self._tele_warned_missing = False
+        # Paired preparation sets this on its phone pass so any telephone
+        # failure aborts instead of silently caching clean audio as "phone".
+        self.strict_telephony: bool = False
 
     def _audio_duration_seconds(self, audio: Any) -> float:
         """Compute duration from waveform length. Returns 0.0 if unknown."""
@@ -381,6 +386,8 @@ class PersianASRDataPipeline:
         # input but with the measured customer telephone channel.
         if self.telephony_prob > 0 and self.telephony_profiles:
             if not _TELEPHONE_AVAILABLE:
+                if self.strict_telephony:
+                    raise RuntimeError("telephone augmentation unavailable")
                 if not self._tele_warned_missing:
                     print("Warning: src.telephone not available; skipping phone simulation.")
                     self._tele_warned_missing = True
@@ -396,6 +403,10 @@ class PersianASRDataPipeline:
                     )
                     array = degraded
                 except Exception as e:
+                    if self.strict_telephony:
+                        raise RuntimeError(
+                            f"Telephone augmentation failed for row {index}: {e}"
+                        ) from e
                     print(f"Warning: telephone augmentation failed ({e}); using clean audio.")
 
         # 1. Audio feature extraction (128 mel bins for Whisper Large v3 / BuzzASR)
@@ -420,13 +431,8 @@ class PersianASRDataPipeline:
         batch["is_informal"] = is_informal
         return batch
 
-    def prepare_dataset_split(
-        self,
-        dataset: Dataset,
-        remove_columns: Optional[list] = None
-    ) -> Dataset:
-        """Applies mapping over dataset to produce model-ready inputs."""
-        _check_audio_backend()
+    def _resolve_num_proc(self) -> int:
+        """Effective dataset.map/filter process count, honoring the fork guard."""
         # num_proc=0 (or 1) must run single-process; datasets.map with
         # num_proc>1 pickles prepare_sample (bound method) which can fail.
         effective_proc = 1
@@ -450,6 +456,16 @@ class PersianASRDataPipeline:
                 "before model load to use multiprocess."
             )
             effective_proc = 1
+        return effective_proc
+
+    def prepare_dataset_split(
+        self,
+        dataset: Dataset,
+        remove_columns: Optional[list] = None
+    ) -> Dataset:
+        """Applies mapping over dataset to produce model-ready inputs."""
+        _check_audio_backend()
+        effective_proc = self._resolve_num_proc()
 
         # Forked workers would each start a torch thread pool sized to the core
         # count; N workers x cores threads thrash on the small per-sample STFT
@@ -457,6 +473,48 @@ class PersianASRDataPipeline:
         prev_threads = _set_torch_threads(1) if effective_proc > 1 else None
         try:
             return self._prepare_split(dataset, remove_columns, effective_proc)
+        finally:
+            if prev_threads is not None:
+                _set_torch_threads(prev_threads)
+
+    def prepare_paired_dataset(
+        self,
+        dataset: Dataset,
+        remove_columns: Optional[list] = None
+    ) -> Dataset:
+        """Prepare clean and telephone-degraded copies of every utterance.
+
+        Returns ``concatenate_datasets([clean, phone])`` with identical row
+        order, so row ``i`` and row ``i + n`` are the same utterance. Duration
+        filtering runs once on the source rows. The phone half is strict: any
+        telephone failure aborts, never silently yielding clean audio as phone.
+        """
+        if not _TELEPHONE_AVAILABLE:
+            raise RuntimeError("paired mode requires the telephone module")
+        _check_audio_backend()
+        effective_proc = self._resolve_num_proc()
+
+        prev_threads = _set_torch_threads(1) if effective_proc > 1 else None
+        try:
+            filtered = self._filter_by_duration(dataset, effective_proc)
+
+            clean_pipe = copy.copy(self)
+            clean_pipe.telephony_prob = 0.0
+            clean_pipe.strict_telephony = False
+
+            phone_pipe = copy.copy(self)
+            phone_pipe.telephony_prob = 1.0
+            phone_pipe.strict_telephony = True
+
+            clean = clean_pipe._prepare_split(
+                filtered, remove_columns, effective_proc, filter_durations=False
+            )
+            phone = phone_pipe._prepare_split(
+                filtered, remove_columns, effective_proc, filter_durations=False
+            )
+            if clean.features != phone.features:
+                raise ValueError("clean and phone feature schemas differ")
+            return concatenate_datasets([clean, phone])
         finally:
             if prev_threads is not None:
                 _set_torch_threads(prev_threads)
@@ -478,20 +536,22 @@ class PersianASRDataPipeline:
         dataset: Dataset,
         remove_columns: Optional[list],
         effective_proc: int,
+        filter_durations: bool = True,
     ) -> Dataset:
         # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
         # not truncated, to keep audio/text aligned (Whisper caps at 30s).
-        orig_len = len(dataset)
-        try:
-            dataset = self._filter_by_duration(dataset, effective_proc)
-            dropped = orig_len - len(dataset)
-            if dropped:
-                print(
-                    f"Filtered {dropped}/{orig_len} samples outside "
-                    f"[{self.min_duration_seconds}s, {self.max_duration_seconds}s]."
-                )
-        except Exception as e:
-            print(f"Duration filtering skipped ({e}). Continuing without filter.")
+        if filter_durations:
+            orig_len = len(dataset)
+            try:
+                dataset = self._filter_by_duration(dataset, effective_proc)
+                dropped = orig_len - len(dataset)
+                if dropped:
+                    print(
+                        f"Filtered {dropped}/{orig_len} samples outside "
+                        f"[{self.min_duration_seconds}s, {self.max_duration_seconds}s]."
+                    )
+            except Exception as e:
+                print(f"Duration filtering skipped ({e}). Continuing without filter.")
 
         cols_to_remove = remove_columns or [c for c in dataset.column_names if c not in ["input_features", "labels", "is_informal"]]
 

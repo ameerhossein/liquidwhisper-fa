@@ -128,3 +128,92 @@ def test_prepare_split_restores_torch_threads():
     finally:
         datasets.enable_caching()
     assert torch.get_num_threads() == before
+
+
+def _pairing_dataset(n=6):
+    datasets = pytest.importorskip("datasets")
+    return datasets.Dataset.from_dict({
+        "audio": [_clip() for _ in range(n)],
+        "text": [f"سلام {i}" for i in range(n)],
+    })
+
+
+def test_prepare_paired_dataset_pairs_each_utterance():
+    ds = _pairing_dataset(6)
+    out = _pipeline(prob=0.5).prepare_paired_dataset(ds)
+    assert len(out) == 12
+    assert out["labels"][:6] == out["labels"][6:]
+    assert out["is_informal"][:6] == out["is_informal"][6:]
+    assert any(
+        np.asarray(a).tobytes() != np.asarray(b).tobytes()
+        for a, b in zip(out["input_features"][:6], out["input_features"][6:])
+    )
+
+
+def test_prepare_paired_dataset_clean_half_matches_clean_pipeline():
+    ds = _pairing_dataset(4)
+    paired = _pipeline(prob=0.5).prepare_paired_dataset(ds)
+    clean = _pipeline(prob=0.0).prepare_dataset_split(ds)
+    for a, b in zip(paired["input_features"][:4], clean["input_features"]):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_prepare_paired_dataset_deterministic_across_num_proc():
+    datasets = pytest.importorskip("datasets")
+    ds = _pairing_dataset(8)
+    datasets.disable_caching()
+    try:
+        a = _pipeline(num_proc=1).prepare_paired_dataset(ds)
+        b = _pipeline(num_proc=2).prepare_paired_dataset(ds)
+    finally:
+        datasets.enable_caching()
+    for x, y in zip(a["input_features"][8:], b["input_features"][8:]):
+        np.testing.assert_array_equal(x, y)
+
+
+def test_prepare_paired_dataset_filters_once():
+    datasets = pytest.importorskip("datasets")
+    ds = datasets.Dataset.from_dict({
+        "audio": [_clip(dur=0.1), _clip(dur=1.0), _clip(dur=1.0)],
+        "text": ["a", "b", "c"],
+    })
+    out = _pipeline(prob=0.5).prepare_paired_dataset(ds)
+    assert len(out) == 4
+
+
+def test_prepare_paired_dataset_requires_telephone(monkeypatch):
+    ds = _pairing_dataset(2)
+    monkeypatch.setattr("src.data._TELEPHONE_AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="telephone"):
+        _pipeline(prob=0.5).prepare_paired_dataset(ds)
+
+
+def test_prepare_paired_dataset_fails_closed_on_degradation_error(monkeypatch):
+    ds = _pairing_dataset(2)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated codec failure")
+
+    monkeypatch.setattr("src.data.apply_random_telephone", boom)
+    with pytest.raises(RuntimeError, match="simulated codec failure"):
+        _pipeline(prob=0.5).prepare_paired_dataset(ds)
+
+
+class _MismatchedPipeline(PersianASRDataPipeline):
+    def prepare_sample(self, batch, index=None):
+        out = super().prepare_sample(batch, index=index)
+        if self.telephony_prob >= 1.0:
+            out["input_features"] = "not-a-feature"
+        return out
+
+
+def test_prepare_paired_dataset_rejects_schema_mismatch():
+    pipe = _MismatchedPipeline(
+        processor=_StubProcessor(),
+        normalizer=_StubNormalizer(),
+        telephony_prob=0.5,
+        telephony_profiles=["mobile"],
+        telephony_use_ffmpeg=False,
+    )
+    with pytest.raises(ValueError, match="schema"):
+        pipe.prepare_paired_dataset(_pairing_dataset(2))
