@@ -466,6 +466,10 @@ def test_fake_merge_writes_artifacts(tmp_path):
             # Tolerated for parity with scripts/merge_lora.py.
             "--base_model",
             "BuzzASR/persian",
+            "--run_dir",
+            str(tmp_path / "run"),
+            "--hf_run_repo",
+            "me/run",
         ],
         cwd=str(ROOT),
         env=_fake_env(),

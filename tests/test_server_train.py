@@ -1692,6 +1692,36 @@ def test_merge_command_passes_hf_context(client, monkeypatch):
     assert "me/run" in cmd
 
 
+def test_merge_command_omits_hf_flags_without_repo(client, monkeypatch):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+
+    cmd = client.launched[-1]
+    assert "--run_dir" in cmd
+    assert "--hf_run_repo" not in cmd
+
+
+def test_merge_command_prefers_recorded_hf_repo(client, monkeypatch):
+    monkeypatch.setenv("ASR_HF_RUN_REPO", "me/env")
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
+    )
+    _seed_adapter(client, run["run_id"])
+    _write_run(client, run["run_id"], hf={"repo_id": "me/recorded"})
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+
+    cmd = client.launched[-1]
+    assert _flag_value(cmd, "--hf_run_repo") == "me/recorded"
+
+
 def test_monitor_task_start_is_idempotent(client):
     async def scenario():
         first = client.mod._ensure_monitor_task()
