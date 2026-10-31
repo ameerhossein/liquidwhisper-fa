@@ -907,6 +907,39 @@ def _download_merged(
     return _download_tree(download, repo_id, remote_paths, prefix, run_dir / "merged")
 
 
+def restore_artifacts(
+    api: Any,
+    repo_id: str,
+    run_id: str,
+    output_dir: Path | str,
+    *,
+    include_best_adapter: bool = True,
+    download: Any = _default_download,
+) -> int | None:
+    """Download a run's newest complete checkpoint and best adapter.
+
+    Only artifacts under ``output_dir`` are written; the run ledger is left
+    untouched. Used to repair an existing local run whose checkpoint volume
+    was lost, including completed runs that must not be retrained.
+    """
+    validate_repo_id(repo_id)
+    _require_run_id(run_id)
+    files = _listed_files(api, repo_id)
+    output = Path(output_dir)
+    step, _downloaded = _download_checkpoint(
+        download, repo_id, run_id, files, output
+    )
+    if include_best_adapter:
+        _download_best_adapter(
+            download,
+            repo_id,
+            files,
+            repo_run_path(run_id),
+            output,
+        )
+    return step
+
+
 def rewrite_run_paths(run: dict, run_dir: Path) -> dict:
     """Point a restored manifest at its new local folder."""
     run_dir = Path(run_dir)

@@ -164,6 +164,38 @@ def test_restore_without_checkpoint_returns_partial_state(tmp_path):
     assert (tmp_path / RUN / "steps.jsonl").is_file()
 
 
+def test_restore_artifacts_leaves_existing_ledger_untouched(tmp_path):
+    run_dir = tmp_path / RUN
+    run_dir.mkdir()
+    manifest = run_dir / "run.json"
+    manifest.write_text('{"run_id": "%s", "status": "completed"}' % RUN)
+
+    step = hf_sync.restore_artifacts(
+        _api(_files(1000)),
+        "me/run",
+        RUN,
+        run_dir / "output",
+        download=_download(_blobs(1000)),
+    )
+
+    assert step == 1000
+    assert (run_dir / "output" / "checkpoint-1000" / "trainer_state.json").is_file()
+    assert (run_dir / "output" / "best_adapter" / "adapter_config.json").is_file()
+    assert manifest.read_text() == '{"run_id": "%s", "status": "completed"}' % RUN
+
+
+def test_restore_artifacts_returns_none_without_checkpoint(tmp_path):
+    step = hf_sync.restore_artifacts(
+        _api(_files(None)),
+        "me/run",
+        RUN,
+        tmp_path / RUN / "output",
+        download=_download(_blobs(None)),
+    )
+    assert step is None
+    assert (tmp_path / RUN / "output" / "best_adapter" / "adapter_config.json").is_file()
+
+
 def test_rewrite_and_normalize_keep_metrics_and_clear_dead_state(tmp_path):
     run = json.loads(
         _blobs(1000)[f"runs/{RUN}/run.json"].decode()

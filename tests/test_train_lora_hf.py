@@ -164,12 +164,105 @@ def test_hf_resume_completed_run_does_not_train(tmp_path, monkeypatch):
         "restore_run",
         lambda *a, **k: {"run_id": RUN, "checkpoint_step": 1000},
     )
+    downloads = []
+    monkeypatch.setattr(
+        train_lora,
+        "_download_restore_artifacts",
+        lambda api, repo, run_id, current: downloads.append(run_id) or 1000,
+    )
     called = []
     monkeypatch.setattr(
         train_lora, "_run_training", lambda parsed, current: called.append(current)
     )
     train_lora.main()
     assert called == []
+    assert downloads == [RUN]
+
+
+def test_completed_run_with_local_checkpoint_restores_without_repo(
+    tmp_path, monkeypatch
+):
+    train_lora = _train_lora()
+    runs_root = tmp_path / "runs"
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    run_state.create_run(
+        runs_root, run_id=RUN, config={}, trainer_args={}
+    )
+    run_dir = runs_root / RUN
+    run_state.set_status(run_dir, "completed")
+    checkpoint = run_dir / "output" / "checkpoint-1000"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "adapter_model.safetensors").write_text("", encoding="utf-8")
+    args = _restore_args(tmp_path, hf_run_repo=None)
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "make_api",
+        lambda: pytest.fail("a complete local checkpoint needs no HF call"),
+    )
+
+    assert train_lora._restore_hf_run(args) is True
+
+
+def test_completed_run_missing_checkpoint_downloads_without_replacing_ledger(
+    tmp_path, monkeypatch
+):
+    train_lora = _train_lora()
+    _runs_root, run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=2000
+    )
+    run_state.set_status(run_dir, "completed")
+    before = (run_dir / "run.json").read_text(encoding="utf-8")
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: pytest.fail("the local ledger must not be replaced"),
+    )
+    downloads = []
+    monkeypatch.setattr(
+        train_lora,
+        "_download_restore_artifacts",
+        lambda api, repo, run_id, current: downloads.append(run_id) or 1000,
+    )
+
+    assert train_lora._restore_hf_run(args) is True
+    assert downloads == [RUN]
+    assert (run_dir / "run.json").read_text(encoding="utf-8") == before
+
+
+def test_completed_run_missing_checkpoint_without_remote_exits_2(
+    tmp_path, monkeypatch, capsys
+):
+    train_lora = _train_lora()
+    _runs_root, run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=2000
+    )
+    run_state.set_status(run_dir, "completed")
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: pytest.fail("the local ledger must not be replaced"),
+    )
+    monkeypatch.setattr(
+        train_lora, "_download_restore_artifacts", lambda *a, **k: None
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        train_lora._restore_hf_run(args)
+    assert excinfo.value.code == 2
+    assert "no complete checkpoint" in capsys.readouterr().err
+
 
 
 def test_explicit_cli_keys_maps_no_flags():
@@ -308,7 +401,9 @@ def _restore_args(tmp_path, **overrides):
     return SimpleNamespace(**values)
 
 
-def _prepare_restore_run(tmp_path, monkeypatch, *, last_step):
+def _prepare_restore_run(
+    tmp_path, monkeypatch, *, last_step, recorded_repo=None
+):
     runs_root = tmp_path / "runs"
     monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
     run_state.create_run(
@@ -318,6 +413,11 @@ def _prepare_restore_run(tmp_path, monkeypatch, *, last_step):
     if last_step:
         run_state.set_progress(
             run_dir, step=last_step, step_count=last_step, last_step_at=1.0
+        )
+    if recorded_repo:
+        run_state.update_run(
+            run_dir,
+            lambda run: {**run, "hf": {"repo_id": recorded_repo}},
         )
     return runs_root, run_dir
 
@@ -376,9 +476,32 @@ def test_restore_keeps_local_ledger_and_exits_without_remote_checkpoint(
     assert "no usable remote checkpoint" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("remote_step", [1000, 2000])
-def test_restore_replaces_local_ledger_when_remote_not_older(
-    tmp_path, monkeypatch, remote_step
+def test_restore_keeps_local_ledger_on_tie(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path, monkeypatch, last_step=1000
+    )
+    args = _restore_args(tmp_path)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    monkeypatch.setattr(
+        train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
+    )
+    monkeypatch.setattr(train_lora, "_remote_hf_high_water", lambda *a, **k: 1000)
+    monkeypatch.setattr(train_lora, "_remote_checkpoint_step", lambda *a, **k: 1000)
+    restore_calls = []
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: restore_calls.append(k),
+    )
+
+    assert train_lora._restore_hf_run(args) is False
+    assert restore_calls == []
+    assert getattr(args, "_hf_repair_pending", False) is True
+
+
+def test_restore_replaces_local_ledger_when_remote_newer(
+    tmp_path, monkeypatch
 ):
     train_lora = _train_lora()
     _runs_root, _run_dir = _prepare_restore_run(
@@ -390,13 +513,13 @@ def test_restore_replaces_local_ledger_when_remote_not_older(
         train_lora.hf_sync, "resolve_resume_run", lambda *a, **k: RUN
     )
     monkeypatch.setattr(
-        train_lora, "_remote_hf_high_water", lambda *a, **k: remote_step
+        train_lora, "_remote_hf_high_water", lambda *a, **k: 2000
     )
     restore_calls = []
 
     def _restore(*args, **kwargs):
         restore_calls.append(kwargs)
-        return {"run_id": RUN, "checkpoint_step": remote_step}
+        return {"run_id": RUN, "checkpoint_step": 2000}
 
     monkeypatch.setattr(train_lora.hf_sync, "restore_run", _restore)
 
@@ -404,6 +527,99 @@ def test_restore_replaces_local_ledger_when_remote_not_older(
     assert len(restore_calls) == 1
     assert restore_calls[0]["force"] is True
     assert getattr(args, "_hf_repair_pending", False) is False
+
+
+def test_restore_uses_recorded_repo_over_cli(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path,
+        monkeypatch,
+        last_step=2000,
+        recorded_repo="recorded/repo",
+    )
+    args = _restore_args(tmp_path, hf_run_repo="cli/repo")
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    seen = {}
+
+    def _resolve(api, repo_id, requested):
+        seen["resolve"] = repo_id
+        return RUN
+
+    def _high_water(api, repo_id, run_id):
+        seen["high_water"] = repo_id
+        return 1000
+
+    monkeypatch.setattr(train_lora.hf_sync, "resolve_resume_run", _resolve)
+    monkeypatch.setattr(train_lora, "_remote_hf_high_water", _high_water)
+    monkeypatch.setattr(train_lora, "_remote_checkpoint_step", lambda *a, **k: 1000)
+    monkeypatch.setattr(
+        train_lora.hf_sync,
+        "restore_run",
+        lambda *a, **k: pytest.fail("local ledger is newer"),
+    )
+
+    assert train_lora._restore_hf_run(args) is False
+    assert seen == {"resolve": "recorded/repo", "high_water": "recorded/repo"}
+    assert args.hf_run_repo == "recorded/repo"
+
+
+def test_restore_uses_recorded_repo_without_cli_or_env(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path,
+        monkeypatch,
+        last_step=0,
+        recorded_repo="recorded/repo",
+    )
+    args = _restore_args(tmp_path, hf_run_repo=None)
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr(train_lora.hf_sync, "resolve_config", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    seen = {}
+
+    def _resolve(api, repo_id, requested):
+        seen["resolve"] = repo_id
+        return RUN
+
+    def _restore(api, repo_id, run_id, runs_root, **kwargs):
+        seen["restore"] = repo_id
+        return {"run_id": RUN, "checkpoint_step": 1000}
+
+    monkeypatch.setattr(train_lora.hf_sync, "resolve_resume_run", _resolve)
+    monkeypatch.setattr(train_lora.hf_sync, "restore_run", _restore)
+
+    assert train_lora._restore_hf_run(args) is False
+    assert seen == {"resolve": "recorded/repo", "restore": "recorded/repo"}
+    assert args.hf_run_repo == "recorded/repo"
+
+
+def test_restore_latest_switches_to_recorded_repo(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    _runs_root, _run_dir = _prepare_restore_run(
+        tmp_path,
+        monkeypatch,
+        last_step=0,
+        recorded_repo="recorded/repo",
+    )
+    args = _restore_args(tmp_path, hf_resume="latest", hf_run_repo="cli/repo")
+    monkeypatch.setattr(train_lora.hf_sync, "make_api", lambda: object())
+    seen = {}
+
+    def _resolve(api, repo_id, requested):
+        seen["resolve"] = repo_id
+        assert requested == "latest"
+        return RUN
+
+    def _restore(api, repo_id, run_id, runs_root, **kwargs):
+        seen["restore"] = repo_id
+        return {"run_id": RUN, "checkpoint_step": 1000}
+
+    monkeypatch.setattr(train_lora.hf_sync, "resolve_resume_run", _resolve)
+    monkeypatch.setattr(train_lora.hf_sync, "restore_run", _restore)
+
+    assert train_lora._restore_hf_run(args) is False
+    assert seen == {"resolve": "cli/repo", "restore": "recorded/repo"}
+    assert args.hf_run_repo == "recorded/repo"
 
 
 def test_build_mirror_repairs_before_starting_uploader(tmp_path, monkeypatch):

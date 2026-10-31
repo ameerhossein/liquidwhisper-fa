@@ -845,27 +845,126 @@ def _remote_checkpoint_step(api, repo_id: str, run_id: str) -> Optional[int]:
     return hf_sync.select_checkpoint_step(files, run_id)
 
 
+def _hf_config_for_repo(args, repo_id: str):
+    """Return an ``HFSyncConfig`` that targets *repo_id* (recorded on a run)."""
+    try:
+        config = hf_sync.resolve_config(args)
+    except Exception:
+        config = None
+    if config is not None:
+        return replace(config, repo_id=repo_id)
+    try:
+        steps = int(getattr(args, "hf_adapter_snapshot_steps", 250))
+    except (TypeError, ValueError):
+        steps = 250
+    return hf_sync.HFSyncConfig(
+        repo_id=repo_id,
+        private=bool(getattr(args, "hf_private", True)),
+        adapter_snapshot_steps=max(0, steps),
+        auto_resume=bool(getattr(args, "hf_auto_resume", True)),
+    )
+
+
+def _select_restore_repo(args, config, recorded_repo: str):
+    """Prefer the repo recorded in ``run.json`` over a CLI/env override."""
+    if not recorded_repo:
+        return config
+    args.hf_run_repo = recorded_repo
+    if config is None:
+        print(f"[hf-sync] using the repo recorded in run.json ({recorded_repo})")
+        return _hf_config_for_repo(args, recorded_repo)
+    if config.repo_id != recorded_repo:
+        print(
+            "[hf-sync] using the repo recorded in run.json "
+            f"({recorded_repo}); ignoring {config.repo_id}"
+        )
+        return replace(config, repo_id=recorded_repo)
+    return config
+
+
+def _download_restore_artifacts(
+    api, repo_id: str, run_id: str, run_dir
+) -> Optional[int]:
+    """Download checkpoint/best-adapter artifacts without touching the ledger."""
+    try:
+        return hf_sync.restore_artifacts(
+            api, repo_id, run_id, Path(run_dir) / "output"
+        )
+    except Exception as exc:
+        print(
+            f"[hf-sync] could not download artifacts for {run_id}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _restore_hf_run(args) -> bool:
     """Handle ``--hf_resume``; return True when main should stop.
 
     The completed-run case returns True so ``main`` exits 0 before creating an
-    attempt, changing status, or entering training. Runs without a complete
-    checkpoint are restored (ledger-only) and then rejected with exit code 2.
+    attempt, changing status, or entering training. A completed run with a
+    local checkpoint restores nothing; one without a checkpoint downloads the
+    newest remote checkpoint and best adapter without replacing ``run.json``.
     """
     requested = str(getattr(args, "hf_resume", "none") or "none").strip()
     if requested == "none":
         return False
+
+    runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
+    explicit = requested != "latest"
+    run_dir = None
+    local_run = None
+    if explicit:
+        if not run_state.run_id_valid(requested):
+            print(
+                f"error: invalid run id {requested!r}; expected "
+                "YYYYMMDD-HHMMSS-<6 hex chars>",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        run_dir = runs_root / requested
+        local_run = run_state.load_run(run_dir)
+        local_checkpoint = (
+            _local_checkpoint_step(run_dir / "output")
+            if local_run is not None
+            else None
+        )
+        if (
+            local_run is not None
+            and str(local_run.get("status") or "") == "completed"
+            and local_checkpoint is not None
+        ):
+            print(f"Restored completed run: {run_dir}")
+            return True
+
+    recorded_repo = _run_hf_repo_id(local_run) if explicit else ""
     try:
         config = hf_sync.resolve_config(args)
     except Exception as exc:
-        print(f"error: invalid HF configuration: {exc}", file=sys.stderr)
-        raise SystemExit(2)
-    if config is None:
+        if not recorded_repo:
+            print(f"error: invalid HF configuration: {exc}", file=sys.stderr)
+            raise SystemExit(2)
         print(
-            "error: --hf_resume requires --hf_run_repo or ASR_HF_RUN_REPO.",
+            f"[hf-sync] ignoring invalid repo override ({exc}); using "
+            f"{recorded_repo} from run.json"
+        )
+        config = None
+    try:
+        config = _select_restore_repo(args, config, recorded_repo)
+    except Exception as exc:
+        print(
+            f"error: invalid HF repo recorded in run.json: {exc}",
             file=sys.stderr,
         )
         raise SystemExit(2)
+    if config is None:
+        print(
+            "error: --hf_resume requires --hf_run_repo, ASR_HF_RUN_REPO, "
+            "or a run.json hf.repo_id.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     try:
         api = hf_sync.make_api()
         run_id = hf_sync.resolve_resume_run(api, config.repo_id, requested)
@@ -876,28 +975,66 @@ def _restore_hf_run(args) -> bool:
         )
         raise SystemExit(2)
 
-    runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
     run_dir = runs_root / run_id
     args.run_dir = str(run_dir)
 
-    local_run = run_state.load_run(run_dir)
-    checkpoint_step = (
-        _local_checkpoint_step(run_dir / "output") if local_run is not None else None
+    if not explicit:
+        local_run = run_state.load_run(run_dir)
+        recorded_repo = _run_hf_repo_id(local_run)
+        try:
+            config = _select_restore_repo(args, config, recorded_repo)
+        except Exception as exc:
+            print(
+                f"error: invalid HF repo recorded in run.json: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    args.hf_run_repo = config.repo_id
+
+    local_checkpoint = (
+        _local_checkpoint_step(run_dir / "output")
+        if local_run is not None
+        else None
     )
+    completed = local_run is not None and str(
+        local_run.get("status") or ""
+    ) == "completed"
+    if completed:
+        if local_checkpoint is not None:
+            print(f"Restored completed run: {run_dir}")
+            return True
+        checkpoint_step = _download_restore_artifacts(
+            api, config.repo_id, run_id, run_dir
+        )
+        if checkpoint_step is None:
+            print(
+                f"error: completed run {run_id} has no local checkpoint and the "
+                f"remote repo has no complete checkpoint to restore; run "
+                f"directory: {run_dir}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        print(
+            f"Restored completed run: {run_dir} "
+            f"(checkpoint-{checkpoint_step})"
+        )
+        return True
+
+    checkpoint_step = local_checkpoint
     repair_pending = False
     should_restore = local_run is None or checkpoint_step is None
     if local_run is not None and checkpoint_step is None:
         local_step = _local_hf_high_water(local_run, run_dir)
         if local_step > 0:
             remote_step = _remote_hf_high_water(api, config.repo_id, run_id)
-            if local_step > (remote_step or 0):
+            if local_step >= (remote_step or 0):
                 remote_checkpoint = _remote_checkpoint_step(
                     api, config.repo_id, run_id
                 )
                 if remote_checkpoint is None:
                     print(
                         f"error: cannot restore run {run_id}: the local ledger "
-                        f"is at step {local_step}, newer than remote step "
+                        f"is at step {local_step}, not older than remote step "
                         f"{remote_step if remote_step is not None else 'unknown'}, "
                         "and the remote repo has no usable remote checkpoint to "
                         "repair from",
@@ -906,7 +1043,7 @@ def _restore_hf_run(args) -> bool:
                     raise SystemExit(2)
                 print(
                     f"[hf-sync] keeping the local ledger for {run_id} "
-                    f"(last_step {local_step} is newer than remote "
+                    f"(last_step {local_step} is not older than remote "
                     f"{remote_step if remote_step is not None else 'unknown'}); "
                     f"auto-repair will fetch checkpoint-{remote_checkpoint} "
                     "before training resumes."
