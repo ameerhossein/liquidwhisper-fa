@@ -15,6 +15,7 @@ import json
 import shutil
 import time
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 
 # Must precede any HF tokenizer import: forked datasets.map workers deadlock
 # if the parent created tokenizers with parallelism enabled (see src/data.py).
@@ -66,11 +67,17 @@ from src.normalizer import PersianTextNormalizer
 from src.metrics import ASRMetricsCalculator
 from src.collator import DataCollatorSpeechSeq2SeqWithPadding
 from src.data import PersianASRDataPipeline, persian_label_ids
-from src.trainer_callbacks import WebTelemetryCallback, _resolve_infer_dtype, _should_autocast
+from src.trainer_callbacks import (
+    WebTelemetryCallback,
+    HFMirrorCallback,
+    _resolve_infer_dtype,
+    _should_autocast,
+)
 from src.preflight import compute_deltas, preflight_path, run_preflight
 from src import paths as _managed_paths
 from src import prep_cache
 from src import run_state
+from src import hf_sync
 
 
 def _default_output_dir() -> str:
@@ -88,7 +95,8 @@ def _resolve_results_dir(raw: Optional[str]) -> str:
     return _managed_paths.resolve_results_dir(raw)
 
 
-def parse_args():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the training CLI parser without applying the YAML overlay."""
     parser = argparse.ArgumentParser(description="Train BuzzASR with LoRA on Persian Speech")
     # Model & Data
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config (e.g. configs/l40s_train_config.yaml). CLI flags override file.")
@@ -99,6 +107,13 @@ def parse_args():
     parser.add_argument("--run_dir", type=str, default=None, help="Persistent run directory for the cockpit/CLI run ledger (optional).")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Limit train samples (smoke test)")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Limit eval samples")
+
+    # Hugging Face run mirror (off unless a repo id is configured).
+    parser.add_argument("--hf_run_repo", "--hf-run-repo", type=str, default=None, help="Hugging Face repo id (<owner>/<name>) used to mirror this run. Env ASR_HF_RUN_REPO also works; unset disables mirroring.")
+    parser.add_argument("--hf_private", "--hf-private", action=argparse.BooleanOptionalAction, default=True, help="Create the mirror repo private (default).")
+    parser.add_argument("--hf_adapter_snapshot_steps", "--hf-adapter-snapshot-steps", type=int, default=250, help="Upload an adapter-only snapshot every N steps; 0 disables snapshots.")
+    parser.add_argument("--hf_auto_resume", "--hf-auto-resume", action=argparse.BooleanOptionalAction, default=True, help="Pull a newer remote checkpoint before resuming (ignored with --fresh_start).")
+    parser.add_argument("--hf_resume", type=str, default="none", metavar="{none,latest,<run_id>}", help="Restore a mirrored run (latest or a run id) and resume it instead of starting fresh.")
 
     # LoRA Hyperparameters
     parser.add_argument("--lora_r", type=int, default=64, help="LoRA rank")
@@ -149,9 +164,49 @@ def parse_args():
     parser.add_argument("--reuse_prep", "--reuse-prep", action=argparse.BooleanOptionalAction, default=True, help="Load prepared datasets from prep_cache_dir when fingerprint matches (skips re-prep).")
     parser.add_argument("--overwrite_prep_cache", "--overwrite-prep-cache", action=argparse.BooleanOptionalAction, default=False, help="Force re-prep even if cache hits (use after data/code/telephone-seed changes).")
     parser.add_argument("--gradient_checkpointing", "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False, help="Recompute activations in the backward pass to save VRAM. Off is the fast L40S default; enable it only if a larger micro-batch requires it.")
+    return parser
+
+
+def _explicit_cli_keys(parser: argparse.ArgumentParser, argv) -> set[str]:
+    """Return the ``action.dest`` values named explicitly on the command line."""
+    dest_by_option: Dict[str, Optional[str]] = {}
+    for action in parser._actions:
+        for option in getattr(action, "option_strings", ()) or ():
+            dest_by_option[option] = getattr(action, "dest", None)
+    keys: set[str] = set()
+    for token in argv or ():
+        if not isinstance(token, str) or not token.startswith("--"):
+            continue
+        name = token.split("=", 1)[0]
+        dest = dest_by_option.get(name)
+        if dest is None and name.startswith("--no-"):
+            base = name[5:]
+            for candidate in (
+                "--" + base,
+                "--" + base.replace("-", "_"),
+                "--" + base.replace("_", "-"),
+            ):
+                if candidate in dest_by_option:
+                    dest = dest_by_option[candidate]
+                    break
+        if dest is not None and dest is not argparse.SUPPRESS:
+            keys.add(dest)
+    return keys
+
+
+def parse_args():
+    parser = build_parser()
     args = parser.parse_args()
-    # YAML config overlay: file provides defaults, CLI wins only if explicitly passed.
-    if args.config:
+    # Restore mode uses the saved trainer_args as its base. Applying the YAML
+    # overlay here would silently override them, so --config is ignored in
+    # that mode; explicit individual CLI flags remain the override mechanism.
+    restore_requested = str(getattr(args, "hf_resume", "none") or "none").strip() != "none"
+    if args.config and restore_requested:
+        print(
+            "Warning: --config is ignored with --hf_resume; the restored "
+            "run's trainer_args are used (individual CLI flags still override)."
+        )
+    elif args.config:
         if not _YAML_AVAILABLE:
             print("Warning: PyYAML not installed; ignoring --config. pip install pyyaml")
         else:
@@ -163,6 +218,8 @@ def parse_args():
             "telephony_mode must be one of paired, disjoint, clean "
             f"(got {args.telephony_mode!r})."
         )
+    if bool(getattr(args, "fresh_start", False)) and restore_requested:
+        parser.error("--fresh_start cannot be combined with --hf_resume.")
     # load_best_model_at_end needs save_steps to be a multiple of eval_steps; the
     # Trainer only checks this after data prep and model load.
     if args.save_steps % args.eval_steps != 0:
@@ -171,6 +228,7 @@ def parse_args():
         parser.error("--preflight_samples must be between 0 and 10000 (0 = full test).")
     if not args.gradient_checkpointing and args.batch_size > 8:
         print("Warning: batch_size > 8 without gradient checkpointing may run out of VRAM on a 48 GB GPU.")
+    args._explicit_keys = _explicit_cli_keys(parser, sys.argv[1:])
     return args
 
 
@@ -594,6 +652,10 @@ def _cli_run_config(args) -> dict:
         "run_post_test_eval",
         "run_epoch_benchmark",
         "enable_telemetry",
+        "hf_run_repo",
+        "hf_private",
+        "hf_adapter_snapshot_steps",
+        "hf_auto_resume",
     )
     return {key: _json_safe(getattr(args, key, None)) for key in keys}
 
@@ -616,6 +678,196 @@ def _validate_cli_run_dir(run_dir: Path) -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
+
+
+def _maybe_create_hf_run_dir(args) -> Optional[Path]:
+    """Create a canonical run directory when HF mirroring is enabled.
+
+    The remote layout is keyed by run id, so a mirrored run needs a ledger
+    directory even when the caller did not pass ``--run_dir``. Allocating the
+    run here (before main's run-dir handling) makes output/results defaults
+    run-scoped exactly like an explicit CLI run.
+    """
+    repo = getattr(args, "hf_run_repo", None) or os.environ.get("ASR_HF_RUN_REPO")
+    if not str(repo or "").strip():
+        return None
+    if bool(getattr(args, "post_eval_only", False)):
+        return None
+    if getattr(args, "run_dir", None):
+        return None
+    runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
+    run_dir = runs_root / run_state.new_run_id()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    args.run_dir = str(run_dir)
+    return run_dir
+
+
+def _run_hf_repo_id(run: Any) -> str:
+    """Return the repo id recorded on a run manifest, if any."""
+    if not isinstance(run, Mapping):
+        return ""
+    hf = run.get("hf")
+    if not isinstance(hf, Mapping):
+        return ""
+    return str(hf.get("repo_id") or "").strip()
+
+
+def _build_hf_mirror(args, run_dir, run=None):
+    """Build and start the run mirror, or return ``None`` when it is off.
+
+    The feature is off unless ``--hf_run_repo`` or ``ASR_HF_RUN_REPO`` is set,
+    so no Hugging Face import or network call happens in the default path.
+    Mirror failures are logged and never propagate into training.
+    """
+    if run_dir is None:
+        return None
+    try:
+        config = hf_sync.resolve_config(args)
+    except Exception as exc:
+        print(f"[hf-sync] disabled: invalid configuration: {exc}")
+        return None
+    if config is None:
+        return None
+    try:
+        if run is None:
+            run = run_state.load_run(run_dir)
+        recorded_repo = _run_hf_repo_id(run)
+        if recorded_repo:
+            if recorded_repo != config.repo_id:
+                print(
+                    "[hf-sync] using the repo recorded in run.json "
+                    f"({recorded_repo}); ignoring {config.repo_id}"
+                )
+            config = replace(config, repo_id=recorded_repo)
+        mirror = hf_sync.HFRunMirror(
+            config,
+            run_id=Path(run_dir).name,
+            run_dir=Path(run_dir),
+            output_dir=Path(args.output_dir),
+            results_dir=Path(args.results_dir),
+            manifest_update=lambda mutate: run_state.update_run(run_dir, mutate),
+        )
+        mirror.start()
+    except Exception as exc:
+        print(f"[hf-sync] disabled: {exc}")
+        return None
+    # A pod restart may have lost the local checkpoint volume while the ledger
+    # survived. Pull the newest remote checkpoint before checkpoint selection.
+    if bool(getattr(args, "hf_auto_resume", True)) and not bool(
+        getattr(args, "fresh_start", False)
+    ):
+        try:
+            mirror.auto_repair()
+        except Exception as exc:
+            print(f"[hf-sync] auto repair failed: {exc}")
+    return mirror
+
+
+def _local_checkpoint_step(output_dir) -> Optional[int]:
+    """Return the highest complete local checkpoint step, if any."""
+    best: Optional[int] = None
+    try:
+        entries = list(Path(output_dir).glob("checkpoint-*"))
+    except OSError:
+        return None
+    for path in entries:
+        match = hf_sync.CHECKPOINT_RE.fullmatch(path.name)
+        if match is None or not hf_sync.is_complete_checkpoint(path):
+            continue
+        step = int(match.group(1))
+        best = step if best is None else max(best, step)
+    return best
+
+
+def _restore_hf_run(args) -> bool:
+    """Handle ``--hf_resume``; return True when main should stop.
+
+    The completed-run case returns True so ``main`` exits 0 before creating an
+    attempt, changing status, or entering training. Runs without a complete
+    checkpoint are restored (ledger-only) and then rejected with exit code 2.
+    """
+    requested = str(getattr(args, "hf_resume", "none") or "none").strip()
+    if requested == "none":
+        return False
+    try:
+        config = hf_sync.resolve_config(args)
+    except Exception as exc:
+        print(f"error: invalid HF configuration: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    if config is None:
+        print(
+            "error: --hf_resume requires --hf_run_repo or ASR_HF_RUN_REPO.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        api = hf_sync.make_api()
+        run_id = hf_sync.resolve_resume_run(api, config.repo_id, requested)
+    except Exception as exc:
+        print(
+            f"error: could not resolve HF run {requested!r}: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
+    run_dir = runs_root / run_id
+    args.run_dir = str(run_dir)
+
+    local_run = run_state.load_run(run_dir)
+    checkpoint_step = (
+        _local_checkpoint_step(run_dir / "output") if local_run is not None else None
+    )
+    if local_run is None or checkpoint_step is None:
+        # restore_run stages and validates the whole run before replacing any
+        # existing local copy, so force is safe for a partial local ledger.
+        try:
+            restored = hf_sync.restore_run(
+                api,
+                config.repo_id,
+                run_id,
+                runs_root,
+                force=local_run is not None,
+            )
+        except Exception as exc:
+            print(
+                f"error: could not restore run {run_id}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raw_step = restored.get("checkpoint_step")
+        checkpoint_step = int(raw_step) if raw_step is not None else None
+
+    run = run_state.load_run(run_dir)
+    if run is None:
+        print(
+            f"error: restored run ledger not found at {run_dir / 'run.json'}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    hf_sync.apply_restored_args(
+        args,
+        run,
+        explicit=getattr(args, "_explicit_keys", set()),
+        run_dir=run_dir,
+    )
+    args.telephony_profiles = _parse_telephony_profiles(
+        getattr(args, "telephony_profiles", "customer")
+    )
+    if str(run.get("status") or "") == "completed":
+        print(f"Restored completed run: {run_dir}")
+        return True
+    if checkpoint_step is None:
+        print(
+            f"error: run {run_id} has no complete checkpoint to resume from; "
+            f"it was restored to {run_dir}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    print(
+        f"Restored {run_id} at checkpoint-{checkpoint_step}; resuming from {run_dir}"
+    )
+    return False
 
 
 def _ensure_cli_run(run_dir: Path, args) -> dict:
@@ -1017,6 +1269,13 @@ def main():
         getattr(args, "telephony_profiles", "customer")
     )
     explicit_results = getattr(args, "results_dir", None) not in (None, "")
+    restore_requested = str(getattr(args, "hf_resume", "none") or "none").strip() != "none"
+    restore_mode = False
+    if restore_requested:
+        if _restore_hf_run(args):
+            return 0
+        restore_mode = True
+    _maybe_create_hf_run_dir(args)
     run_dir = (
         Path(args.run_dir).expanduser().resolve()
         if getattr(args, "run_dir", None)
@@ -1046,8 +1305,10 @@ def main():
         try:
             run = _ensure_cli_run(run_dir, args)
             # Persist the full effective namespace before any stage work so Resume
-            # can recreate the exact LoRA/scheduler/telephony settings.
-            _record_trainer_args(run_dir, args)
+            # can recreate the exact LoRA/scheduler/telephony settings. A
+            # restored run already carries the saved trainer_args.
+            if not restore_mode:
+                _record_trainer_args(run_dir, args)
             _mark_run_status(run_dir, "running")
             # The server records the attempt before spawning its child; a standalone
             # CLI invocation owns its own attempt and PID file.
@@ -1080,13 +1341,39 @@ def main():
             _finalize_cli_run(run_dir, exit_code)
 
 
+def _finish_hf_mirror(mirror, run_dir) -> None:
+    """Upload the terminal ledger and stop the mirror without failing training."""
+    if mirror is None:
+        return
+    try:
+        run = run_state.load_run(run_dir) if run_dir else None
+        if run is not None:
+            mirror.enqueue_ledger(str(run.get("status") or "running"))
+    except Exception as exc:
+        print(f"[hf-sync] could not enqueue the final ledger: {exc}")
+    try:
+        mirror.close()
+    except Exception as exc:
+        print(f"[hf-sync] could not close the mirror: {exc}")
+
+
 def _run_training(args, run_dir):
+    mirror = _build_hf_mirror(args, run_dir)
+    try:
+        _run_training_stages(args, run_dir, mirror)
+    finally:
+        _finish_hf_mirror(mirror, run_dir)
+
+
+def _run_training_stages(args, run_dir, mirror):
     # Post-eval-only resume: never repeat dataset prep, preflight, or training,
     # and never replay optimizer steps.
     if bool(getattr(args, "post_eval_only", False)):
         if bool(getattr(args, "fresh_start", False)):
             print("Note: --fresh_start is ignored with --post_eval_only.")
         _run_post_eval_only(args)
+        if mirror is not None:
+            mirror.enqueue_ledger("post_eval", reports=True)
         return
 
     stop_signal = os.path.join(args.results_dir, "stop_training.signal")
@@ -1316,6 +1603,8 @@ def _run_training(args, run_dir):
         "completed",
         detail=("cache hit" if preflight.get("cached") else f"measured, n={measured_samples}"),
     )
+    if mirror is not None:
+        mirror.enqueue_ledger("preflight")
     baseline_benchmark = baseline_models
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1393,6 +1682,19 @@ def _run_training(args, run_dir):
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
         )
         callbacks.append(telemetry_cb)
+    if mirror is not None:
+        callbacks.append(
+            HFMirrorCallback(
+                mirror,
+                model=model,
+                processor=processor,
+                output_dir=args.output_dir,
+                snapshot_steps=int(
+                    getattr(args, "hf_adapter_snapshot_steps", 250)
+                ),
+                save_steps=int(getattr(args, "save_steps", 1000)),
+            )
+        )
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
@@ -1508,6 +1810,8 @@ def _run_training(args, run_dir):
     trainer.model.save_pretrained(best_save_path)
     processor.save_pretrained(best_save_path)
     print("Done saving best adapter.")
+    if mirror is not None:
+        mirror.enqueue_adapter(best_save_path)
 
     if halted:
         return
@@ -1543,6 +1847,8 @@ def _run_training(args, run_dir):
             evaluate=evaluate,
         ):
             return
+        if mirror is not None:
+            mirror.enqueue_ledger("post_eval", reports=True)
     else:
         _mark_run_stage(run_dir, "post_eval", "skipped", detail=None)
         _write_telemetry_status(args.results_dir, "completed", run_dir=run_dir)
