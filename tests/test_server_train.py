@@ -4,9 +4,11 @@ Training is never launched: the audio-backend check is stubbed and subprocess.Po
 records the command instead. Benchmark tests only read files under tmp_path.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -75,11 +77,12 @@ def _write_run(client, run_id=None, **fields):
         )
         assert runs, "no run manifest to update"
         run_id = runs[-1]
-    path = client.mod.RUNS_DIR / run_id / "run.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data.update(fields)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return data
+
+    def mutate(run):
+        run.update(fields)
+        return run
+
+    return run_state.update_run(client.mod.RUNS_DIR / run_id, mutate)
 
 
 def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
@@ -481,6 +484,98 @@ def test_start_rejects_explicit_results_dir(client):
     assert client.launched == []
 
 
+def test_resume_unknown_run_checks_manifest_before_audio(client, monkeypatch):
+    def broken_audio():
+        raise client.mod.HTTPException(
+            status_code=500, detail="audio backend unavailable"
+        )
+
+    monkeypatch.setattr(client.mod, "_check_audio_backend_or_400", broken_audio)
+    res = client.post("/api/runs/20261031-000000-abcdef/resume")
+    assert res.status_code == 404
+
+
+def test_resume_completed_run_checks_status_before_audio(client, monkeypatch):
+    start = client.post("/api/train/start", json={}).json()
+    _write_run(
+        client, start["run_id"], status="completed", current_pid=None
+    )
+
+    def broken_audio():
+        raise client.mod.HTTPException(
+            status_code=500, detail="audio backend unavailable"
+        )
+
+    monkeypatch.setattr(client.mod, "_check_audio_backend_or_400", broken_audio)
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 400
+    assert "cannot resume" in res.json()["detail"]
+
+
+def test_resume_rejected_while_live_run_exists(client):
+    client.post("/api/train/start", json={})
+    other = run_state.create_run(
+        client.mod.RUNS_DIR, config={}, trainer_args={}
+    )
+    other_dir = client.mod.RUNS_DIR / other["run_id"]
+    run_state.set_status(other_dir, "failed")
+    res = client.post(f"/api/runs/{other['run_id']}/resume")
+    assert res.status_code == 400
+    assert "already running" in res.json()["detail"]
+    assert len(client.launched) == 1
+
+
+def test_resume_uses_manifest_run_dir(client, tmp_path):
+    start = client.post("/api/train/start", json={}).json()
+    source_dir = client.mod.RUNS_DIR / start["run_id"]
+    manifest_run_dir = tmp_path / "cli-run"
+
+    def repoint(run):
+        run["status"] = "failed"
+        run["paths"]["run_dir"] = str(manifest_run_dir)
+        return run
+
+    run_state.update_run(source_dir, repoint)
+    shutil.copytree(source_dir, manifest_run_dir)
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+    res = client.post(f"/api/runs/{start['run_id']}/resume")
+    assert res.status_code == 200, res.text
+    flags = _flags(client.launched[-1])
+    assert flags["--run_dir"] == str(manifest_run_dir)
+    assert run_state.load_run(manifest_run_dir)["status"] == "running"
+
+
+def test_run_preflight_file_falls_back_to_legacy(client, tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy-preflight.json"
+    monkeypatch.setattr(client.mod, "PREFLIGHT_FILE", legacy)
+    run = {
+        "run_id": "20261031-000000-abcdef",
+        "paths": {
+            "run_dir": str(tmp_path / "missing-run"),
+            "preflight_cache": str(
+                tmp_path / "missing-shared" / "baselines" / "preflight.json"
+            ),
+        },
+    }
+    assert client.mod._run_preflight_file(run) == legacy
+
+
+def test_escalate_halt_pid_skips_terminate_when_run_completed(
+    client, tmp_path, monkeypatch
+):
+    telemetry = tmp_path / "run-telemetry.json"
+    telemetry.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    terminated = []
+    monkeypatch.setattr(client.mod, "HALT_GRACE_SECONDS", 0)
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: True)
+    monkeypatch.setattr(
+        client.mod, "_terminate_child", lambda pid: terminated.append(pid)
+    )
+    asyncio.run(client.mod._escalate_halt_pid(12345, telemetry))
+    assert terminated == []
+
+
 def test_start_uses_fake_trainer_when_enabled(client, monkeypatch):
     monkeypatch.setenv("ASR_FAKE_TRAINER", "1")
     res = client.post("/api/train/start", json={})
@@ -531,6 +626,45 @@ def test_status_includes_run_and_storage(client):
     assert body["active_run_id"] == body["run"]["run_id"]
     assert body["storage"]["runs_dir"] == str(client.mod.RUNS_DIR)
     assert body["steps"]["count"] == 0
+
+
+def test_run_scoped_logs_and_status_use_active_run_files(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    (run_dir / "training_live.log").write_text(
+        "run-scoped log marker\n", encoding="utf-8"
+    )
+    client.mod.LOG_FILE.write_text("legacy log marker\n", encoding="utf-8")
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({
+            "status": "training",
+            "step": 77,
+            "max_steps": 100,
+            "epoch": 1.5,
+            "loss": 0.25,
+            "learning_rate": 1e-4,
+            "speed_s_per_step": 0.5,
+            "eta_seconds": 12,
+        }),
+        encoding="utf-8",
+    )
+    client.mod.TELEMETRY_FILE.write_text(
+        json.dumps({"status": "training", "step": 1}), encoding="utf-8"
+    )
+
+    logs = client.get("/api/logs").json()["logs"]
+    assert "run-scoped log marker" in logs
+    assert "legacy log marker" not in logs
+    body = client.get("/api/status").json()
+    assert body["step"] == 77
+    assert body["run"]["run_id"] == start["run_id"]
+
+
+def test_legacy_stop_without_run_reports_not_running(client):
+    res = client.post("/api/train/stop", json={})
+    assert res.status_code == 200
+    assert res.json()["status"] == "not_running"
+    assert not client.mod.STOP_SIGNAL_FILE.exists()
 
 
 def test_resume_reuses_paths_and_appends_attempt(client):

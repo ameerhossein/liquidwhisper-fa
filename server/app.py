@@ -299,6 +299,8 @@ def _refresh_runs() -> Dict[str, Any]:
             "merge_run": None,
             "runs": runs,
         }
+    # Task 6 owns merge busy-gating; Task 5 intentionally ignores the
+    # summary's "merge_run" slot when deciding start/resume/stop.
     active = summary.get("active_run")
     latest = summary.get("latest_run")
     ACTIVE_RUN_ID = str(active.get("run_id")) if active else None
@@ -1326,7 +1328,9 @@ def _run_preflight_file(run: Optional[Dict[str, Any]]) -> Path:
         / "baselines"
         / "preflight.json"
     )
-    return shared if shared.is_file() else run_copy
+    if shared.is_file():
+        return shared
+    return PREFLIGHT_FILE
 
 
 def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1464,14 +1468,14 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
 def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     if not run_state.run_id_valid(run_id):
         raise HTTPException(status_code=404, detail="Run not found.")
-    _check_audio_backend_or_400()
-    if _any_training_running():
-        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
-
-    run_dir = RUNS_DIR / run_id
-    run = run_state.load_run(run_dir)
+    manifest_dir = RUNS_DIR / run_id
+    run = run_state.load_run(manifest_dir)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
+    # Reconcile a dead running/starting attempt before deciding whether the
+    # run is resumable; completed runs are still rejected below.
+    _refresh_runs()
+    run = run_state.load_run(manifest_dir) or run
     status = str(run.get("status") or "")
     if status not in ("interrupted", "stopped", "failed"):
         raise HTTPException(
@@ -1479,6 +1483,11 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
             detail=f"Run {run_id} cannot resume from status '{status or 'unknown'}'.",
         )
 
+    _check_audio_backend_or_400()
+    if _any_training_running():
+        raise HTTPException(status_code=400, detail="Training or smoke test is already running.")
+
+    run_dir = _run_dir(run)
     stored_paths = dict(run.get("paths") or {})
     output_dir = str(stored_paths.get("output_dir") or (run_dir / "output"))
     results_dir = str(stored_paths.get("results_dir") or run_dir)
@@ -1506,7 +1515,6 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     post_eval_status = str((stages.get("post_eval") or {}).get("status") or "pending")
     post_eval_only = training_status == "completed" and post_eval_status != "completed"
 
-    trainer_args["run_dir"] = str(run_dir)
     response_config = {
         "epochs": str(trainer_args.get("epochs", "")),
         "batch_size": str(trainer_args.get("batch_size", "")),
@@ -1579,11 +1587,17 @@ async def _escalate_halt(
         await asyncio.sleep(2)
 
 
-async def _escalate_halt_pid(pid: int) -> None:
+async def _escalate_halt_pid(
+    pid: int,
+    telemetry_file: Optional[Path] = None,
+) -> None:
     """Escalate against a run PID recovered from the ledger after a restart."""
     deadline = time.time() + HALT_GRACE_SECONDS
+    telemetry_path = Path(telemetry_file) if telemetry_file is not None else TELEMETRY_FILE
     while _is_process_running(pid):
         if time.time() >= deadline:
+            if read_json_safely(telemetry_path, {}).get("status") in ("stopped", "completed"):
+                return
             _terminate_child(pid)
             return
         await asyncio.sleep(2)
@@ -1598,7 +1612,7 @@ async def stop_training(payload: Dict[str, Any] = None):
 
     if active is not None:
         run_id = str(active.get("run_id"))
-        run_dir = RUNS_DIR / run_id
+        run_dir = _run_dir(active)
         paths = _run_paths(active)
         try:
             paths["stop_signal_file"].parent.mkdir(parents=True, exist_ok=True)
@@ -1638,7 +1652,9 @@ async def stop_training(payload: Dict[str, Any] = None):
             )
         elif pid is not None:
             try:
-                asyncio.create_task(_escalate_halt_pid(int(pid)))
+                asyncio.create_task(
+                    _escalate_halt_pid(int(pid), paths["telemetry_file"])
+                )
             except (TypeError, ValueError):
                 pass
         return {"status": "stopping", "run_id": run_id}
