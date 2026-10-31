@@ -1642,6 +1642,117 @@ def test_refresh_cached_reuses_scan_within_ttl(client, monkeypatch):
     assert len(calls) == 2
 
 
+def test_spawn_and_stop_invalidate_cached_scan(client, monkeypatch):
+    calls = []
+    orig = client.mod.run_state.reconcile_all
+
+    def counting(root, **kwargs):
+        calls.append(1)
+        return orig(root, **kwargs)
+
+    monkeypatch.setattr(client.mod.run_state, "reconcile_all", counting)
+    client.mod._refresh_runs_cached()
+    assert len(calls) == 1
+
+    # A spawn must force the next cached read to rescan so the new run is
+    # visible immediately instead of serving the pre-spawn summary.
+    start = client.post("/api/train/start", json={}).json()
+    n_after_post = len(calls)  # the busy-check refresh inside POST
+    summary = client.mod._refresh_runs_cached()
+    assert len(calls) == n_after_post + 1
+    assert summary["active_run"]["run_id"] == start["run_id"]
+    # A second read inside the TTL is served from the cache.
+    assert client.mod._refresh_runs_cached()["active_run"]["run_id"] == (
+        start["run_id"]
+    )
+    assert len(calls) == n_after_post + 1
+
+    # A stop must likewise invalidate: the cached read that follows has to
+    # rescan instead of serving the pre-stop summary.
+    assert client.post("/api/train/stop", json={}).status_code == 200
+    n_after_stop = len(calls)  # stop's own forced refresh
+    client.mod._refresh_runs_cached()
+    assert len(calls) == n_after_stop + 1
+    assert (
+        run_state.load_run(client.mod.RUNS_DIR / start["run_id"])[
+            "stop_requested_at"
+        ]
+        is not None
+    )
+
+
+def test_merge_start_invalidates_cached_scan(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-ccccce"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(
+        client.mod.RUNS_DIR / run["run_id"], "training", "completed"
+    )
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    client.mod.training_process = None
+
+    calls = []
+    orig = client.mod.run_state.reconcile_all
+
+    def counting(root, **kwargs):
+        calls.append(1)
+        return orig(root, **kwargs)
+
+    monkeypatch.setattr(client.mod.run_state, "reconcile_all", counting)
+    client.mod._refresh_runs_cached()
+    before = len(calls)
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+    assert len(calls) == before + 1  # the pre-flight forced refresh in POST
+    client.mod._refresh_runs_cached()
+    assert len(calls) == before + 2
+    assert (
+        run_state.load_run(client.mod.RUNS_DIR / run["run_id"])["stages"][3][
+            "status"
+        ]
+        == "running"
+    )
+
+
+def test_refresh_cached_returns_shallow_copy(client):
+    client.post("/api/train/start", json={})
+    first = client.mod._refresh_runs_cached()
+    first["active_run"] = None
+    first["injected"] = True
+    second = client.mod._refresh_runs_cached()
+    assert "injected" not in second
+    assert second["active_run"] is not None
+
+
+def test_duplicate_warning_is_rate_limited(client, monkeypatch, capsys):
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: True)
+    _create_run(
+        client, pid=111111, status="running", run_id="20261030-194700-aaaaaa"
+    )
+    _create_run(
+        client, pid=222222, status="running", run_id="20261030-195700-bbbbbb"
+    )
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(client.mod.time, "monotonic", lambda: clock["now"])
+    client.mod._refresh_runs()
+    assert "duplicate" in capsys.readouterr().err.lower()
+    # A second forced rescan inside the TTL must not repeat the warning.
+    client.mod._refresh_runs()
+    assert "duplicate" not in capsys.readouterr().err.lower()
+    clock["now"] += 61.0
+    client.mod._refresh_runs()
+    assert "duplicate" in capsys.readouterr().err.lower()
+
+
+def test_log_exception_state_is_bounded(client, capsys):
+    for index in range(client.mod._LOG_EXCEPTION_MAX_CONTEXTS + 25):
+        client.mod._log_exception(f"bounded-ctx-{index}")
+    capsys.readouterr()
+    assert len(client.mod._log_exception_state) <= (
+        client.mod._LOG_EXCEPTION_MAX_CONTEXTS
+    )
+
+
 def test_merge_scan_cached_reuses_no_child_scan(client, monkeypatch):
     calls = []
     orig_list = client.mod.run_state.list_runs

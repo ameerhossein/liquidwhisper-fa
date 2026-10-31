@@ -138,7 +138,7 @@ def test_steps_file_is_uncapped_and_resumes(tmp_path):
     assert records[-1]["step"] == 601
 
 
-def test_progress_updates_every_100_steps_and_on_train_end(tmp_path):
+def test_progress_updates_every_10_steps_and_on_train_end(tmp_path):
     run_dir = Path(tmp_path) / RUN_ID
     run_state.create_run(tmp_path, config={}, trainer_args={}, run_id=RUN_ID)
     cb = _callback(run_dir, run_dir=str(run_dir))

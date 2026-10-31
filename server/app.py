@@ -155,6 +155,9 @@ _merge_scan_at: float = 0.0
 _merge_scan_result: bool = False
 _log_exception_state: Dict[str, list] = {}
 _LOG_EXCEPTION_WINDOW_SECONDS = 60.0
+_LOG_EXCEPTION_MAX_CONTEXTS = 128
+_DUPLICATE_WARN_TTL_SECONDS = 60.0
+_duplicate_warn_at: float = 0.0
 
 
 def _load_preflight_benchmarks(
@@ -276,6 +279,26 @@ def read_json_safely(path: Path, default: Any) -> Any:
         return default
 
 
+def _remember_log_exception_context(context: str, now: float) -> None:
+    """Record an emission, evicting the oldest context when over the cap.
+
+    Dynamic contexts (e.g. per-run ``clear merge_pid`` ids) must not grow
+    the table without bound.
+    """
+    _log_exception_state[context] = [now, 0]
+    while len(_log_exception_state) > _LOG_EXCEPTION_MAX_CONTEXTS:
+        try:
+            oldest = min(
+                _log_exception_state,
+                key=lambda key: float(_log_exception_state[key][0]),
+            )
+        except Exception:
+            break
+        if oldest == context:
+            break
+        _log_exception_state.pop(oldest, None)
+
+
 def _log_exception(context: str) -> None:
     """Print one monitor/recovery failure, rate-limited per context.
 
@@ -306,7 +329,7 @@ def _log_exception(context: str) -> None:
             pending = int(suppressed)
         except (TypeError, ValueError):
             pending = 0
-        _log_exception_state[context] = [now, 0]
+        _remember_log_exception_context(context, now)
         try:
             import traceback
             suffix = (
@@ -319,7 +342,7 @@ def _log_exception(context: str) -> None:
         except Exception:
             pass
         return
-    _log_exception_state[context] = [now, 0]
+    _remember_log_exception_context(context, now)
     try:
         import traceback
         print(f"[cockpit] {context} failed:", file=sys.stderr)
@@ -518,14 +541,21 @@ def _refresh_runs() -> Dict[str, Any]:
         summary["duplicates"] = []
     duplicates = summary.get("duplicates") or []
     if duplicates:
+        global _duplicate_warn_at
         try:
-            print(
-                f"[cockpit] warning: duplicate live trainer PIDs for runs: "
-                f"{', '.join(str(run_id) for run_id in duplicates)}",
-                file=sys.stderr,
-            )
+            warn_now = time.monotonic()
         except Exception:
-            pass
+            warn_now = time.time()
+        if (warn_now - _duplicate_warn_at) >= _DUPLICATE_WARN_TTL_SECONDS:
+            _duplicate_warn_at = warn_now
+            try:
+                print(
+                    f"[cockpit] warning: duplicate live trainer PIDs for runs: "
+                    f"{', '.join(str(run_id) for run_id in duplicates)}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
     # `_merge_running()` owns live-merge busy gating: it also has the child
     # handle and the artifact checks. The summary's "merge_run" is advisory.
     active = summary.get("active_run")
@@ -542,7 +572,11 @@ def _refresh_runs() -> Dict[str, Any]:
 
 
 def _refresh_runs_cached() -> Dict[str, Any]:
-    """Return the cached run scan when fresh, else do a forced refresh."""
+    """Return the cached run scan when fresh, else do a forced refresh.
+
+    The returned mapping is a shallow copy; nested run dicts are shared and
+    must be treated as read-only so callers cannot mutate the cache.
+    """
     global _refresh_cache_summary
     try:
         now = time.monotonic()
@@ -552,8 +586,8 @@ def _refresh_runs_cached() -> Dict[str, Any]:
         _refresh_cache_summary is not None
         and (now - _refresh_cache_at) < _REFRESH_TTL_SECONDS
     ):
-        return _refresh_cache_summary
-    return _refresh_runs()
+        return dict(_refresh_cache_summary)
+    return dict(_refresh_runs())
 
 
 def _current_run() -> Optional[Dict[str, Any]]:
@@ -2510,11 +2544,7 @@ async def get_run_steps(run_id: str, tail: int = 2000):
     except (TypeError, ValueError):
         count = 2000
     count = max(0, min(count, 10000))
-    run_dir = _run_dir(run)
-    raw_results = ((run or {}).get("paths") or {}).get("results_dir")
-    steps_dir = Path(str(raw_results)) if raw_results else run_dir
-    if not steps_dir.is_absolute():
-        steps_dir = BASE_DIR / steps_dir
+    steps_dir = _run_paths(run)["telemetry_file"].parent
     return {
         "run_id": run_id,
         "total": run_state.step_count(steps_dir),

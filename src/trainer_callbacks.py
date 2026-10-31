@@ -344,7 +344,6 @@ class WebTelemetryCallback(TrainerCallback):
             key = None
         is_new = key is not None and key not in self._seen_steps
         if is_new:
-            assert key is not None
             self._seen_steps.add(key)
             self.step_count += 1
         if is_new and self.run_dir and (self.step_count % 10 == 0):
