@@ -6,7 +6,7 @@
 |---|---|---|---|
 | `checkpoint-*/` | Auto-saved every `--save_steps 1000` during training (`scripts/train_lora.py`). Only last 2 kept (`--save_total_limit 2`). | LoRA weights + optimizer + scheduler + `trainer_state.json` | Crash / pod-restart resume only. Not for inference. |
 | `best_adapter/` | Auto-saved once at end: `trainer.model.save_pretrained(best_adapter)` (`scripts/train_lora.py`). Selected by `load_best_model_at_end=True, metric_for_best_model="wer"`. | `adapter_model.safetensors` + `adapter_config.json` + processor. No optimizer. | `evaluate_model.py`, `transcribe.py --adapter_path`, `merge_lora.py --adapter_path`. Requires base `BuzzASR/persian` + `peft`. |
-| Merged model | **Manual only**: `scripts/merge_lora.py` (`merge_and_unload()`). Nothing auto-runs it. | Full Whisper weights (`W0 + BA`) + processor. No `peft` needed. | Production inference. |
+| Merged model | **Manual**: `scripts/merge_lora.py` (`merge_and_unload()`), or the cockpit's Merge action (`POST /api/runs/<run_id>/merge`) after training completes. Nothing auto-runs it. | Full Whisper weights (`W0 + BA`) + processor. No `peft` needed. | Production inference. |
 
 ## 2. Production Use (Merged Model)
 
@@ -47,8 +47,24 @@ Inference details (`scripts/transcribe.py`): 16 kHz mono resample, `max_new_toke
 Only `/workspace` survives pod restarts. Container disk (`~/stt`, `/tmp`, `~/.cache`) does not.
 
 Persistent by default (when `/workspace` exists):
-- `ASR_OUTPUT_DIR` default: `/workspace/stt-outputs/buzzasr-neyshekar-lora` (`scripts/train_lora.py`, `run_train.sh`, `configs/l40s_train_config.yaml`, `server/app.py`). Holds `checkpoint-*/`, `best_adapter/`, `final_evaluation_report.json/md`.
-- `ASR_RESULTS_DIR` default: `/workspace/stt-outputs/results`. Holds `live_telemetry.json`, `loss_history.json`, `epoch_benchmarks.json`, `training_live.log`, `training.pid`, and the mandatory preflight cache at `baselines/preflight.json` (plus per-model `baselines/preflight/` evaluation details).
+- `ASR_OUTPUT_DIR` default: `/workspace/stt-outputs/buzzasr-neyshekar-lora` (`scripts/train_lora.py`, `run_train.sh`, `configs/l40s_train_config.yaml`). CLI training writes `checkpoint-*/`, `best_adapter/`, `final_evaluation_report.json/md` there. Cockpit runs are run-scoped: `output/` lives inside the run directory unless the start payload sets an explicit `output_dir` (recorded in `run.json`).
+- `ASR_RESULTS_DIR` default: `/workspace/stt-outputs/results`. Top-level `live_telemetry.json`, `loss_history.json`, `epoch_benchmarks.json`, `training_live.log`, and `training.pid` remain for legacy/no-ledger views and the CLI preflight cache at `baselines/preflight.json` (plus per-model `baselines/preflight/` evaluation details). Cockpit runs keep the same files inside their run directory.
+- **Run ledger** (`ASR_RUNS_DIR`, default `$ASR_RESULTS_DIR/runs`):
+
+  ```
+  results/runs/<run_id>/          # run.json, steps.jsonl, events.jsonl,
+                                  # telemetry, benchmarks, log, output/, merged/
+  results/runs/_shared/baselines/preflight.json
+  ```
+
+  On RunPod this resolves to `/workspace/stt-outputs/results/runs`; the local
+  fallback is repo-local `results/runs`. Each `<run_id>/` is self-contained:
+  `run.json` (atomic manifest with config, stages, attempts, status),
+  append-only `steps.jsonl` and `events.jsonl`, `live_telemetry.json`,
+  `loss_history.json`, `epoch_benchmarks.json`, `baselines/preflight.json`,
+  `training_live.log`, `training.pid`, `stop_training.signal`, `output/`,
+  `merged/`, `merge.log`, and `merge.pid`. The cockpit restores, resumes, and
+  merges from this directory, including after a server restart.
 
 Ephemeral (re-downloaded / lost on restart):
 - `~/stt/.venv/`, repo-local `outputs/`, `results/`, `models/`
@@ -69,6 +85,9 @@ python scripts/merge_lora.py \
   --output_dir /workspace/stt-outputs/buzzasr-persian-merged
 ```
 
+The cockpit's Merge action is persistent automatically: it writes to
+`<runs_root>/<run_id>/merged/` under the same `ASR_RUNS_DIR` root.
+
 Check: `echo $ASR_OUTPUT_DIR; ls -d /workspace/stt-outputs/buzzasr-neyshekar-lora/checkpoint-*`
 
 ## 4. Continuing Training Later
@@ -77,6 +96,10 @@ Check: `echo $ASR_OUTPUT_DIR; ls -d /workspace/stt-outputs/buzzasr-neyshekar-lor
   ```bash
   ./run_train.sh  # auto-resumes latest checkpoint in --output_dir
   ```
+- In the cockpit, `interrupted`, `stopped`, and `failed` runs show **Resume**.
+  It reuses the same run directory and original settings, auto-resumes from the
+  checkpoint, and switches to `--post_eval_only` when training already
+  completed but post-eval is still pending.
 - Only have `best_adapter`/merged? Start round 2 with merged as new base (use lower LR to avoid forgetting). Do not stack adapter-on-adapter:
   ```bash
   python scripts/train_lora.py \
@@ -91,7 +114,7 @@ The former `configs/` baseline file (`baselines.json`) is gone. Every training r
 
 - Both the preflight and the epoch benchmark matrix use the first 1,000 test rows by default (`--preflight_samples 1000 --max_benchmark_samples 1000`; `0` = full 2,149-row test split).
 - **BuzzASR/persian is the authoritative baseline; Whisper Large v3 is reference-only.** A failed Whisper preflight omits its row instead of inventing values or blocking training.
-- The measured preflight is cached at `$ASR_RESULTS_DIR/baselines/preflight.json`. A matching fingerprint (dataset, split, sample count, phone seed/profiles, telephony ffmpeg encoding, eval batch size, model ids, and a hash of the evaluator/metric code) reuses the cache across restarts; `--overwrite_preflight` forces re-measurement. Dataset/model revisions are not pinned: bump `PREFLIGHT_VERSION` in `src/preflight.py` and clear (or overwrite) the cache after changing them.
+- The measured preflight is cached at `<runs root>/_shared/baselines/preflight.json` for cockpit runs (CLI default: `$ASR_RESULTS_DIR/baselines/preflight.json`) and copied to `<run>/baselines/preflight.json`. A matching fingerprint (dataset, split, sample count, phone seed/profiles, telephony ffmpeg encoding, eval batch size, model ids, and a hash of the evaluator/metric code) reuses the cache across restarts; `--overwrite_preflight` forces re-measurement. Dataset/model revisions are not pinned: bump `PREFLIGHT_VERSION` in `src/preflight.py` and clear (or overwrite) the cache after changing them.
 - Epoch deltas are displayed as `Δ clean vs base` and `Δ phone vs base`, in percentage points (pp), and only when the row and baseline have the same sample count.
 - The final full-test report shows no delta without a matching full-test baseline; the default 1,000-row preflight against the 2,149-row test split reports `n/a (no matching full-test baseline)`.
 - For smoke runs, pass matching small values so the comparison stays valid: `--preflight_samples 20 --max_benchmark_samples 20`.
