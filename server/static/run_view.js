@@ -160,6 +160,75 @@ function shouldApplyPickerRefresh(selectionAtStart, selectionNow) {
   return String(selectionAtStart ?? "latest") === String(selectionNow ?? "latest");
 }
 
+// Restore controls for one remote run summary from /api/hf/runs. A completed
+// run can still be restored, but its training must not be resumed. A remote
+// run without a complete checkpoint is restore-only too; the restore script
+// installs the run and reports the missing checkpoint without training.
+function recoverActionState(remoteRun) {
+  const run = remoteRun && typeof remoteRun === "object" ? remoteRun : {};
+  const runId = run.run_id == null ? "" : String(run.run_id).trim();
+  if (!runId) {
+    return {
+      canRestore: false,
+      canResume: false,
+      reason: "Choose a remote run to restore.",
+    };
+  }
+  const status = String(run.status || "").trim().toLowerCase();
+  if (status === "completed") {
+    return {
+      canRestore: true,
+      canResume: false,
+      reason: "Run is completed; restoring it will not resume training.",
+    };
+  }
+  if (!truthyFlagValue(run.has_checkpoint)) {
+    return {
+      canRestore: true,
+      canResume: false,
+      reason: "No complete checkpoint on the remote; restore only.",
+    };
+  }
+  return { canRestore: true, canResume: true, reason: "" };
+}
+
+// The HF sync badge. ``enabled: false`` means sync is off, so there is no
+// badge; otherwise reflect uploading, the retrying error state, or the last
+// successfully uploaded step with its local time.
+function hfSyncLabel(sync) {
+  if (!sync || typeof sync !== "object" || sync.enabled === false) return "";
+  const status = String(sync.status || "").trim().toLowerCase();
+  if (status === "uploading") return "HF: uploading…";
+  if (status === "error") return "HF: error — retrying";
+  const step = Number(sync.last_success_step);
+  if (sync.last_success_step == null || !Number.isFinite(step)) {
+    return "HF: waiting for first upload";
+  }
+  let label = `HF: synced ${step.toLocaleString("en-US")}`;
+  const at = Number(sync.last_success_at);
+  if (sync.last_success_at != null && Number.isFinite(at) && at > 0) {
+    const date = new Date(at * 1000);
+    if (!isNaN(date.getTime())) {
+      label += ` · ${date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })}`;
+    }
+  }
+  return label;
+}
+
+// One row of the recover dialog's remote run list.
+function remoteRunOptionLabel(run) {
+  const row = run && typeof run === "object" ? run : {};
+  const runId = row.run_id == null ? "" : String(row.run_id);
+  const status = String(row.status || "unknown");
+  const step = Number(row.last_step);
+  const stepLabel =
+    row.last_step != null && Number.isFinite(step) ? step.toLocaleString("en-US") : "—";
+  return `${runId} · ${status} · step ${stepLabel}`;
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     STAGE_ORDER,
@@ -174,5 +243,8 @@ if (typeof module !== "undefined" && module.exports) {
     epochsForTelephonyMode,
     resolvePickerSelection,
     shouldApplyPickerRefresh,
+    recoverActionState,
+    hfSyncLabel,
+    remoteRunOptionLabel,
   };
 }

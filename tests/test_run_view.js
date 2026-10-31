@@ -17,6 +17,9 @@ const {
   runViewState,
   resolvePickerSelection,
   shouldApplyPickerRefresh,
+  recoverActionState,
+  hfSyncLabel,
+  remoteRunOptionLabel,
 } = require("../server/static/run_view.js");
 
 assert.deepStrictEqual(STAGE_ORDER, ["preflight", "training", "post_eval", "merge"]);
@@ -376,5 +379,67 @@ assert.strictEqual(
 assert.strictEqual(resolvePickerSelection("run-gone", [{ run_id: "run-a" }]), "latest");
 assert.strictEqual(resolvePickerSelection("run-a", []), "latest");
 assert.strictEqual(resolvePickerSelection("run-a", null), "latest");
+
+assert.deepStrictEqual(
+  recoverActionState({ run_id: "r", status: "running", has_checkpoint: true }),
+  { canRestore: true, canResume: true, reason: "" },
+);
+assert.strictEqual(
+  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
+    .canResume,
+  false,
+);
+assert.match(
+  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
+    .reason,
+  /completed/i,
+);
+assert.strictEqual(
+  recoverActionState({ run_id: "r", status: "running", has_checkpoint: false })
+    .canResume,
+  false,
+);
+assert.strictEqual(
+  hfSyncLabel({ enabled: true, status: "idle", last_success_step: 2000 }),
+  "HF: synced 2,000",
+);
+assert.strictEqual(hfSyncLabel({ enabled: true, status: "uploading" }), "HF: uploading…");
+assert.match(hfSyncLabel({ enabled: true, status: "error" }), /error/i);
+assert.strictEqual(hfSyncLabel({ enabled: false }), "");
+assert.strictEqual(
+  remoteRunOptionLabel({ run_id: "20261031-120000-abcdef", status: "running", last_step: 1000 }),
+  "20261031-120000-abcdef · running · step 1,000",
+);
+
+assert.deepStrictEqual(
+  recoverActionState({ run_id: "r", status: "running", has_checkpoint: true }),
+  { canRestore: true, canResume: true, reason: "" },
+);
+assert.strictEqual(
+  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
+    .canResume,
+  false,
+);
+assert.match(
+  recoverActionState({ run_id: "r", status: "completed", has_checkpoint: true })
+    .reason,
+  /completed/i,
+);
+assert.strictEqual(
+  recoverActionState({ run_id: "r", status: "running", has_checkpoint: false })
+    .canResume,
+  false,
+);
+assert.strictEqual(
+  hfSyncLabel({ enabled: true, status: "idle", last_success_step: 2000 }),
+  "HF: synced 2,000",
+);
+assert.strictEqual(hfSyncLabel({ enabled: true, status: "uploading" }), "HF: uploading…");
+assert.match(hfSyncLabel({ enabled: true, status: "error" }), /error/i);
+assert.strictEqual(hfSyncLabel({ enabled: false }), "");
+assert.strictEqual(
+  remoteRunOptionLabel({ run_id: "20261031-120000-abcdef", status: "running", last_step: 1000 }),
+  "20261031-120000-abcdef · running · step 1,000",
+);
 
 console.log("run_view behavior tests passed");

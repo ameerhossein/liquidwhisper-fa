@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=11">
+  <link rel="stylesheet" href="/static/style.css?v=12">
 </head>
 <body>
   <div class="page">
@@ -24,6 +24,10 @@
             <option value="latest">Latest</option>
           </select>
         </label>
+        <button id="btnRecover" type="button" class="btn btn-fresh btn-recover"
+                title="Restore a run mirrored to Hugging Face">
+          Recover
+        </button>
         <span class="status"><span id="statusDot" class="dot dot-idle"></span><span id="statusLabel">Idle</span></span>
         <span class="gpu">
           <span id="gpuModel">Detecting GPU…</span>
@@ -44,6 +48,7 @@
             <span id="runSource" class="dev-badge" hidden>Dev simulation</span>
           </div>
           <div class="run-head-meta">
+            <span id="hfSyncBadge" class="hf-sync-badge" hidden></span>
             <span id="runCreated" class="run-created">—</span>
             <span id="stepSaved" class="step-saved">0 steps saved</span>
           </div>
@@ -277,8 +282,65 @@
 
   </div>
 
+  <dialog id="hfRecoverDialog" class="hf-dialog" aria-labelledby="hfDialogTitle">
+    <div class="hf-dialog-head">
+      <div>
+        <h2 id="hfDialogTitle" class="hf-dialog-title">Recover from Hugging Face</h2>
+        <p class="hf-dialog-copy">
+          Restore a mirrored run into the local runs root. Restore only installs the
+          run; Restore &amp; resume continues training from its last complete checkpoint.
+        </p>
+      </div>
+      <button id="btnHfClose" type="button" class="btn btn-fresh btn-small">Close</button>
+    </div>
+
+    <div class="hf-recover-form">
+      <label class="field">
+        <span class="field-label">Hugging Face repo</span>
+        <input id="inputHfRepo" class="field-input hf-repo-input" type="text"
+               placeholder="owner/repo" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="field-label">Run ID</span>
+        <input id="inputHfRunId" class="field-input hf-run-input" type="text"
+               placeholder="20261031-120000-abcdef" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="btnHfList" type="button" class="btn btn-fresh">List remote runs</button>
+    </div>
+
+    <div class="hf-remote-wrap">
+      <table class="hf-remote-table">
+        <thead>
+          <tr>
+            <th scope="col">Run</th>
+            <th scope="col">Status</th>
+            <th scope="col" class="num">Step</th>
+            <th scope="col">Checkpoint</th>
+          </tr>
+        </thead>
+        <tbody id="hfRunList">
+          <tr><td colspan="4" class="empty-cell">List remote runs to see what can be restored.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p id="hfRestoreStatus" class="hf-restore-status" role="status" aria-live="polite"></p>
+    <p id="hfLocalRunNotice" class="hf-local-run" hidden>
+      <button id="btnHfOpenLocal" type="button" class="btn-link">Open the existing local run</button>
+    </p>
+    <details id="hfRestoreLogWrap" class="hf-restore-log-wrap" hidden>
+      <summary>Restore log</summary>
+      <pre id="hfRestoreLog" class="hf-restore-log"></pre>
+    </details>
+
+    <div class="hf-dialog-actions">
+      <button id="btnHfRestore" type="button" class="btn btn-fresh" disabled>Restore only</button>
+      <button id="btnHfRestoreResume" type="button" class="btn btn-primary" disabled>Restore &amp; resume</button>
+    </div>
+  </dialog>
+
   <script src="/static/benchmark_view.js?v=1"></script>
-  <script src="/static/run_view.js?v=3"></script>
-  <script src="/static/app.js?v=12"></script>
+  <script src="/static/run_view.js?v=4"></script>
+  <script src="/static/app.js?v=13"></script>
 </body>
 </html>

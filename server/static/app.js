@@ -27,6 +27,21 @@ const el = {
   btnSmoke: document.getElementById("btnSmoke"),
   btnResume: document.getElementById("btnResume"),
   btnMerge: document.getElementById("btnMerge"),
+  btnRecover: document.getElementById("btnRecover"),
+  hfRecoverDialog: document.getElementById("hfRecoverDialog"),
+  inputHfRepo: document.getElementById("inputHfRepo"),
+  inputHfRunId: document.getElementById("inputHfRunId"),
+  btnHfList: document.getElementById("btnHfList"),
+  hfRunList: document.getElementById("hfRunList"),
+  btnHfRestore: document.getElementById("btnHfRestore"),
+  btnHfRestoreResume: document.getElementById("btnHfRestoreResume"),
+  hfRestoreStatus: document.getElementById("hfRestoreStatus"),
+  hfRestoreLog: document.getElementById("hfRestoreLog"),
+  hfRestoreLogWrap: document.getElementById("hfRestoreLogWrap"),
+  btnHfClose: document.getElementById("btnHfClose"),
+  btnHfOpenLocal: document.getElementById("btnHfOpenLocal"),
+  hfLocalRunNotice: document.getElementById("hfLocalRunNotice"),
+  hfSyncBadge: document.getElementById("hfSyncBadge"),
   runSelect: document.getElementById("runSelect"),
   runPicker: document.getElementById("runPicker"),
   runHead: document.getElementById("runHead"),
@@ -82,6 +97,25 @@ let mergePollGeneration = 0;
 let mergePendingPolls = 0;
 let mergeError = "";
 let mergeViewSignature = null;
+
+const HF_RESTORE_STORAGE_KEY = "asr.hfRestore";
+const HF_RESTORE_ACTIVE_STATES = new Set([
+  "running",
+  "resolving",
+  "listing",
+  "ledger",
+  "checkpoint",
+  "verify",
+]);
+
+let hfConfig = { enabled: false, repo_id: "", runs_root: "" };
+let remoteHfRuns = [];
+let hfRestorePending = false;
+let hfRestoreTimer = null;
+let hfRestoreGeneration = 0;
+let hfRestoreResumeRequested = false;
+let hfRestoreSelectedRunId = "";
+let hfLocalRunId = "";
 
 const STAGE_STATUS_LABELS = {
   pending: "Pending",
@@ -236,6 +270,7 @@ function renderRun(run, steps, storage, adapterExists = false) {
   renderStepper(run);
   el.stepSaved.textContent = savedStepsLabel(steps);
   updateStorageWarning(storage);
+  renderHfBadge(run);
 
   const viewState = runViewState(run, adapterExists);
   el.btnResume.hidden = !viewState.resumeVisible;
@@ -248,6 +283,10 @@ function hideRunUi() {
   if (el.runHead) el.runHead.hidden = true;
   if (el.btnResume) el.btnResume.hidden = true;
   if (el.btnMerge) el.btnMerge.hidden = true;
+  if (el.hfSyncBadge) {
+    el.hfSyncBadge.hidden = true;
+    el.hfSyncBadge.textContent = "";
+  }
   hideMergeResult();
 }
 
@@ -366,7 +405,12 @@ async function selectRun(runId) {
     }
 
     selectedRunId = String(payload.run.run_id || "latest");
-    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    renderRun(
+      { ...payload.run, hf_sync: payload.hf_sync },
+      payload.steps,
+      payload.storage,
+      payload.adapter_exists,
+    );
     restoreRunConfig(payload.run.config);
     updateTelemetry(payload.telemetry || {}, viewingHistorical);
     if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
@@ -391,7 +435,12 @@ async function selectRun(runId) {
 function applyLiveRun(data) {
   if (!data || !data.run || viewingHistorical) return;
   selectedRunId = data.run.run_id ? String(data.run.run_id) : "latest";
-  renderRun(data.run, data.steps, data.storage, data.adapter_exists);
+  renderRun(
+    { ...data.run, hf_sync: data.hf_sync },
+    data.steps,
+    data.storage,
+    data.adapter_exists,
+  );
   restoreRunConfig(data.run.config);
   renderMergeStatus(data);
 }
@@ -417,7 +466,12 @@ async function loadRunState() {
     }
 
     selectedRunId = payload.run.run_id ? String(payload.run.run_id) : "latest";
-    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    renderRun(
+      { ...payload.run, hf_sync: payload.hf_sync },
+      payload.steps,
+      payload.storage,
+      payload.adapter_exists,
+    );
     restoreRunConfig(payload.run.config);
     if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
     if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
@@ -555,7 +609,12 @@ async function pollMergeStatus(runId, generation) {
     const payload = await res.json();
     // The user may have switched runs while this request was in flight.
     if (generation !== mergePollGeneration || selectedRunId !== runId) return;
-    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    renderRun(
+      payload.run ? { ...payload.run, hf_sync: payload.hf_sync } : payload.run,
+      payload.steps,
+      payload.storage,
+      payload.adapter_exists,
+    );
     if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
     if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
     renderMergeStatus(payload);
@@ -656,6 +715,493 @@ async function mergeRun() {
     renderMergeStatus({});
     syncRunActionButtons();
   }
+}
+
+// Hugging Face recovery
+
+async function loadHfConfig() {
+  if (!el.btnRecover) return;
+  try {
+    const res = await fetch("/api/hf/config");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    hfConfig = {
+      enabled: data && data.enabled !== false,
+      repo_id: String((data && data.repo_id) || ""),
+      runs_root: String((data && data.runs_root) || ""),
+    };
+    // The Recover button remains visible with no local runs; only an explicit
+    // enabled:false removes it, because HF support is genuinely unavailable.
+    el.btnRecover.hidden = Boolean(data && data.enabled === false);
+    if (el.inputHfRepo && !el.inputHfRepo.value.trim() && hfConfig.repo_id) {
+      el.inputHfRepo.value = hfConfig.repo_id;
+    }
+  } catch (e) {
+    // Keep the button usable: a config failure must not remove the only way
+    // back to a restore that may still be running.
+    console.error("Failed to load HF config", e);
+  }
+}
+
+function openRecoverDialog(preserveStatus = false) {
+  if (!el.hfRecoverDialog) return;
+  if (el.inputHfRepo && !el.inputHfRepo.value.trim() && hfConfig.repo_id) {
+    el.inputHfRepo.value = hfConfig.repo_id;
+  }
+  if (!preserveStatus && !hfRestorePending) {
+    setHfRestoreStatus("");
+    hideHfRestoreLog();
+    hideHfLocalRunNotice();
+  }
+  if (!el.hfRecoverDialog.open) {
+    if (typeof el.hfRecoverDialog.showModal === "function") {
+      try {
+        el.hfRecoverDialog.showModal();
+      } catch (e) {
+        el.hfRecoverDialog.setAttribute("open", "");
+      }
+    } else {
+      el.hfRecoverDialog.setAttribute("open", "");
+    }
+  }
+  if (el.inputHfRunId) el.inputHfRunId.focus();
+  syncHfRestoreButtons();
+}
+
+function closeRecoverDialog() {
+  if (!el.hfRecoverDialog) return;
+  if (el.hfRecoverDialog.open) el.hfRecoverDialog.close();
+  else el.hfRecoverDialog.removeAttribute("open");
+}
+
+function setHfRestoreStatus(text, isError = false) {
+  if (!el.hfRestoreStatus) return;
+  el.hfRestoreStatus.textContent = String(text || "");
+  el.hfRestoreStatus.className = `hf-restore-status${isError ? " is-error" : ""}`;
+}
+
+function hideHfRestoreLog() {
+  if (el.hfRestoreLogWrap) el.hfRestoreLogWrap.hidden = true;
+  if (el.hfRestoreLog) el.hfRestoreLog.textContent = "";
+}
+
+function showHfLocalRunNotice(runId) {
+  hfLocalRunId = String(runId || "");
+  if (el.hfLocalRunNotice) el.hfLocalRunNotice.hidden = !hfLocalRunId;
+  if (el.btnHfOpenLocal) {
+    el.btnHfOpenLocal.textContent = hfLocalRunId
+      ? `Open local run ${hfLocalRunId}`
+      : "Open the existing local run";
+  }
+}
+
+function hideHfLocalRunNotice() {
+  hfLocalRunId = "";
+  if (el.hfLocalRunNotice) el.hfLocalRunNotice.hidden = true;
+}
+
+function selectedHfRemoteRun() {
+  const runId = el.inputHfRunId ? String(el.inputHfRunId.value || "").trim() : "";
+  if (!runId) return null;
+  return remoteHfRuns.find((run) => run && String(run.run_id || "") === runId) || null;
+}
+
+function hfRestoreSelection() {
+  const runId = el.inputHfRunId ? String(el.inputHfRunId.value || "").trim() : "";
+  const run = runId ? selectedHfRemoteRun() : null;
+  // A manually typed id that is not in the listed page still gets Restore
+  // only and Resume; the server validates it and reports a missing checkpoint.
+  const state = run
+    ? recoverActionState(run)
+    : { canRestore: Boolean(runId), canResume: Boolean(runId), reason: "" };
+  return { runId, run, state };
+}
+
+function syncHfRestoreButtons() {
+  const { runId, state } = hfRestoreSelection();
+  if (el.btnRecover) el.btnRecover.disabled = hfRestorePending;
+  if (el.btnHfRestore) {
+    el.btnHfRestore.disabled = hfRestorePending || !runId || !state.canRestore;
+    el.btnHfRestore.title = !runId ? "Choose a remote run first." : state.reason || "";
+  }
+  if (el.btnHfRestoreResume) {
+    el.btnHfRestoreResume.disabled = hfRestorePending || !runId || !state.canResume;
+    el.btnHfRestoreResume.title = state.canResume
+      ? "Restore the run and continue training from its last checkpoint."
+      : state.reason || "No complete checkpoint is available.";
+  }
+  if (el.btnHfList) el.btnHfList.disabled = hfRestorePending;
+}
+
+function renderHfBadge(run) {
+  if (!el.hfSyncBadge) return;
+  const sync = run && run.hf_sync;
+  if (!sync || typeof sync !== "object" || Object.keys(sync).length === 0) {
+    el.hfSyncBadge.hidden = true;
+    el.hfSyncBadge.textContent = "";
+    el.hfSyncBadge.className = "hf-sync-badge";
+    return;
+  }
+  const label = hfSyncLabel(sync);
+  el.hfSyncBadge.textContent = label;
+  el.hfSyncBadge.hidden = !label;
+  const status = String(sync.status || "idle").trim().toLowerCase();
+  el.hfSyncBadge.className = `hf-sync-badge${label ? ` is-${status}` : ""}`;
+}
+
+function renderRemoteRuns(runs) {
+  remoteHfRuns = Array.isArray(runs)
+    ? runs.filter((run) => run && run.run_id)
+    : [];
+  if (!el.hfRunList) return;
+  if (remoteHfRuns.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 4;
+    cell.className = "empty-cell";
+    cell.textContent = "No remote runs found.";
+    row.append(cell);
+    el.hfRunList.replaceChildren(row);
+    syncHfRestoreButtons();
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const run of remoteHfRuns) {
+    const runId = String(run.run_id || "");
+    const hasCheckpoint = truthyFlagValue(run.has_checkpoint);
+    const row = document.createElement("tr");
+    row.className = "hf-run-row";
+    row.tabIndex = 0;
+    row.dataset.runId = runId;
+
+    const runCell = document.createElement("td");
+    runCell.className = "hf-run-id";
+    runCell.textContent = runId;
+    const statusCell = document.createElement("td");
+    statusCell.className = "hf-run-status";
+    statusCell.textContent = String(run.status || "unknown");
+    const stepCell = document.createElement("td");
+    stepCell.className = "num";
+    const step = Number(run.last_step);
+    stepCell.textContent =
+      run.last_step != null && Number.isFinite(step) ? numberFormat.format(step) : "—";
+    const checkpointCell = document.createElement("td");
+    checkpointCell.className = hasCheckpoint ? "hf-has-checkpoint" : "muted";
+    checkpointCell.textContent = hasCheckpoint ? "Yes" : "No";
+    row.append(runCell, statusCell, stepCell, checkpointCell);
+
+    const select = () => {
+      if (el.inputHfRunId) el.inputHfRunId.value = runId;
+      const state = recoverActionState(run);
+      setHfRestoreStatus(state.reason || `Selected ${runId}.`);
+      syncHfRestoreButtons();
+    };
+    row.addEventListener("click", select);
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        select();
+      }
+    });
+    fragment.append(row);
+  }
+  el.hfRunList.replaceChildren(fragment);
+  syncHfRestoreButtons();
+}
+
+async function loadRemoteRuns() {
+  const repo = el.inputHfRepo ? String(el.inputHfRepo.value || "").trim() : "";
+  if (el.btnHfList) el.btnHfList.disabled = true;
+  setHfRestoreStatus("Listing remote runs…");
+  try {
+    const url = repo ? `/api/hf/runs?repo=${encodeURIComponent(repo)}` : "/api/hf/runs";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(await errorDetail(res));
+    const data = await res.json();
+    renderRemoteRuns(data && Array.isArray(data.runs) ? data.runs : []);
+    const count = remoteHfRuns.length;
+    setHfRestoreStatus(
+      count
+        ? `Found ${numberFormat.format(count)} remote run${count === 1 ? "" : "s"}.`
+        : "No remote runs found.",
+    );
+  } catch (e) {
+    renderRemoteRuns([]);
+    setHfRestoreStatus(
+      `Could not list remote runs: ${e && e.message ? e.message : e}`,
+      true,
+    );
+  } finally {
+    if (el.btnHfList) el.btnHfList.disabled = hfRestorePending;
+  }
+}
+
+function saveHfRestoreState(runId, repo, resume) {
+  try {
+    localStorage.setItem(
+      HF_RESTORE_STORAGE_KEY,
+      JSON.stringify({ runId, repo, resume }),
+    );
+  } catch (e) {
+    // Storage can be unavailable in a private window; polling still works.
+  }
+}
+
+function readHfRestoreState() {
+  try {
+    const raw = localStorage.getItem(HF_RESTORE_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearHfRestoreState() {
+  try {
+    localStorage.removeItem(HF_RESTORE_STORAGE_KEY);
+  } catch (e) {
+    // Nothing to clear.
+  }
+}
+
+function scheduleHfRestorePoll(delay = 2000, generation = hfRestoreGeneration) {
+  if (hfRestoreTimer) clearTimeout(hfRestoreTimer);
+  hfRestoreTimer = setTimeout(() => pollRestore(generation), delay);
+}
+
+async function startRestore(resume) {
+  if (hfRestorePending) return;
+  const { runId, run, state } = hfRestoreSelection();
+  if (!runId || !state.canRestore) {
+    setHfRestoreStatus(state.reason || "Choose a remote run to restore.", true);
+    return;
+  }
+  if (resume && run && !state.canResume) {
+    setHfRestoreStatus(state.reason || "This run cannot be resumed.", true);
+    return;
+  }
+
+  const repo = el.inputHfRepo ? String(el.inputHfRepo.value || "").trim() : "";
+  hfRestorePending = true;
+  hfRestoreResumeRequested = Boolean(resume);
+  hfRestoreSelectedRunId = runId;
+  hfRestoreGeneration += 1;
+  const generation = hfRestoreGeneration;
+  hideHfLocalRunNotice();
+  hideHfRestoreLog();
+  setHfRestoreStatus(
+    resume
+      ? `Restoring ${runId} and preparing to resume…`
+      : `Restoring ${runId}…`,
+  );
+  syncHfRestoreButtons();
+  saveHfRestoreState(runId, repo, Boolean(resume));
+
+  try {
+    const body = { run_id: runId, include_merged: false };
+    if (repo) body.repo = repo;
+    const res = await fetch("/api/hf/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const detail = await errorDetail(res);
+      hfRestorePending = false;
+      hfRestoreResumeRequested = false;
+      clearHfRestoreState();
+      if (res.status === 409) {
+        setHfRestoreStatus(`That run already exists locally. ${detail}`, true);
+        showHfLocalRunNotice(runId);
+      } else {
+        setHfRestoreStatus(`Could not start restore: ${detail}`, true);
+      }
+      syncHfRestoreButtons();
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (data && data.run_id) hfRestoreSelectedRunId = String(data.run_id);
+    scheduleHfRestorePoll(2000, generation);
+  } catch (e) {
+    hfRestorePending = false;
+    hfRestoreResumeRequested = false;
+    clearHfRestoreState();
+    setHfRestoreStatus(
+      `Could not start restore: ${e && e.message ? e.message : e}`,
+      true,
+    );
+    syncHfRestoreButtons();
+  }
+}
+
+const HF_RESTORE_STATE_LABELS = {
+  idle: "Idle.",
+  running: "Restoring…",
+  resolving: "Resolving the remote run…",
+  listing: "Listing remote files…",
+  ledger: "Restoring the run ledger…",
+  checkpoint: "Downloading the checkpoint…",
+  verify: "Verifying the restored run…",
+  completed: "Restore complete.",
+  failed: "Restore failed.",
+  interrupted: "Restore interrupted.",
+};
+
+function renderHfRestoreStatus(data) {
+  const state = String((data && data.state) || "idle").toLowerCase();
+  const label = HF_RESTORE_STATE_LABELS[state] || `Restoring (${state})…`;
+  const message = data && data.message ? String(data.message) : "";
+  const isError = state === "failed" || state === "interrupted";
+  setHfRestoreStatus(message ? `${label} — ${message}` : label, isError);
+
+  const lines =
+    data && Array.isArray(data.log_tail) ? data.log_tail.map(String) : [];
+  if (el.hfRestoreLogWrap) el.hfRestoreLogWrap.hidden = lines.length === 0;
+  if (el.hfRestoreLog) el.hfRestoreLog.textContent = lines.join("\n");
+  if (isError && lines.length && el.hfRestoreLogWrap) {
+    el.hfRestoreLogWrap.open = true;
+  }
+
+  const runId = data && data.run_id ? String(data.run_id) : "";
+  if (runId) hfRestoreSelectedRunId = runId;
+  if (runId && el.inputHfRunId && !el.inputHfRunId.value.trim()) {
+    el.inputHfRunId.value = runId;
+  }
+}
+
+async function pollRestore(generation = hfRestoreGeneration) {
+  hfRestoreTimer = null;
+  if (!hfRestorePending || generation !== hfRestoreGeneration) return;
+  try {
+    const res = await fetch("/api/hf/restore/status");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!hfRestorePending || generation !== hfRestoreGeneration) return;
+
+    const state = String((data && data.state) || "idle").toLowerCase();
+    renderHfRestoreStatus(data);
+
+    if (HF_RESTORE_ACTIVE_STATES.has(state)) {
+      scheduleHfRestorePoll(2000, generation);
+      return;
+    }
+
+    if (state === "completed") {
+      const restoredId = String(
+        (data && data.run_id) || hfRestoreSelectedRunId || "",
+      );
+      const resumeAfterRestore = hfRestoreResumeRequested;
+      hfRestorePending = false;
+      hfRestoreResumeRequested = false;
+      if (hfRestoreTimer) {
+        clearTimeout(hfRestoreTimer);
+        hfRestoreTimer = null;
+      }
+      clearHfRestoreState();
+      syncHfRestoreButtons();
+      closeRecoverDialog();
+      await refreshRunList();
+      await selectRun(restoredId || "latest");
+      if (resumeAfterRestore && restoredId) await resumeRun();
+      return;
+    }
+
+    if (state === "failed" || state === "interrupted") {
+      hfRestorePending = false;
+      hfRestoreResumeRequested = false;
+      clearHfRestoreState();
+      syncHfRestoreButtons();
+      const text = state === "failed" ? "Restore failed" : "Restore interrupted";
+      const message = (data && data.message) || "see the restore log.";
+      setHfRestoreStatus(`${text}: ${message}`, true);
+      if (
+        el.hfRestoreLogWrap &&
+        data &&
+        Array.isArray(data.log_tail) &&
+        data.log_tail.length > 0
+      ) {
+        el.hfRestoreLogWrap.open = true;
+      }
+      refreshRunList();
+      return;
+    }
+
+    // An unexpected idle status means the server never recorded the restore.
+    hfRestorePending = false;
+    hfRestoreResumeRequested = false;
+    clearHfRestoreState();
+    syncHfRestoreButtons();
+    setHfRestoreStatus("Restore status is idle; the restore did not start.", true);
+  } catch (e) {
+    if (!hfRestorePending || generation !== hfRestoreGeneration) return;
+    setHfRestoreStatus(
+      `Restore status unavailable: ${e && e.message ? e.message : e}. Retrying…`,
+      true,
+    );
+    scheduleHfRestorePoll(5000, generation);
+  }
+}
+
+// A reload must not lose a restore that is still running on the server.
+async function restoreHfProgressOnLoad() {
+  try {
+    const res = await fetch("/api/hf/restore/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    const state = String((data && data.state) || "idle").toLowerCase();
+    if (!HF_RESTORE_ACTIVE_STATES.has(state)) {
+      // A completed restore may still owe its "resume" if the page was
+      // reloaded in the window between completion and the poll that would
+      // have started training.
+      const stored = readHfRestoreState();
+      clearHfRestoreState();
+      const statusRunId = data && data.run_id ? String(data.run_id) : "";
+      if (
+        state === "completed" &&
+        stored &&
+        stored.resume &&
+        statusRunId &&
+        String(stored.runId || "") === statusRunId
+      ) {
+        await refreshRunList();
+        await selectRun(statusRunId);
+        await resumeRun();
+      }
+      return;
+    }
+
+    const stored = readHfRestoreState();
+    const storedRunId = stored && stored.runId ? String(stored.runId) : "";
+    const statusRunId = data && data.run_id ? String(data.run_id) : "";
+    hfRestorePending = true;
+    hfRestoreResumeRequested = Boolean(
+      stored && stored.resume && storedRunId && storedRunId === (statusRunId || storedRunId),
+    );
+    hfRestoreSelectedRunId = statusRunId || storedRunId;
+    hfRestoreGeneration += 1;
+
+    openRecoverDialog(true);
+    if (el.inputHfRunId && hfRestoreSelectedRunId) {
+      el.inputHfRunId.value = hfRestoreSelectedRunId;
+    }
+    if (el.inputHfRepo && stored && stored.repo && !el.inputHfRepo.value.trim()) {
+      el.inputHfRepo.value = String(stored.repo);
+    }
+    renderHfRestoreStatus(data);
+    syncHfRestoreButtons();
+    scheduleHfRestorePoll(2000, hfRestoreGeneration);
+  } catch (e) {
+    // The cockpit still works without the restore status.
+  }
+}
+
+async function openHfLocalRun() {
+  if (!hfLocalRunId) return;
+  const runId = hfLocalRunId;
+  closeRecoverDialog();
+  await refreshRunList();
+  await selectRun(runId);
 }
 
 // Connection
@@ -1277,6 +1823,22 @@ if (el.inputTelephonyMode) {
 }
 if (el.btnResume) el.btnResume.addEventListener("click", resumeRun);
 if (el.btnMerge) el.btnMerge.addEventListener("click", mergeRun);
+if (el.btnRecover) el.btnRecover.addEventListener("click", () => openRecoverDialog());
+if (el.btnHfClose) el.btnHfClose.addEventListener("click", closeRecoverDialog);
+if (el.btnHfList) el.btnHfList.addEventListener("click", loadRemoteRuns);
+if (el.btnHfRestore) el.btnHfRestore.addEventListener("click", () => startRestore(false));
+if (el.btnHfRestoreResume) {
+  el.btnHfRestoreResume.addEventListener("click", () => startRestore(true));
+}
+if (el.btnHfOpenLocal) el.btnHfOpenLocal.addEventListener("click", openHfLocalRun);
+if (el.inputHfRunId) {
+  el.inputHfRunId.addEventListener("input", () => {
+    syncHfRestoreButtons();
+    const { run, state } = hfRestoreSelection();
+    if (run && state.reason) setHfRestoreStatus(state.reason);
+  });
+}
+syncHfRestoreButtons();
 
 el.btnFresh.addEventListener("click", () => {
   if (!confirm("Fresh start deletes existing checkpoints, the best adapter, reports and telemetry history before training. This cannot be undone. Continue?")) {
@@ -1318,5 +1880,7 @@ window.addEventListener("DOMContentLoaded", () => {
   fetchLogs();
   setInterval(fetchLogs, 2500);
   pollSmokeStatus();
+  loadHfConfig();
+  restoreHfProgressOnLoad();
   new ResizeObserver(() => drawLoss()).observe(el.svgChart);
 });
