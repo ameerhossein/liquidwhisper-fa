@@ -1539,6 +1539,15 @@ class HFRunMirror:
             self._remote_files = list(files)
         return files
 
+    def _remember_remote_paths(self, paths: Iterable[str]) -> None:
+        """Add committed paths to the cached listing when we have one."""
+        with self._condition:
+            if self._remote_files is None:
+                return
+            merged = set(self._remote_files)
+            merged.update(paths)
+            self._remote_files = sorted(merged)
+
     def _remote_high_water(self, files: list[str] | None) -> int | None:
         state_path = f"{repo_run_path(self.run_id)}/{STATE_FILE}"
         if files is None or state_path in files:
@@ -1645,8 +1654,9 @@ class HFRunMirror:
                 return None
             job = self._pending.popleft()
             self._active = job
-            self._state["status"] = "running"
+            self._state["status"] = "uploading"
             self._persist_pending_locked()
+            self._write_state_locked()
             return job
 
     def _worker_loop(self) -> None:
@@ -1658,8 +1668,9 @@ class HFRunMirror:
                     return
                 job = self._pending.popleft()
                 self._active = job
-                self._state["status"] = "running"
+                self._state["status"] = "uploading"
                 self._persist_pending_locked()
+                self._write_state_locked()
             self._handle_job(job)
             with self._condition:
                 self._active = None
@@ -1740,7 +1751,7 @@ class HFRunMirror:
                 _as_int(self._state.get("bytes_uploaded")) or 0
             ) + int(uploaded_bytes) + int(latest_bytes)
             self._state["status"] = (
-                "running" if self._pending or self._active is not None else "idle"
+                "uploading" if self._pending or self._active is not None else "idle"
             )
             self._write_state_locked()
 
@@ -1779,13 +1790,13 @@ class HFRunMirror:
             repo_checkpoint_path(self.run_id, step),
             f"Upload checkpoint-{step}",
         )
-        ledger_step, ledger_size = self._commit_ledger(
+        _ledger_step, ledger_size = self._commit_ledger(
             status=self._manifest_status(),
             step=step,
             reports=False,
             checkpoint_step=step,
         )
-        return ledger_step, size + ledger_size
+        return step, size + ledger_size
 
     def _upload_adapter(self, job: SyncJob) -> tuple[int | None, int]:
         path = job.path
@@ -1839,6 +1850,16 @@ class HFRunMirror:
             repo_id=self.config.repo_id,
             commit_message=message,
         )
+        committed: list[str] = []
+        try:
+            for child in path.rglob("*"):
+                if child.is_file():
+                    relative = child.relative_to(path).as_posix()
+                    committed.append(f"{path_in_repo}/{relative}")
+        except OSError:
+            pass
+        if committed:
+            self._remember_remote_paths(committed)
 
     def _retain_adapter_snapshots(self, newest_step: int) -> None:
         """Keep the newest two snapshots; delete only superseded ones."""
@@ -1951,19 +1972,29 @@ class HFRunMirror:
         state_path = f"{repo_run_path(self.run_id)}/{STATE_FILE}"
         try:
             state = _json_payload(self.download(self.config.repo_id, state_path))
-        except Exception:  # noqa: BLE001 - fall back to the file listing
+        except Exception:  # noqa: BLE001 - verify presence before falling back
             state = None
         if state is not None:
             step = _as_int(state.get("last_step"))
             if step is not None:
                 return step
+
+        # A state file that exists but could not be read must not be replaced
+        # by the lower checkpoint listing. The listing is refreshed so commits
+        # made by this process are visible to the next conflict check.
         try:
-            files = self._list_files()
+            files = self._list_files(force=True)
         except Exception as exc:  # noqa: BLE001 - refuse an unverifiable ledger
             raise _DropJob(
                 f"cannot verify the remote high-water mark: {exc}",
                 record_error=True,
             ) from exc
+        if state_path in files:
+            raise _DropJob(
+                "cannot verify the remote high-water mark: "
+                f"{state_path} exists but could not be read",
+                record_error=True,
+            )
         return select_checkpoint_step(files, self.run_id)
 
     def _commit_ledger(
@@ -2024,6 +2055,9 @@ class HFRunMirror:
             repo_id=self.config.repo_id,
             operations=operations,
             commit_message=f"Sync {self.run_id} ledger ({status})",
+        )
+        self._remember_remote_paths(
+            f"{prefix}/{relative}" for relative in files
         )
         return local_step, sum(_path_size(path) for path in files.values())
 

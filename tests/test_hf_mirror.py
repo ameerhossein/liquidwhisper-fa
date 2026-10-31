@@ -204,7 +204,12 @@ def test_start_backfills_newer_local_checkpoint_and_best_adapter(tmp_path):
         f"runs/{RUN}/checkpoint-1000/adapter_model.safetensors",
     ]
     api = FakeApi(files)
-    mirror = _mirror(tmp_path, api)
+    download = lambda repo, path: (
+        json.dumps({"last_step": 1000}).encode()
+        if path.endswith("/hf_state.json")
+        else b"{}"
+    )
+    mirror = _mirror(tmp_path, api, download=download)
     _checkpoint(mirror.output_dir, 1000)
     _checkpoint(mirror.output_dir, 2000)
     _complete_adapter(mirror.output_dir / "best_adapter")
@@ -429,3 +434,102 @@ def test_latest_upload_failure_is_retried_and_never_raises(tmp_path):
     assert mirror.status()["status"] == "error"
     assert "latest boom" in mirror.status()["last_error"]
     assert len(api.folders) == 3
+
+
+def test_unreadable_remote_state_blocks_ledger_when_state_exists(tmp_path):
+    files = [
+        f"runs/{RUN}/run.json",
+        f"runs/{RUN}/hf_state.json",
+        f"runs/{RUN}/checkpoint-1000/trainer_state.json",
+        f"runs/{RUN}/checkpoint-1000/adapter_model.safetensors",
+    ]
+    api = FakeApi(files)
+
+    def download(repo, path):
+        raise RuntimeError("state unavailable")
+
+    mirror = _mirror(tmp_path, api, download=download)
+    mirror.start()
+    mirror.enqueue_ledger("training")
+
+    assert mirror.process_pending() == 0
+    assert api.commits == []
+    assert "hf_state.json" in mirror.status()["last_error"]
+
+
+def test_ledger_uses_a_fresh_listing_instead_of_the_start_cache(tmp_path):
+    class TrackingApi(FakeApi):
+        def __init__(self):
+            super().__init__([])
+            self.create_calls = 0
+
+        def create_commit(self, **kwargs):
+            super().create_commit(**kwargs)
+            self.create_calls += 1
+            # A real HF repo exposes the committed hf_state.json next listing.
+            self.files = [f"runs/{RUN}/hf_state.json"]
+
+    api = TrackingApi()
+
+    def download(repo, path):
+        raise RuntimeError("download unavailable")
+
+    mirror = _mirror(tmp_path, api, download=download)
+    mirror.start()
+    mirror.enqueue_ledger("training")
+    assert mirror.process_pending() == 1
+
+    mirror.enqueue_ledger("training")
+    assert mirror.process_pending() == 0
+    assert api.create_calls == 1
+    assert "hf_state.json" in mirror.status()["last_error"]
+
+
+def test_checkpoint_accounting_uses_actual_checkpoint_step(tmp_path):
+    api = FakeApi()
+    mirror = _mirror(tmp_path, api)
+    run = json.loads((mirror.run_dir / "run.json").read_text())
+    run["last_step"] = 2000
+    (mirror.run_dir / "run.json").write_text(json.dumps(run))
+    path = _checkpoint(mirror.output_dir, 1000)
+
+    mirror.enqueue_checkpoint(path, 1000)
+    assert mirror.process_pending() == 1
+    assert mirror.status()["last_success_step"] == 1000
+
+    local_state = json.loads((mirror.run_dir / "hf_state.json").read_text())
+    assert local_state["last_step"] == 2000
+    assert local_state["checkpoints"] == [1000]
+
+    mirror.enqueue_ledger("training")
+    assert mirror.process_pending() == 1
+    state_op = next(
+        op
+        for op in api.commits[-1]["operations"]
+        if op.path_in_repo.endswith("/hf_state.json")
+    )
+    uploaded = json.loads(_read_operation_bytes(state_op))
+    assert uploaded["last_step"] == 2000
+    assert uploaded["checkpoints"] == [1000]
+
+
+def test_status_is_uploading_while_a_job_is_active(tmp_path):
+    api = FakeApi()
+    mirror = _mirror(tmp_path, api)
+    observed = []
+    persisted = []
+
+    def upload_folder(**kwargs):
+        observed.append(mirror.status()["status"])
+        status_path = mirror.run_dir / "hf_sync.json"
+        persisted.append(json.loads(status_path.read_text())["status"])
+        api.folders.append(kwargs)
+
+    api.upload_folder = upload_folder
+    path = _checkpoint(mirror.output_dir, 1000)
+    mirror.enqueue_checkpoint(path, 1000)
+
+    assert mirror.process_pending() == 1
+    assert observed == ["uploading"]
+    assert persisted == ["uploading"]
+    assert mirror.status()["status"] == "idle"
