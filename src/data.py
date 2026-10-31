@@ -461,18 +461,26 @@ class PersianASRDataPipeline:
     def prepare_dataset_split(
         self,
         dataset: Dataset,
-        remove_columns: Optional[list] = None
+        remove_columns: Optional[list] = None,
+        cache_dir: Optional[str] = None
     ) -> Dataset:
         """Applies mapping over dataset to produce model-ready inputs."""
         _check_audio_backend()
         effective_proc = self._resolve_num_proc()
+        cache_file_name = None
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file_name = os.path.join(cache_dir, "data.arrow")
 
         # Forked workers would each start a torch thread pool sized to the core
         # count; N workers x cores threads thrash on the small per-sample STFT
         # ops. Forked children inherit the limit; the parent's is restored after.
         prev_threads = _set_torch_threads(1) if effective_proc > 1 else None
         try:
-            return self._prepare_split(dataset, remove_columns, effective_proc)
+            return self._prepare_split(
+                dataset, remove_columns, effective_proc,
+                cache_file_name=cache_file_name,
+            )
         finally:
             if prev_threads is not None:
                 _set_torch_threads(prev_threads)
@@ -480,7 +488,8 @@ class PersianASRDataPipeline:
     def prepare_paired_dataset(
         self,
         dataset: Dataset,
-        remove_columns: Optional[list] = None
+        remove_columns: Optional[list] = None,
+        cache_dir: Optional[str] = None
     ) -> Dataset:
         """Prepare clean and telephone-degraded copies of every utterance.
 
@@ -493,6 +502,11 @@ class PersianASRDataPipeline:
             raise RuntimeError("paired mode requires the telephone module")
         _check_audio_backend()
         effective_proc = self._resolve_num_proc()
+        clean_cache_file = phone_cache_file = None
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            clean_cache_file = os.path.join(cache_dir, "clean.arrow")
+            phone_cache_file = os.path.join(cache_dir, "phone.arrow")
 
         prev_threads = _set_torch_threads(1) if effective_proc > 1 else None
         try:
@@ -507,10 +521,12 @@ class PersianASRDataPipeline:
             phone_pipe.strict_telephony = True
 
             clean = clean_pipe._prepare_split(
-                filtered, remove_columns, effective_proc, filter_durations=False
+                filtered, remove_columns, effective_proc, filter_durations=False,
+                cache_file_name=clean_cache_file,
             )
             phone = phone_pipe._prepare_split(
-                filtered, remove_columns, effective_proc, filter_durations=False
+                filtered, remove_columns, effective_proc, filter_durations=False,
+                cache_file_name=phone_cache_file,
             )
             if clean.features != phone.features:
                 raise ValueError("clean and phone feature schemas differ")
@@ -537,6 +553,7 @@ class PersianASRDataPipeline:
         remove_columns: Optional[list],
         effective_proc: int,
         filter_durations: bool = True,
+        cache_file_name: Optional[str] = None,
     ) -> Dataset:
         # Drop out-of-range clips (too short OR over 30s). Overlong are dropped,
         # not truncated, to keep audio/text aligned (Whisper caps at 30s).
@@ -562,6 +579,8 @@ class PersianASRDataPipeline:
             "desc": "Preparing ASR Features",
             "with_indices": True,
         }
+        if cache_file_name is not None:
+            map_kwargs["cache_file_name"] = cache_file_name
         if effective_proc > 1:
             map_kwargs["num_proc"] = effective_proc
 

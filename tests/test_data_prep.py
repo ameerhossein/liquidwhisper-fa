@@ -217,3 +217,25 @@ def test_prepare_paired_dataset_rejects_schema_mismatch():
     )
     with pytest.raises(ValueError, match="schema"):
         pipe.prepare_paired_dataset(_pairing_dataset(2))
+
+
+def test_prepare_dataset_split_writes_cache_dir(tmp_path):
+    ds = _pairing_dataset(4)
+    out = _pipeline(prob=0.0, num_proc=1).prepare_dataset_split(
+        ds, cache_dir=str(tmp_path / "stage")
+    )
+    files = [Path(c["filename"]).resolve() for c in out.cache_files]
+    assert files
+    assert all(tmp_path.resolve() in f.parents for f in files)
+    assert all(f.is_file() for f in files)
+
+
+def test_prepare_paired_dataset_writes_clean_and_phone_shards(tmp_path):
+    ds = _pairing_dataset(4)
+    out = _pipeline(prob=0.5, num_proc=1).prepare_paired_dataset(
+        ds, cache_dir=str(tmp_path / "stage")
+    )
+    names = [Path(c["filename"]).name for c in out.cache_files]
+    assert any(n.startswith("clean") for n in names)
+    assert any(n.startswith("phone") for n in names)
+    assert len(out) == 8
