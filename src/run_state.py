@@ -366,12 +366,16 @@ def set_stage(
     name: str,
     status: str,
     detail: Any = _UNSET,
+    preserve_started: bool = False,
     **fields: Any,
 ) -> dict:
     """Update one pipeline stage and append a ``stage`` event.
 
     Omit *detail* to leave the existing detail untouched, or pass ``None`` to
-    clear stale failure text when a resumed stage finishes successfully.
+    clear stale failure text when a resumed stage finishes successfully. Pass
+    *preserve_started* to keep the existing ``started_at`` when a ``running``
+    stage only changes its detail (e.g. preflight moving from dataset
+    preparation to baseline measurement).
     """
     if name not in STAGES:
         raise ValueError(f"invalid stage name: {name!r}")
@@ -395,7 +399,8 @@ def set_stage(
             stage[key] = value
 
         if status == "running":
-            stage["started_at"] = time.time()
+            if not (preserve_started and stage.get("started_at") is not None):
+                stage["started_at"] = time.time()
             stage["ended_at"] = None
         elif status in _TERMINAL_STAGE_STATUSES:
             stage["ended_at"] = time.time()

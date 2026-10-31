@@ -162,3 +162,52 @@ def test_runs_dir_explicit_argument_wins(monkeypatch, tmp_path):
     assert paths.resolve_runs_dir(str(tmp_path / "explicit")) == str(
         tmp_path / "explicit"
     )
+
+
+def test_cli_run_config_captures_full_resume_fields(monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import _cli_run_config, parse_args
+
+    monkeypatch.setattr(sys, "argv", ["train_lora.py"])
+    args = parse_args()
+    config = _cli_run_config(args)
+    expected = {
+        "base_model",
+        "dataset_name",
+        "epochs",
+        "batch_size",
+        "grad_accum",
+        "learning_rate",
+        "eval_steps",
+        "save_steps",
+        "max_benchmark_samples",
+        "preflight_samples",
+        "num_proc",
+        "telephony_prob",
+        "gradient_checkpointing",
+        "fresh_start",
+        "auto_resume",
+        "output_dir",
+        "results_dir",
+        "eval_batch_size",
+        "resume_from_checkpoint",
+        "telephony_profiles",
+        "telephony_seed",
+        "telephony_use_ffmpeg",
+        "phone_benchmark",
+        "phone_seed",
+        "lora_r",
+        "lora_alpha",
+        "lora_dropout",
+        "warmup_steps",
+        "lr_scheduler_type",
+        "save_total_limit",
+        "run_post_test_eval",
+        "run_epoch_benchmark",
+        "enable_telemetry",
+    }
+    assert expected <= set(config.keys())
+    assert config["lora_r"] == args.lora_r
+    assert config["warmup_steps"] == args.warmup_steps
+    assert config["telephony_seed"] == args.telephony_seed

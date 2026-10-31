@@ -12,7 +12,6 @@ import os
 import sys
 import argparse
 import json
-import shutil
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -374,13 +373,18 @@ def _mark_run_stage(
     name: str,
     status: str,
     detail: Any = _DETAIL_UNSET,
+    preserve_started: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Record one stage transition, or no-op for a plain CLI run."""
     if not run_dir:
         return None
     if detail is _DETAIL_UNSET:
-        return run_state.set_stage(run_dir, name, status)
-    return run_state.set_stage(run_dir, name, status, detail=detail)
+        return run_state.set_stage(
+            run_dir, name, status, preserve_started=preserve_started
+        )
+    return run_state.set_stage(
+        run_dir, name, status, detail=detail, preserve_started=preserve_started
+    )
 
 
 def _mark_run_status(
@@ -390,6 +394,16 @@ def _mark_run_status(
     if not run_dir:
         return None
     return run_state.set_status(run_dir, status, **fields)
+
+
+def _mark_preflight_failed(run_dir: Optional[str | Path], exc: BaseException) -> str:
+    """Record a baseline-measurement failure on the run ledger."""
+    message = f"baseline measurement failed: {exc}"
+    _mark_run_stage(run_dir, "preflight", "failed", detail=message)
+    _mark_run_status(
+        run_dir, "failed", failed_stage="preflight", last_error=str(exc)
+    )
+    return message
 
 
 def _record_trainer_args(run_dir, args) -> Optional[Dict[str, Any]]:
@@ -405,16 +419,15 @@ def _record_trainer_args(run_dir, args) -> Optional[Dict[str, Any]]:
 
 def _halt_run(run_dir, results_dir: str, stage: str) -> None:
     """Mark a cooperative halt: the active stage stops and later stages skip."""
-    try:
-        index = run_state.STAGES.index(stage)
-    except ValueError:
-        index = 0
+    if stage not in run_state.STAGES:
+        raise ValueError(f"invalid halt stage: {stage!r}")
+    index = run_state.STAGES.index(stage)
     for later in run_state.STAGES[index + 1:]:
         _mark_run_stage(run_dir, later, "skipped")
     # Mark the halted stage last so current_stage points at what was stopped.
     _mark_run_stage(run_dir, stage, "stopped", detail="halt requested")
     _mark_run_status(run_dir, "stopped", failed_stage=None)
-    _write_telemetry_status(results_dir, "stopped")
+    _write_telemetry_status(results_dir, "stopped", run_dir=run_dir)
     try:
         os.remove(os.path.join(results_dir, "stop_training.signal"))
     except OSError:
@@ -564,25 +577,58 @@ def _cli_run_config(args) -> dict:
         "batch_size",
         "grad_accum",
         "learning_rate",
+        "eval_batch_size",
         "eval_steps",
         "save_steps",
         "max_benchmark_samples",
         "preflight_samples",
         "num_proc",
         "telephony_prob",
+        "telephony_profiles",
+        "telephony_seed",
+        "telephony_use_ffmpeg",
+        "phone_benchmark",
+        "phone_seed",
+        "lora_r",
+        "lora_alpha",
+        "lora_dropout",
+        "warmup_steps",
+        "lr_scheduler_type",
+        "save_total_limit",
+        "resume_from_checkpoint",
         "gradient_checkpointing",
         "fresh_start",
         "auto_resume",
         "output_dir",
         "results_dir",
+        "run_post_test_eval",
+        "run_epoch_benchmark",
+        "enable_telemetry",
     )
     return {key: _json_safe(getattr(args, key, None)) for key in keys}
 
 
+def _validate_cli_run_dir(run_dir: Path) -> None:
+    """Reject a ``--run_dir`` outside the canonical run-directory contract.
+
+    A CLI ledger run must live directly under the resolved runs root and carry
+    a canonical run id, so the cockpit can list, resume, and merge it like any
+    other run.
+    """
+    runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
+    if not run_state.run_id_valid(run_dir.name) or run_dir.parent != runs_root:
+        print(
+            "error: --run_dir must be a canonical run directory directly under "
+            f"the resolved runs root ({runs_root}), e.g. "
+            "<runs-root>/YYYYMMDD-HHMMSS-xxxxxx. Set ASR_RUNS_DIR to relocate "
+            f"the runs root. Got: {run_dir}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def _ensure_cli_run(run_dir: Path, args) -> dict:
     """Create the ledger for a CLI ``--run_dir`` when it does not exist yet."""
-    import time as _time
-
     run = run_state.load_run(run_dir)
     if run is not None:
         return run
@@ -599,32 +645,15 @@ def _ensure_cli_run(run_dir: Path, args) -> dict:
     }
     trainer_args = {str(key): _json_safe(value) for key, value in vars(args).items()}
     config = _cli_run_config(args)
-    kwargs = dict(
+    # main() validates the canonical contract first; create_run enforces it.
+    return run_state.create_run(
+        run_dir.parent,
+        run_id=run_dir.name,
         config=config,
         trainer_args=trainer_args,
         paths=paths,
         source="cli",
     )
-    if run_state.run_id_valid(run_dir.name):
-        return run_state.create_run(run_dir.parent, run_id=run_dir.name, **kwargs)
-
-    # Manual CLI runs may use a non-canonical directory name. Create a
-    # canonical ledger, move it into place, and repoint the manifest.
-    temporary_id = run_state.new_run_id(now=_time.time())
-    run_state.create_run(run_dir.parent, run_id=temporary_id, **kwargs)
-    generated = run_dir.parent / temporary_id
-    try:
-        run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(generated, run_dir, dirs_exist_ok=True)
-    finally:
-        shutil.rmtree(generated, ignore_errors=True)
-
-    def repoint(current: dict) -> dict:
-        current["run_id"] = run_dir.name
-        current["paths"] = {**(current.get("paths") or {}), **paths}
-        return current
-
-    return run_state.update_run(run_dir, repoint)
 
 
 def _ensure_cli_attempt(run_dir: Path, run: dict) -> None:
@@ -658,6 +687,18 @@ def _write_cli_pid(run_dir: Path) -> None:
         (run_dir / "training.pid").write_text(str(os.getpid()), encoding="utf-8")
     except OSError as exc:
         print(f"Warning: could not write {run_dir / 'training.pid'}: {exc}")
+
+
+def _abort_cli_setup(run_dir: Path) -> None:
+    """Close any attempt opened during CLI setup and drop the PID file."""
+    try:
+        run_state.finalize_attempt(run_dir, exit_code=1, reason="nonzero_exit")
+    except Exception as exc:
+        print(f"Warning: could not finalize run attempt: {exc}", file=sys.stderr)
+    try:
+        (Path(run_dir) / "training.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _finalize_cli_run(run_dir: Path, exit_code: int) -> None:
@@ -856,7 +897,9 @@ def _run_post_eval_stage(
 
     Returns ``True`` on success and ``False`` when the user halted. The
     post-eval stage is an active telemetry status from start to finish so the
-    cockpit never reports a completed run while evaluation is still running.
+    cockpit never reports a completed run while evaluation is still running;
+    on success the stage also records the terminal ``completed`` snapshot so a
+    plain CLI run never leaves the legacy ``training`` status behind.
     """
     _mark_run_stage(run_dir, "post_eval", "running", detail=detail)
     _write_telemetry_status(
@@ -878,6 +921,7 @@ def _run_post_eval_stage(
         _write_telemetry_status(results_dir, "failed")
         raise
     _mark_run_stage(run_dir, "post_eval", "completed", detail=None)
+    _write_telemetry_status(results_dir, "completed", run_dir=run_dir)
     return True
 
 
@@ -982,6 +1026,7 @@ def main():
         else None
     )
     if run_dir is not None:
+        _validate_cli_run_dir(run_dir)
         # A CLI ledger run is self-contained: telemetry/benchmarks and the
         # default output live under the run unless explicitly overridden.
         if not explicit_results:
@@ -1001,16 +1046,22 @@ def main():
             _clear_previous_state(args.output_dir, results_dir=args.results_dir)
 
     if run_dir is not None:
-        run = _ensure_cli_run(run_dir, args)
-        # Persist the full effective namespace before any stage work so Resume
-        # can recreate the exact LoRA/scheduler/telephony settings.
-        _record_trainer_args(run_dir, args)
-        _mark_run_status(run_dir, "running")
-        # The server records the attempt before spawning its child; a standalone
-        # CLI invocation owns its own attempt and PID file.
-        if not _is_cockpit_spawned():
-            _ensure_cli_attempt(run_dir, run)
-        _write_cli_pid(run_dir)
+        try:
+            run = _ensure_cli_run(run_dir, args)
+            # Persist the full effective namespace before any stage work so Resume
+            # can recreate the exact LoRA/scheduler/telephony settings.
+            _record_trainer_args(run_dir, args)
+            _mark_run_status(run_dir, "running")
+            # The server records the attempt before spawning its child; a standalone
+            # CLI invocation owns its own attempt and PID file.
+            if not _is_cockpit_spawned():
+                _ensure_cli_attempt(run_dir, run)
+            _write_cli_pid(run_dir)
+        except Exception:
+            # A setup failure after the attempt/PID exists must not leave an
+            # open attempt behind.
+            _abort_cli_setup(run_dir)
+            raise
 
     exit_code = 0
     tee = (
@@ -1161,7 +1212,10 @@ def _run_training(args, run_dir):
     # (and Whisper) on exactly the same rows the epoch benchmark will use.
     # Runs after datasets.map prep and before the model/CUDA load so the
     # subprocess evaluation sees an idle GPU.
-    _mark_run_stage(run_dir, "preflight", "running", detail="measuring baseline")
+    _mark_run_stage(
+        run_dir, "preflight", "running",
+        detail="measuring baseline", preserve_started=True,
+    )
     preflight_count = args.preflight_samples
     if preflight_count is None:
         preflight_count = args.max_benchmark_samples
@@ -1191,16 +1245,10 @@ def _run_training(args, run_dir):
             print("Stop signal received during preflight; halting run.")
             _halt_run(run_dir, args.results_dir, "preflight")
             return
-        _mark_run_stage(run_dir, "preflight", "failed",
-                        detail=f"baseline measurement failed: {exc}")
-        _mark_run_status(run_dir, "failed", failed_stage="preflight",
-                         last_error=str(exc))
+        _mark_preflight_failed(run_dir, exc)
         raise
     except Exception as exc:
-        _mark_run_stage(run_dir, "preflight", "failed",
-                        detail=f"baseline measurement failed: {exc}")
-        _mark_run_status(run_dir, "failed", failed_stage="preflight",
-                         last_error=str(exc))
+        _mark_preflight_failed(run_dir, exc)
         raise
 
     baseline_models = preflight.get("models") or {}

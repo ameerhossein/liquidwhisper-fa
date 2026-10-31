@@ -233,6 +233,7 @@ def test_plain_cli_fresh_start_clears_previous_state(tmp_path, monkeypatch):
 
 def test_main_halts_before_data_prep_when_signal_exists(tmp_path, monkeypatch):
     train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
     run_dir = _run(tmp_path)
     (run_dir / "stop_training.signal").write_text("stop", encoding="utf-8")
     args = _main_args(tmp_path, run_dir)
@@ -262,6 +263,7 @@ def test_main_halts_before_data_prep_when_signal_exists(tmp_path, monkeypatch):
 def test_main_cli_run_dir_is_self_contained_and_finalizes(tmp_path, monkeypatch):
     train_lora = _train_lora()
     runs_root = tmp_path / "runs"
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
     run_dir = runs_root / RUN_ID
     args = SimpleNamespace(
         run_dir=str(run_dir),
@@ -317,6 +319,7 @@ def test_main_cli_run_dir_is_self_contained_and_finalizes(tmp_path, monkeypatch)
 
 def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch):
     train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
     run_dir = _run(tmp_path)
     args = _main_args(tmp_path, run_dir)
     monkeypatch.setattr(train_lora, "parse_args", lambda: args)
@@ -479,6 +482,7 @@ def test_post_eval_only_marks_post_eval_failed_when_adapter_missing(
 
 def test_main_runs_post_eval_only_before_processor_load(tmp_path, monkeypatch):
     train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
     run_dir = _run(tmp_path)
     args = _main_args(tmp_path, run_dir, post_eval_only=True)
     monkeypatch.setattr(train_lora, "parse_args", lambda: args)
@@ -730,3 +734,266 @@ def test_post_eval_only_marks_stopped_when_report_halts(tmp_path, monkeypatch):
     assert stages["post_eval"]["status"] == "stopped"
     assert stages["merge"]["status"] == "skipped"
     assert not (run_dir / "stop_training.signal").exists()
+
+
+def _canonical_args(tmp_path, run_dir, **overrides):
+    """Args for main() with a run dir that satisfies the canonical contract."""
+    values = dict(
+        run_dir=str(run_dir),
+        output_dir=train_lora_default_output_dir(),
+        results_dir=None,
+        fresh_start=False,
+        post_eval_only=False,
+        telephony_profiles="customer",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def train_lora_default_output_dir():
+    from scripts import train_lora as _tl
+
+    return _tl._default_output_dir()
+
+
+def test_main_rejects_non_canonical_run_dir(tmp_path, monkeypatch, capsys):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
+    run_dir = tmp_path / "my-custom-run"
+    args = _canonical_args(tmp_path, run_dir)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        train_lora, "_run_training", lambda *a, **k: pytest.fail("must reject early")
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        train_lora.main()
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "ASR_RUNS_DIR" in err
+    assert "canonical" in err
+    assert not run_dir.exists()
+
+
+def test_main_rejects_run_dir_outside_runs_root(tmp_path, monkeypatch, capsys):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path / "runs"))
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    run_dir = outside / RUN_ID
+    args = _canonical_args(tmp_path, run_dir)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        train_lora, "_run_training", lambda *a, **k: pytest.fail("must reject early")
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        train_lora.main()
+    assert exc_info.value.code == 2
+    assert "ASR_RUNS_DIR" in capsys.readouterr().err
+    assert not run_dir.exists()
+
+
+def test_ensure_cli_run_rejects_non_canonical_name(tmp_path):
+    train_lora = _train_lora()
+    args = SimpleNamespace(
+        output_dir=str(tmp_path / "output"),
+        results_dir=str(tmp_path / "results"),
+        preflight_cache_dir=None,
+    )
+    with pytest.raises(ValueError, match="invalid run id"):
+        train_lora._ensure_cli_run(tmp_path / "my-custom-run", args)
+
+
+def test_main_setup_failure_finalizes_open_attempt(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / RUN_ID
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
+    args = _canonical_args(tmp_path, run_dir)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        train_lora, "_run_training", lambda *a, **k: pytest.fail("setup must fail first")
+    )
+
+    def _boom(_run_dir):
+        raise RuntimeError("pid write boom")
+
+    monkeypatch.setattr(train_lora, "_write_cli_pid", _boom)
+    with pytest.raises(RuntimeError, match="pid write boom"):
+        train_lora.main()
+
+    run = run_state.load_run(run_dir.resolve())
+    assert run["current_pid"] is None
+    assert run["attempts"]
+    assert run["attempts"][-1]["ended_at"] is not None
+    assert not (run_dir.resolve() / "training.pid").exists()
+
+
+def test_preflight_detail_update_preserves_started_at(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    train_lora._mark_run_stage(
+        run_dir, "preflight", "running", detail="preparing datasets"
+    )
+    first = _stages(run_dir)["preflight"]["started_at"]
+    assert first is not None
+    train_lora._mark_run_stage(
+        run_dir,
+        "preflight",
+        "running",
+        detail="measuring baseline",
+        preserve_started=True,
+    )
+    assert _stages(run_dir)["preflight"]["started_at"] == first
+
+
+def test_mark_run_stage_without_preserve_refreshes_started_at(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    train_lora._mark_run_stage(
+        run_dir, "preflight", "running", detail="preparing datasets"
+    )
+    first = _stages(run_dir)["preflight"]["started_at"]
+    train_lora._mark_run_stage(
+        run_dir, "preflight", "running", detail="measuring baseline"
+    )
+    assert _stages(run_dir)["preflight"]["started_at"] >= first
+
+
+def test_halt_run_rejects_unknown_stage(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    with pytest.raises(ValueError, match="invalid halt stage"):
+        train_lora._halt_run(run_dir, str(run_dir), "bogus")
+
+
+@pytest.mark.parametrize("error", [RuntimeError("baseline boom"), OSError("disk gone")])
+def test_main_marks_preflight_failed_when_baseline_fails(
+    tmp_path, monkeypatch, error
+):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
+    run_dir = _run(tmp_path)
+    args = _main_args(
+        tmp_path,
+        run_dir,
+        run_epoch_benchmark=False,
+        run_post_test_eval=False,
+        enable_telemetry=False,
+        post_eval_only=False,
+        overwrite_preflight=False,
+        preflight_samples=0,
+        max_benchmark_samples=0,
+        phone_seed=1234,
+        eval_batch_size=16,
+    )
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakePipeline:
+        def __init__(self, *a, **k):
+            pass
+
+        def load_raw_dataset(self, *a, **k):
+            raise AssertionError("cached prep must skip raw loads")
+
+        def prepare_dataset_split(self, *a, **k):
+            raise AssertionError("cached prep must skip re-prep")
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
+    monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
+    monkeypatch.setattr(
+        train_lora, "_try_load_prep_cache", lambda *a, **k: SimpleNamespace()
+    )
+    monkeypatch.setattr(train_lora, "_save_prep_cache", lambda *a, **k: None)
+
+    def _boom(**kwargs):
+        raise error
+
+    monkeypatch.setattr(train_lora, "run_preflight", _boom)
+    with pytest.raises(type(error)):
+        train_lora.main()
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "failed"
+    assert run["failed_stage"] == "preflight"
+    assert run["last_error"] == str(error)
+    stage = _stages(run_dir)["preflight"]
+    assert stage["status"] == "failed"
+    assert stage["detail"] == f"baseline measurement failed: {error}"
+    assert run["current_pid"] is None
+    assert run["attempts"][-1]["ended_at"] is not None
+
+
+def test_post_eval_only_pre_stage_halt_backfills_telemetry_step(tmp_path):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    run_state.set_progress(run_dir, step=100, step_count=100, last_step_at=1.0)
+    (run_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 0, "max_steps": 0}),
+        encoding="utf-8",
+    )
+    (run_dir / "stop_training.signal").write_text("stop", encoding="utf-8")
+    args = _main_args(tmp_path, run_dir, post_eval_only=True)
+
+    train_lora._run_post_eval_only(args)
+
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "stopped"
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "stopped"
+    assert telemetry["step"] == 100
+    assert telemetry["max_steps"] == 100
+    assert not (run_dir / "stop_training.signal").exists()
+
+
+def test_plain_cli_post_eval_stage_writes_active_then_completed_telemetry(tmp_path):
+    train_lora = _train_lora()
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "live_telemetry.json").write_text(
+        json.dumps({"status": "training", "step": 5, "max_steps": 10}),
+        encoding="utf-8",
+    )
+    observed = {}
+
+    def evaluate():
+        observed["during"] = json.loads(
+            (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
+        )["status"]
+
+    completed = train_lora._run_post_eval_stage(
+        run_dir=None, results_dir=results_dir, evaluate=evaluate
+    )
+    assert completed is True
+    assert observed["during"] == "evaluating_benchmark"
+    final = json.loads(
+        (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert final["status"] == "completed"
+    assert final["step"] == 5
+    assert final["max_steps"] == 10
+
+
+def test_plain_cli_post_eval_halt_writes_stopped_telemetry(tmp_path):
+    train_lora = _train_lora()
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+
+    def evaluate():
+        raise RuntimeError("halt requested")
+
+    completed = train_lora._run_post_eval_stage(
+        run_dir=None, results_dir=results_dir, evaluate=evaluate
+    )
+    assert completed is False
+    telemetry = json.loads(
+        (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "stopped"

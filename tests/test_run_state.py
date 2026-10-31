@@ -206,6 +206,39 @@ def test_set_stage_tracks_current_stage_and_timestamps(tmp_path):
         run_state.set_stage(run_dir, "training", "bogus")
 
 
+def test_set_stage_preserve_started_keeps_original_timestamp(tmp_path, monkeypatch):
+    run = _create(tmp_path)
+    run_dir = run["paths"]["run_dir"]
+
+    clock = {"now": 1000.0}
+
+    def fake_time():
+        clock["now"] += 1.0
+        return clock["now"]
+
+    monkeypatch.setattr(run_state.time, "time", fake_time)
+
+    run_state.set_stage(run_dir, "preflight", "running", detail="preparing datasets")
+    first = _stages_by_name(run_state.load_run(run_dir))["preflight"]["started_at"]
+    assert isinstance(first, float)
+
+    run_state.set_stage(
+        run_dir,
+        "preflight",
+        "running",
+        detail="measuring baseline",
+        preserve_started=True,
+    )
+    preserved = _stages_by_name(run_state.load_run(run_dir))["preflight"]
+    assert preserved["started_at"] == first
+    assert preserved["detail"] == "measuring baseline"
+    assert preserved["ended_at"] is None
+
+    run_state.set_stage(run_dir, "preflight", "running", detail="again")
+    refreshed = _stages_by_name(run_state.load_run(run_dir))["preflight"]
+    assert refreshed["started_at"] > first
+
+
 def test_set_status_sets_fields_and_terminal_timestamp(tmp_path):
     run = _create(tmp_path)
     run_dir = run["paths"]["run_dir"]
