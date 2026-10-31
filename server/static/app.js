@@ -25,6 +25,21 @@ const el = {
   btnStop: document.getElementById("btnStop"),
   btnFresh: document.getElementById("btnFresh"),
   btnSmoke: document.getElementById("btnSmoke"),
+  btnResume: document.getElementById("btnResume"),
+  btnMerge: document.getElementById("btnMerge"),
+  runSelect: document.getElementById("runSelect"),
+  runHead: document.getElementById("runHead"),
+  runIdentity: document.getElementById("runIdentity"),
+  runStatus: document.getElementById("runStatus"),
+  runSource: document.getElementById("runSource"),
+  runCreated: document.getElementById("runCreated"),
+  stageStepper: document.getElementById("stageStepper"),
+  stepSaved: document.getElementById("stepSaved"),
+  storageWarning: document.getElementById("storageWarning"),
+  mergeResult: document.getElementById("mergeResult"),
+  mergeResultText: document.getElementById("mergeResultText"),
+  mergeLogWrap: document.getElementById("mergeLogWrap"),
+  mergeLog: document.getElementById("mergeLog"),
   smokeResult: document.getElementById("smokeResult"),
   smokeStatus: document.getElementById("smokeStatus"),
   smokeLogWrap: document.getElementById("smokeLogWrap"),
@@ -52,6 +67,17 @@ let renderedTicks = 0;
 let smokeRunning = false;
 let smokePollTimer = null;
 let fullRunRunning = false;
+let formRestored = false;
+
+const STAGE_STATUS_LABELS = {
+  pending: "Pending",
+  running: "Running",
+  completed: "Completed",
+  stopped: "Stopped",
+  failed: "Failed",
+  skipped: "Skipped",
+  interrupted: "Interrupted",
+};
 
 // Formatters
 
@@ -97,6 +123,145 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;");
 }
 
+// Run provenance
+
+function truthyFlag(value) {
+  if (typeof value === "string") {
+    return ["1", "on", "true", "yes"].includes(value.toLowerCase());
+  }
+  return Boolean(value);
+}
+
+function restoreRunConfig(config) {
+  if (formRestored || !config || typeof config !== "object") return;
+  formRestored = true;
+
+  const fields = [
+    [el.inputEpochs, config.epochs],
+    [el.inputBatchSize, config.batch_size],
+    [el.inputGradAccum, config.grad_accum],
+    [el.inputEvalSteps, config.eval_steps],
+    [el.inputLearningRate, config.learning_rate],
+  ];
+  for (const [input, value] of fields) {
+    if (input && value != null && value !== "") input.value = String(value);
+  }
+  if (Object.prototype.hasOwnProperty.call(config, "gradient_checkpointing")) {
+    el.inputGradCheckpoint.value = truthyFlag(config.gradient_checkpointing) ? "on" : "off";
+  }
+}
+
+function formatCreatedAt(createdAt) {
+  const seconds = Number(createdAt);
+  if (createdAt == null || !Number.isFinite(seconds)) return "Created —";
+  const date = new Date(seconds * 1000);
+  if (isNaN(date.getTime())) return "Created —";
+  const text = date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `Created ${text}`;
+}
+
+function updateStorageWarning(storage) {
+  if (!el.storageWarning) return;
+  const show = !!(storage && storage.persistent === false);
+  el.storageWarning.hidden = !show;
+  if (!show) {
+    el.storageWarning.textContent = "";
+    return;
+  }
+  const runsDir = storage.runs_dir || "unknown";
+  el.storageWarning.textContent =
+    `Runs are not on persistent storage (${runsDir}). ` +
+    "Set ASR_RUNS_DIR to a /workspace path.";
+}
+
+function renderStepper(run) {
+  if (!el.stageStepper) return;
+  const stages = stageMap(run);
+  for (const stage of el.stageStepper.querySelectorAll(".stage")) {
+    const name = stage.dataset.stage;
+    const current = stages.get(name) || { status: "pending" };
+    const status = STAGE_STATUS_LABELS[current.status] ? current.status : "pending";
+
+    for (const cls of Array.from(stage.classList)) {
+      if (cls.startsWith("is-")) stage.classList.remove(cls);
+    }
+    stage.classList.add(`is-${status}`);
+    stage.dataset.status = status;
+
+    const label = stage.querySelector(".stage-label");
+    if (label) label.textContent = stageLabel(name);
+    const detail = stage.querySelector(".stage-detail");
+    if (detail) detail.textContent = STAGE_STATUS_LABELS[status];
+    stage.title = current.detail ? String(current.detail) : "";
+  }
+}
+
+function renderRun(run, steps, storage, adapterExists = false) {
+  if (!run || !el.runHead) {
+    hideRunUi();
+    return;
+  }
+
+  const status = String(run.status || "unknown");
+  const knownStatus = ["starting", "running", "completed", "stopped", "failed", "interrupted"];
+  el.runHead.hidden = false;
+  el.runIdentity.textContent = run.run_id || "—";
+  el.runStatus.textContent = runStatusLabel(run);
+  el.runStatus.className = `run-status run-status-${knownStatus.includes(status) ? status : "unknown"}`;
+  el.runCreated.textContent = formatCreatedAt(run.created_at);
+  el.runSource.hidden = run.source !== "fake";
+  renderStepper(run);
+  el.stepSaved.textContent = savedStepsLabel(steps);
+  updateStorageWarning(storage);
+
+  el.btnResume.hidden = !["interrupted", "stopped", "failed"].includes(run.status);
+  el.btnMerge.hidden = !isMergeAvailable(run, Boolean(adapterExists) || Boolean(run.adapter_exists));
+}
+
+function hideRunUi() {
+  if (el.runHead) el.runHead.hidden = true;
+  if (el.btnResume) el.btnResume.hidden = true;
+  if (el.btnMerge) el.btnMerge.hidden = true;
+}
+
+function applyLiveRun(data) {
+  if (!data || !data.run) return;
+  const selected = el.runSelect ? el.runSelect.value || "latest" : "latest";
+  if (selected !== "latest") return;
+  renderRun(data.run, data.steps, data.storage, data.adapter_exists);
+  restoreRunConfig(data.run.config);
+}
+
+async function loadRunState() {
+  try {
+    const res = await fetch("/api/runs/latest");
+    if (!res.ok) {
+      hideRunUi();
+      return;
+    }
+    const payload = await res.json();
+    if (!payload || !payload.run) {
+      // Legacy/local demo without a run ledger: keep the pre-run cockpit.
+      hideRunUi();
+      return;
+    }
+
+    const firstLoad = !formRestored;
+    renderRun(payload.run, payload.steps, payload.storage, payload.adapter_exists);
+    restoreRunConfig(payload.run.config);
+    if (Array.isArray(payload.benchmarks)) updateBenchmarks(payload.benchmarks);
+    if (Array.isArray(payload.loss_history)) updateLossHistory(payload.loss_history);
+    if (firstLoad) fetchLogs();
+  } catch (e) {
+    hideRunUi();
+  }
+}
+
 // Connection
 
 function connectWebSocket() {
@@ -116,6 +281,13 @@ function connectWebSocket() {
         if (data.telemetry) updateTelemetry(data.telemetry);
         if (data.benchmarks) updateBenchmarks(data.benchmarks);
         if (data.loss_history) updateLossHistory(data.loss_history);
+        if (Object.prototype.hasOwnProperty.call(data, "run")) {
+          if (data.run) {
+            applyLiveRun(data);
+          } else if (!el.runSelect || (el.runSelect.value || "latest") === "latest") {
+            hideRunUi();
+          }
+        }
       } catch (e) {
         console.error("Error parsing live payload:", e);
       }
@@ -698,6 +870,10 @@ window.addEventListener("DOMContentLoaded", () => {
   connectWebSocket();
   pollTelemetryFallback();
   setInterval(pollTelemetryFallback, 1000);
+  loadRunState();
+  setInterval(() => {
+    if (!wsActive) loadRunState();
+  }, 2000);
   fetchLogs();
   setInterval(fetchLogs, 2500);
   pollSmokeStatus();

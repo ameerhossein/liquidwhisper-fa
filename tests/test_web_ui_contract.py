@@ -33,3 +33,60 @@ def test_benchmark_best_is_gated_to_comparable_rows():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_stateful_run_controls_are_present():
+    html = (ROOT / "server/static/index.html").read_text()
+    js = (ROOT / "server/static/app.js").read_text()
+    for element in (
+        "runSelect",
+        "runIdentity",
+        "runCreated",
+        "stageStepper",
+        "stepSaved",
+        "storageWarning",
+        "btnResume",
+        "btnMerge",
+        "mergeResult",
+        "mergeLog",
+    ):
+        assert f'id="{element}"' in html
+    assert "/static/run_view.js" in html
+    assert html.index("/static/run_view.js") < html.index("/static/app.js")
+    assert "/api/runs/latest" in js
+    assert "stageStepper" in js
+    assert "stageMap(" in js
+    assert "Runs are not on persistent storage (" in js
+    assert "Set ASR_RUNS_DIR to a /workspace path." in js
+    assert "Dev simulation" in html
+
+
+def test_stepper_styles_every_stage_state():
+    css = (ROOT / "server/static/style.css").read_text()
+    for status in (
+        "pending",
+        "running",
+        "completed",
+        "stopped",
+        "failed",
+        "skipped",
+        "interrupted",
+    ):
+        assert f".stage.is-{status}" in css
+    assert ".storage-warning" in css
+    assert ".stage-dot" in css
+    assert ".stage-label" in css
+    assert ".stage-detail" in css
+    assert "prefers-reduced-motion" in css
+
+
+def test_run_view_behavior():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    result = subprocess.run(
+        [node, str(ROOT / "tests" / "test_run_view.js")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

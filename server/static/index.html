@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
   <div class="page">
@@ -18,6 +18,12 @@
         <span class="brand-sub">BuzzASR fine-tune on Neyshekar v6</span>
       </div>
       <div class="topbar-meta">
+        <label class="run-picker">
+          <span class="run-picker-label">Run</span>
+          <select id="runSelect" class="run-select">
+            <option value="latest">Latest</option>
+          </select>
+        </label>
         <span class="status"><span id="statusDot" class="dot dot-idle"></span><span id="statusLabel">Idle</span></span>
         <span class="gpu">
           <span id="gpuModel">Detecting GPU…</span>
@@ -28,6 +34,44 @@
     </header>
 
     <main>
+
+      <section id="runHead" class="run-head" aria-label="Run context" hidden>
+        <div class="run-head-top">
+          <div class="run-identity">
+            <span class="run-identity-label">Run</span>
+            <span id="runIdentity" class="run-identity-id">—</span>
+            <span id="runStatus" class="run-status">—</span>
+            <span id="runSource" class="dev-badge" hidden>Dev simulation</span>
+          </div>
+          <div class="run-head-meta">
+            <span id="runCreated" class="run-created">—</span>
+            <span id="stepSaved" class="step-saved">0 steps saved</span>
+          </div>
+        </div>
+        <ol id="stageStepper" class="stage-stepper" aria-label="Run stages">
+          <li class="stage is-pending" data-stage="preflight">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Preflight</span>
+            <span class="stage-detail">Pending</span>
+          </li>
+          <li class="stage is-pending" data-stage="training">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Training</span>
+            <span class="stage-detail">Pending</span>
+          </li>
+          <li class="stage is-pending" data-stage="post_eval">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Post-eval</span>
+            <span class="stage-detail">Pending</span>
+          </li>
+          <li class="stage is-pending" data-stage="merge">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Merge</span>
+            <span class="stage-detail">Pending</span>
+          </li>
+        </ol>
+        <div id="storageWarning" class="storage-warning" role="status" hidden></div>
+      </section>
 
       <section class="run">
         <div>
@@ -91,6 +135,8 @@
           <input type="text" id="inputLearningRate" class="field-input" value="0.0001">
         </label>
         <div class="config-actions">
+          <button id="btnResume" type="button" class="btn btn-fresh" hidden>Resume run</button>
+          <button id="btnMerge" type="button" class="btn btn-fresh" hidden>Merge adapter</button>
           <button id="btnStop" type="button" class="btn btn-halt" disabled>Halt run</button>
           <button id="btnFresh" type="button" class="btn btn-fresh">Fresh start</button>
           <button id="btnSmoke" type="button" class="btn btn-fresh"
@@ -100,6 +146,14 @@
           <button id="btnStart" type="button" class="btn btn-primary">Start run</button>
         </div>
       </form>
+
+      <div id="mergeResult" class="merge-result" hidden>
+        <p id="mergeResultText"></p>
+        <details id="mergeLogWrap" hidden>
+          <summary>Show merge log</summary>
+          <pre id="mergeLog"></pre>
+        </details>
+      </div>
 
       <div id="smokeResult" class="smoke-result" hidden>
         <p id="smokeStatus"></p>
@@ -216,6 +270,7 @@
   </div>
 
   <script src="/static/benchmark_view.js?v=1"></script>
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/run_view.js?v=1"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>
