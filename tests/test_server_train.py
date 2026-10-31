@@ -246,7 +246,23 @@ def test_defaults_use_small_batch_with_accumulation_and_sparse_eval(client):
     assert flags["--max_benchmark_samples"] == "1000"
     assert flags["--preflight_samples"] == "1000"
     assert flags["--telephony_prob"] == "0.5"
+    assert flags["--telephony_mode"] == "paired"
+    assert flags["--epochs"] == "2"
     assert "--no-gradient_checkpointing" in client.launched[0]
+
+
+def test_start_defaults_to_paired_and_two_epochs(client):
+    res = client.post("/api/train/start", json={})
+    assert res.status_code == 200
+    flags = _flags(client.launched[0])
+    assert flags["--telephony_mode"] == "paired"
+    assert flags["--epochs"] == "2"
+
+
+def test_start_rejects_unknown_telephony_mode(client):
+    res = client.post("/api/train/start", json={"telephony_mode": "satellite"})
+    assert res.status_code == 400
+    assert client.launched == []
 
 
 def test_gradient_checkpointing_flag_is_passed_through(client):
@@ -487,6 +503,12 @@ def test_smoke_start_builds_fast_isolated_command(client):
     assert res.json()["mode"] == "smoke"
 
 
+def test_smoke_command_includes_paired_mode(client):
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 200
+    assert _flags(client.launched[0])["--telephony_mode"] == "paired"
+
+
 def test_smoke_output_dir_avoids_persistent_fallback_collision(client, monkeypatch):
     monkeypatch.setattr(
         client.mod,
@@ -622,7 +644,10 @@ def test_start_creates_self_contained_run(client):
     assert flags["--preflight_cache_dir"] == str(client.mod.RUNS_DIR / "_shared")
     assert flags["--output_dir"] == str(run_dir / "output")
     assert flags["--results_dir"] == str(run_dir)
-    assert run["trainer_args"]["epochs"] == 4
+    assert run["trainer_args"]["epochs"] == 2
+    assert run["trainer_args"]["telephony_mode"] == "paired"
+    assert run["config"]["telephony_mode"] == "paired"
+    assert res.json()["config"]["telephony_mode"] == "paired"
 
 
 def test_start_rejects_explicit_results_dir(client):
@@ -694,6 +719,27 @@ def test_resume_uses_manifest_run_dir(client, tmp_path):
     flags = _flags(client.launched[-1])
     assert flags["--run_dir"] == str(manifest_run_dir)
     assert run_state.load_run(manifest_run_dir)["status"] == "running"
+
+
+def test_resume_legacy_run_defaults_to_disjoint(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_id = start["run_id"]
+    # Stop the fake child so the resume is allowed, as in the existing
+    # test_resume_uses_manifest_run_dir test.
+    client.mod._is_process_running = lambda pid=None: False
+    client.mod.training_process = None
+
+    def strip_mode(run):
+        run["trainer_args"].pop("telephony_mode", None)
+        run["config"].pop("telephony_mode", None)
+        run["status"] = "failed"
+        return run
+
+    run_state.update_run(client.mod.RUNS_DIR / run_id, strip_mode)
+    res = client.post(f"/api/runs/{run_id}/resume")
+    assert res.status_code == 200, res.text
+    flags = _flags(client.launched[-1])
+    assert flags["--telephony_mode"] == "disjoint"
 
 
 def test_run_preflight_file_falls_back_to_legacy(client, tmp_path, monkeypatch):

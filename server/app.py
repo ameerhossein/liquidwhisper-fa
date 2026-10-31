@@ -1657,6 +1657,12 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
     if not (0.0 <= tele_f <= 1.0):
         raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
+    mode = str(config.get("telephony_mode", "paired")).strip().lower()
+    if mode not in ("paired", "disjoint", "clean"):
+        raise HTTPException(
+            status_code=400,
+            detail="telephony_mode must be one of paired, disjoint, clean.",
+        )
 
     ckpt_raw = config.get("gradient_checkpointing", False)
     gradient_ckpt = (
@@ -1714,6 +1720,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         "--preflight_samples", "25",
         "--num_proc", str(num_proc_i),
         "--telephony_prob", str(tele_f),
+        "--telephony_mode", mode,
         "--warmup_steps", "2",
         "--eval_steps", "5",
         "--save_steps", "5",
@@ -1785,6 +1792,7 @@ _TRAINER_VALUE_ARGS = (
     "preflight_samples",
     "num_proc",
     "telephony_prob",
+    "telephony_mode",
     "telephony_seed",
     "phone_seed",
     "lora_r",
@@ -1862,7 +1870,7 @@ def _build_trainer_command(
 def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and normalize a new-run payload (legacy rules unchanged)."""
     try:
-        epochs_i = int(config.get("epochs", 4))
+        epochs_i = int(config.get("epochs", 2))
         batch_i = int(config.get("batch_size", 8))
         accum_i = int(config.get("grad_accum", 4))
         eval_steps_i = int(config.get("eval_steps", 1000))
@@ -1891,6 +1899,12 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="num_proc must be 1..16.")
     if not (0.0 <= tele_f <= 1.0):
         raise HTTPException(status_code=400, detail="telephony_prob must be 0..1.")
+    mode = str(config.get("telephony_mode", "paired")).strip().lower()
+    if mode not in ("paired", "disjoint", "clean"):
+        raise HTTPException(
+            status_code=400,
+            detail="telephony_mode must be one of paired, disjoint, clean.",
+        )
     if not (1 <= eval_steps_i <= 10000):
         raise HTTPException(status_code=400, detail="eval_steps must be 1..10000.")
     ckpt_raw = config.get("gradient_checkpointing", False)
@@ -1923,6 +1937,7 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "max_benchmark_samples": max_bench_i,
         "num_proc": num_proc_i,
         "telephony_prob": tele_f,
+        "telephony_mode": mode,
         "gradient_checkpointing": gradient_ckpt,
         "dataset_name": dataset_name,
         "fresh_start": fresh_start,
@@ -2156,6 +2171,7 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "preflight_samples": values["max_benchmark_samples"],
         "num_proc": values["num_proc"],
         "telephony_prob": values["telephony_prob"],
+        "telephony_mode": values["telephony_mode"],
         "telephony_profiles": ["customer"],
         "telephony_seed": 42,
         "telephony_use_ffmpeg": True,
@@ -2188,6 +2204,7 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "preflight_samples": values["max_benchmark_samples"],
         "num_proc": values["num_proc"],
         "telephony_prob": values["telephony_prob"],
+        "telephony_mode": values["telephony_mode"],
         "gradient_checkpointing": values["gradient_checkpointing"],
         "auto_resume": values["auto_resume"],
         "fresh_start": values["fresh_start"],
@@ -2212,6 +2229,7 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "gradient_checkpointing": values["gradient_checkpointing"],
         "num_proc": str(values["num_proc"]),
         "telephony_prob": str(values["telephony_prob"]),
+        "telephony_mode": values["telephony_mode"],
         "output_dir": output_dir,
         "results_dir": str(run_dir),
         "auto_resume": values["auto_resume"],
@@ -2266,6 +2284,7 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     }
 
     trainer_args = dict(run.get("trainer_args") or {})
+    trainer_args.setdefault("telephony_mode", "disjoint")
     trainer_args.pop("resume_from_checkpoint", None)
     trainer_args.update({
         "run_dir": str(run_dir),
@@ -2289,6 +2308,7 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         "gradient_checkpointing": _as_bool(trainer_args.get("gradient_checkpointing", False)),
         "num_proc": str(trainer_args.get("num_proc", "")),
         "telephony_prob": str(trainer_args.get("telephony_prob", "")),
+        "telephony_mode": trainer_args["telephony_mode"],
         "output_dir": output_dir,
         "results_dir": results_dir,
         "auto_resume": True,
