@@ -678,6 +678,21 @@ def _finalize_fake_attempt(run_dir: Path, exit_code: int) -> None:
         pass
 
 
+def _system_exit_code(exc: SystemExit) -> int:
+    """Map a ``SystemExit`` to a process exit code.
+
+    ``SystemExit`` with code ``None`` (bare ``raise SystemExit``) means a
+    clean exit, just like code ``0``; anything non-integer is a failure.
+    The finalizer uses this so the recorded attempt matches the real exit.
+    """
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
 def _fail(
     run_dir: Path,
     results_dir: Path,
@@ -823,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         exit_code = _run(args, run, run_dir, results_dir, output_dir, cache_dir)
     except SystemExit as exc:
-        exit_code = exc.code if isinstance(exc.code, int) else 1
+        exit_code = _system_exit_code(exc)
         raise
     except BaseException:
         exit_code = 1

@@ -691,3 +691,128 @@ def test_fake_trainer_separate_results_dir(tmp_path):
     )
     assert telemetry["status"] == "completed"
     assert telemetry["step"] == 4
+
+
+def _load_fake_trainer_module():
+    """Import the fake trainer in-process for white-box exit-path tests."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "dev_fake_trainer_under_test", str(TRAINER)
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_code", "expected_reason"),
+    [
+        (SystemExit(), 0, "completed"),
+        (SystemExit(0), 0, "completed"),
+        (SystemExit("boom"), 1, "nonzero_exit"),
+    ],
+)
+def test_fake_trainer_system_exit_code_finalizes_attempt(
+    tmp_path, monkeypatch, raised, expected_code, expected_reason
+):
+    module = _load_fake_trainer_module()
+    run_dir = tmp_path / "runs" / RUN_ID
+    monkeypatch.delenv("ASR_COCKPIT_SPAWNED", raising=False)
+    for key in [key for key in os.environ if key.startswith("ASR_FAKE_")]:
+        monkeypatch.delenv(key, raising=False)
+
+    def blow_up(*args, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(module, "_run", blow_up)
+    with pytest.raises(SystemExit) as exc_info:
+        module.main(
+            [
+                "--run_dir",
+                str(run_dir),
+                "--results_dir",
+                str(run_dir),
+                "--output_dir",
+                str(run_dir / "output"),
+                "--preflight_cache_dir",
+                str(tmp_path / "cache"),
+            ]
+        )
+    assert exc_info.value.code == raised.code
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert len(run["attempts"]) == 1
+    assert run["attempts"][0]["exit_code"] == expected_code
+    assert run["attempts"][0]["reason"] == expected_reason
+    assert run["current_pid"] is None
+    assert not (run_dir / "training.pid").exists()
+
+
+def test_fake_trainer_fresh_start_ignored_with_post_eval_only(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    first = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="5")
+    assert first.returncode == 0, first.stderr
+    steps_before = (run_dir / "steps.jsonl").read_text(encoding="utf-8")
+    loss_before = (run_dir / "loss_history.json").read_text(encoding="utf-8")
+    adapter = run_dir / "output" / "best_adapter" / "adapter_config.json"
+    assert adapter.is_file()
+
+    result = _run_trainer(
+        run_dir,
+        tmp_path / "cache",
+        extra_args=("--post_eval_only", "--fresh_start"),
+        ASR_FAKE_STEPS="12",
+    )
+
+    assert result.returncode == 0, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    # Prior optimizer state is preserved, not cleared, like the real trainer.
+    assert (run_dir / "steps.jsonl").read_text(encoding="utf-8") == steps_before
+    assert (run_dir / "loss_history.json").read_text(
+        encoding="utf-8"
+    ) == loss_before
+    assert adapter.is_file()
+    assert "Note: --fresh_start is ignored with --post_eval_only." in (
+        run_dir / "training_live.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_fake_trainer_stale_attempt_finalized_as_process_lost(tmp_path):
+    runs = tmp_path / "runs"
+    run_state.create_run(
+        runs, config={}, trainer_args={}, source="fake", run_id=RUN_ID
+    )
+    run_dir = runs / RUN_ID
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_pid = proc.pid
+    assert proc.wait(timeout=30) == 0
+    run_state.start_attempt(run_dir, dead_pid, "initial")
+    (run_dir / "training.pid").write_text(str(dead_pid), encoding="utf-8")
+
+    result = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="3")
+
+    assert result.returncode == 0, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    assert len(run["attempts"]) == 2
+    stale, fresh = run["attempts"]
+    assert stale["pid"] == dead_pid
+    assert stale["ended_at"] is not None
+    assert stale["exit_code"] is None
+    assert stale["reason"] == "process_lost"
+    assert fresh["pid"] != dead_pid
+    assert fresh["ended_at"] is not None
+    assert fresh["exit_code"] == 0
+    assert fresh["reason"] == "completed"
+    assert run["current_pid"] is None
+    assert not (run_dir / "training.pid").exists()
+    assert run_state.step_count(run_dir) == 3
+    assert all(
+        record.get("attempt") == 2 for record in run_state.read_steps(run_dir)
+    )
