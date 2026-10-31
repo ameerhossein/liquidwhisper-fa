@@ -2994,7 +2994,10 @@ async def get_hf_config():
 
 
 @app.get("/api/hf/runs")
-async def list_hf_runs(repo: Optional[str] = None):
+def list_hf_runs(repo: Optional[str] = None):
+    # Deliberately synchronous: FastAPI runs a plain ``def`` path operation in
+    # its threadpool, so the blocking HF listing cannot stall the event loop
+    # (and therefore the 1s WebSocket telemetry tick).
     repo_id = str(repo or "").strip() or (
         os.environ.get("ASR_HF_RUN_REPO", "") or ""
     ).strip()
