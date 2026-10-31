@@ -52,6 +52,8 @@ def _main_args(tmp_path, run_dir, **overrides):
         phone_benchmark=False,
         phone_seed=1234,
         num_proc=1,
+        max_train_samples=None,
+        max_eval_samples=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -345,12 +347,96 @@ def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch)
     assert stage["status"] == "failed"
 
 
+def test_prep_failure_does_not_publish(tmp_path, monkeypatch):
+    """A failed map must not publish a partial cache slot."""
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_RUNS_DIR", str(tmp_path))
+    run_dir = _run(tmp_path)
+    prep_cache_dir = tmp_path / "prep_cache"
+    staging = prep_cache_dir / "train.staging-test"
+    args = _main_args(
+        tmp_path,
+        run_dir,
+        prep_cache_dir=str(prep_cache_dir),
+        run_epoch_benchmark=False,
+        max_train_samples=None,
+        max_eval_samples=None,
+    )
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    published = []
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakePipeline:
+        def __init__(self, *a, **k):
+            pass
+
+        def load_raw_dataset(self, *a, **k):
+            return [object()]
+
+        def prepare_paired_dataset(self, *a, **k):
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "clean.arrow").write_bytes(b"partial shard")
+            raise RuntimeError("paired prep boom")
+
+        def prepare_dataset_split(self, *a, **k):
+            raise AssertionError("paired mode must not prepare a plain split")
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
+    monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
+    monkeypatch.setattr(train_lora.prep_cache, "load_prep_cache", lambda *a, **k: None)
+    monkeypatch.setattr(
+        train_lora.prep_cache, "cleanup_stale_staging", lambda *a, **k: None
+    )
+    monkeypatch.setattr(train_lora.prep_cache, "ensure_space", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "remove_cache", lambda *a, **k: None)
+    monkeypatch.setattr(
+        train_lora.prep_cache, "staging_dir", lambda *a, **k: staging
+    )
+    monkeypatch.setattr(
+        train_lora.prep_cache,
+        "publish_dataset",
+        lambda *a, **k: published.append((a, k)),
+    )
+    monkeypatch.setattr(
+        train_lora,
+        "run_preflight",
+        lambda **kwargs: pytest.fail("prep failure must stop before baseline"),
+    )
+
+    with pytest.raises(RuntimeError, match="paired prep boom"):
+        train_lora.main()
+
+    assert published == []
+    assert not staging.exists()
+    run = run_state.load_run(run_dir)
+    assert run["status"] == "failed"
+    assert run["failed_stage"] == "preflight"
+    assert "paired prep boom" in run["last_error"]
+    stage = _stages(run_dir)["preflight"]
+    assert stage["status"] == "failed"
+    assert "paired prep boom" in stage["detail"]
+
+
 @pytest.mark.parametrize(
-    ("mode", "expected_train_prob", "expected_fp_prob"),
-    [("paired", 0.0, None), ("disjoint", 0.5, 0.5), ("clean", 0.0, 0.0)],
+    ("mode", "expected_train_prob", "expected_fp_prob", "expected_copies"),
+    [
+        ("paired", 0.0, None, [2]),
+        ("disjoint", 0.5, 0.5, [1]),
+        ("clean", 0.0, 0.0, [1]),
+    ],
 )
 def test_train_fingerprint_matches_effective_pipeline_prob(
-    tmp_path, monkeypatch, mode, expected_train_prob, expected_fp_prob
+    tmp_path,
+    monkeypatch,
+    mode,
+    expected_train_prob,
+    expected_fp_prob,
+    expected_copies,
 ):
     """The real prep flow fingerprints the prob the pipeline actually uses."""
     train_lora = _train_lora()
@@ -365,7 +451,7 @@ def test_train_fingerprint_matches_effective_pipeline_prob(
         prep_cache_dir=str(tmp_path / "prep_cache"),
         run_epoch_benchmark=False,
     )
-    captured = {"pipeline_probs": [], "fps": {}}
+    captured = {"pipeline_probs": [], "fps": {}, "copies": []}
 
     class _FakeProcessor:
         @classmethod
@@ -377,7 +463,7 @@ def test_train_fingerprint_matches_effective_pipeline_prob(
             captured["pipeline_probs"].append(k.get("telephony_prob"))
 
         def load_raw_dataset(self, *a, **k):
-            return SimpleNamespace()
+            return [object()]
 
         def _stop(self, *a, **k):
             raise RuntimeError("stop after fingerprint")
@@ -385,15 +471,26 @@ def test_train_fingerprint_matches_effective_pipeline_prob(
         prepare_dataset_split = _stop
         prepare_paired_dataset = _stop
 
-    def _record(cache_subdir, fingerprint):
-        captured["fps"][Path(cache_subdir).name] = fingerprint
+    def _load(cache_dir, fingerprint):
+        captured["fps"][Path(cache_dir).name] = fingerprint
         return None
+
+    def _estimate(rows, copies=1):
+        captured["copies"].append(copies)
+        return 1
+
+    staging = tmp_path / "prep_cache" / "staging-test"
 
     monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
     monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
     monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
-    monkeypatch.setattr(train_lora, "_try_load_prep_cache", _record)
-    monkeypatch.setattr(train_lora, "_save_prep_cache", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "load_prep_cache", _load)
+    monkeypatch.setattr(train_lora.prep_cache, "publish_dataset", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "cleanup_stale_staging", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "ensure_space", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "remove_cache", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "staging_dir", lambda *a, **k: staging)
+    monkeypatch.setattr(train_lora.prep_cache, "estimate_feature_bytes", _estimate)
 
     with pytest.raises(RuntimeError, match="stop after fingerprint"):
         train_lora._run_training(args, run_dir)
@@ -406,6 +503,9 @@ def test_train_fingerprint_matches_effective_pipeline_prob(
     assert train_fp["telephony_prob"] == expected_fp_prob
     assert eval_fp["telephony_mode"] == "clean"
     assert eval_fp["telephony_prob"] == 0.0
+    # Paired materializes both halves; every other split is one copy. Only the
+    # train estimate is recorded because the pipeline stops during train prep.
+    assert captured["copies"] == expected_copies
 
 
 def test_run_attempt_number_reads_latest_attempt(tmp_path):
@@ -1035,9 +1135,9 @@ def test_main_marks_preflight_failed_when_baseline_fails(
     monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
     monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
     monkeypatch.setattr(
-        train_lora, "_try_load_prep_cache", lambda *a, **k: SimpleNamespace()
+        train_lora.prep_cache, "load_prep_cache", lambda *a, **k: [SimpleNamespace()]
     )
-    monkeypatch.setattr(train_lora, "_save_prep_cache", lambda *a, **k: None)
+    monkeypatch.setattr(train_lora.prep_cache, "publish_dataset", lambda *a, **k: None)
 
     def _boom(**kwargs):
         raise error

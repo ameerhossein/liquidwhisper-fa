@@ -12,6 +12,7 @@ import os
 import sys
 import argparse
 import json
+import shutil
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -68,6 +69,7 @@ from src.data import PersianASRDataPipeline, persian_label_ids
 from src.trainer_callbacks import WebTelemetryCallback, _resolve_infer_dtype, _should_autocast
 from src.preflight import compute_deltas, preflight_path, run_preflight
 from src import paths as _managed_paths
+from src import prep_cache
 from src import run_state
 
 
@@ -325,46 +327,6 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, teleph
         "telephony_rng": "per_row_index_v1",
         "label_ids": None if prefix_ids is None else [*prefix_ids, eos_id],
     }
-
-
-def _try_load_prep_cache(cache_subdir: str, fingerprint: Dict[str, Any]):
-    """Return cached Dataset if fingerprint matches, else None."""
-    from pathlib import Path as _Path
-    fp_file = _Path(cache_subdir) / "fingerprint.json"
-    data_dir = _Path(cache_subdir) / "data"
-    try:
-        if not fp_file.is_file() or not data_dir.is_dir():
-            return None
-        with open(fp_file, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if saved != fingerprint:
-            print(f"Prep cache mismatch at {cache_subdir}; re-preparing.")
-            return None
-        from datasets import load_from_disk
-        ds = load_from_disk(str(data_dir))
-        print(f"Prep cache HIT: loaded {len(ds)} samples from {data_dir} (skipped re-prep).")
-        return ds
-    except Exception as e:
-        print(f"Prep cache load failed at {cache_subdir} ({e}); re-preparing.")
-        return None
-
-
-def _save_prep_cache(ds, cache_subdir: str, fingerprint: Dict[str, Any]) -> None:
-    """Persist prepared Dataset + fingerprint for future runs."""
-    import shutil
-    from pathlib import Path as _Path
-    try:
-        base = _Path(cache_subdir)
-        data_dir = base / "data"
-        base.mkdir(parents=True, exist_ok=True)
-        if data_dir.is_dir():
-            shutil.rmtree(data_dir, ignore_errors=True)
-        ds.save_to_disk(str(data_dir))
-        with open(base / "fingerprint.json", "w", encoding="utf-8") as f:
-            json.dump(fingerprint, f, ensure_ascii=False, indent=2)
-        print(f"Prep cache SAVED: {len(ds)} samples -> {data_dir}")
-    except Exception as e:
-        print(f"Warning: prep cache save failed at {cache_subdir}: {e}")
 
 
 def _resolve_output_dir(raw: str) -> str:
@@ -1214,13 +1176,12 @@ def _run_training(args, run_dir):
             pass
         train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), mode, effective_train_prob)
         eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), "clean", 0.0)
-        if reuse_prep and not overwrite_prep:
-            train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
-            eval_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "validation"), eval_fp)
-            if train_dataset is not None and mode != "clean":
-                halves = ", both halves" if mode == "paired" else ""
-                print(f"Note: reused train prep freezes the cached draw (mode={mode}{halves}); "
-                      "use --overwrite_prep_cache for a fresh draw.")
+        train_cache = Path(prep_cache_dir) / "train"
+        eval_cache = Path(prep_cache_dir) / "validation"
+        load_cache = reuse_prep and not overwrite_prep
+        if load_cache:
+            train_dataset = prep_cache.load_prep_cache(train_cache, train_fp)
+            eval_dataset = prep_cache.load_prep_cache(eval_cache, eval_fp)
         need_train = train_dataset is None
         need_eval = eval_dataset is None
 
@@ -1233,18 +1194,60 @@ def _run_training(args, run_dir):
 
         if need_train:
             assert raw_train is not None
-            if mode == "paired":
-                train_dataset = train_pipeline.prepare_paired_dataset(raw_train)
-                print(f"Paired train set: {len(train_dataset) // 2} clean + "
-                      f"{len(train_dataset) // 2} phone = {len(train_dataset)} rows")
-            else:
-                train_dataset = train_pipeline.prepare_dataset_split(raw_train)
-                print(f"Train set: {len(train_dataset)} rows (mode={mode})")
-            _save_prep_cache(train_dataset, os.path.join(prep_cache_dir, "train"), train_fp)
+            prep_cache.cleanup_stale_staging(train_cache)
+            required = int(
+                prep_cache.estimate_feature_bytes(
+                    len(raw_train), copies=2 if mode == "paired" else 1
+                )
+                * 1.05
+            )
+            reclaimable = prep_cache.dir_size(train_cache)
+            # Guard before removing the old cache: the projection counts its space.
+            prep_cache.ensure_space(Path(prep_cache_dir), required, reclaimable)
+            prep_cache.remove_cache(train_cache)
+            staging = prep_cache.staging_dir(train_cache)
+            try:
+                if mode == "paired":
+                    train_dataset = train_pipeline.prepare_paired_dataset(
+                        raw_train, cache_dir=str(staging)
+                    )
+                    print(f"Paired train set: {len(train_dataset) // 2} clean + "
+                          f"{len(train_dataset) // 2} phone = {len(train_dataset)} rows")
+                else:
+                    train_dataset = train_pipeline.prepare_dataset_split(
+                        raw_train, cache_dir=str(staging)
+                    )
+                    print(f"Train set: {len(train_dataset)} rows (mode={mode})")
+                prep_cache.publish_dataset(train_dataset, staging, train_cache, train_fp)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            train_dataset = prep_cache.load_prep_cache(train_cache, train_fp)
+            if train_dataset is None:
+                raise RuntimeError("prep cache publish/load failed")
         if need_eval:
             assert raw_eval is not None
-            eval_dataset = eval_pipeline.prepare_dataset_split(raw_eval)
-            _save_prep_cache(eval_dataset, os.path.join(prep_cache_dir, "validation"), eval_fp)
+            prep_cache.cleanup_stale_staging(eval_cache)
+            required = int(
+                prep_cache.estimate_feature_bytes(len(raw_eval), copies=1) * 1.05
+            )
+            reclaimable = prep_cache.dir_size(eval_cache)
+            prep_cache.ensure_space(Path(prep_cache_dir), required, reclaimable)
+            prep_cache.remove_cache(eval_cache)
+            staging = prep_cache.staging_dir(eval_cache)
+            try:
+                eval_dataset = eval_pipeline.prepare_dataset_split(
+                    raw_eval, cache_dir=str(staging)
+                )
+                prep_cache.publish_dataset(eval_dataset, staging, eval_cache, eval_fp)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            eval_dataset = prep_cache.load_prep_cache(eval_cache, eval_fp)
+            if eval_dataset is None:
+                raise RuntimeError("prep cache publish/load failed")
+        if train_dataset is not None:
+            print(f"Train set ready: mode={mode}, {len(train_dataset)} rows")
         assert train_dataset is not None and eval_dataset is not None
     except Exception as exc:
         print(f"Preflight data preparation failed: {exc}", file=sys.stderr)
