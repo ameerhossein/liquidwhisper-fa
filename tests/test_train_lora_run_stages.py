@@ -345,6 +345,69 @@ def test_main_marks_preflight_failed_when_data_prep_fails(tmp_path, monkeypatch)
     assert stage["status"] == "failed"
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_train_prob", "expected_fp_prob"),
+    [("paired", 0.0, None), ("disjoint", 0.5, 0.5), ("clean", 0.0, 0.0)],
+)
+def test_train_fingerprint_matches_effective_pipeline_prob(
+    tmp_path, monkeypatch, mode, expected_train_prob, expected_fp_prob
+):
+    """The real prep flow fingerprints the prob the pipeline actually uses."""
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+    args = _main_args(
+        tmp_path,
+        run_dir,
+        telephony_mode=mode,
+        telephony_prob=0.5,
+        max_train_samples=None,
+        max_eval_samples=None,
+        prep_cache_dir=str(tmp_path / "prep_cache"),
+        run_epoch_benchmark=False,
+    )
+    captured = {"pipeline_probs": [], "fps": {}}
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return SimpleNamespace()
+
+    class _FakePipeline:
+        def __init__(self, *a, **k):
+            captured["pipeline_probs"].append(k.get("telephony_prob"))
+
+        def load_raw_dataset(self, *a, **k):
+            return SimpleNamespace()
+
+        def _stop(self, *a, **k):
+            raise RuntimeError("stop after fingerprint")
+
+        prepare_dataset_split = _stop
+        prepare_paired_dataset = _stop
+
+    def _record(cache_subdir, fingerprint):
+        captured["fps"][Path(cache_subdir).name] = fingerprint
+        return None
+
+    monkeypatch.setattr(train_lora, "WhisperProcessor", _FakeProcessor)
+    monkeypatch.setattr(train_lora, "PersianASRDataPipeline", _FakePipeline)
+    monkeypatch.setattr(train_lora, "_label_format", lambda base: (None, None))
+    monkeypatch.setattr(train_lora, "_try_load_prep_cache", _record)
+    monkeypatch.setattr(train_lora, "_save_prep_cache", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="stop after fingerprint"):
+        train_lora._run_training(args, run_dir)
+
+    # Train pipeline first, then the always-clean eval pipeline.
+    assert captured["pipeline_probs"] == [expected_train_prob, 0.0]
+    train_fp = captured["fps"]["train"]
+    eval_fp = captured["fps"]["validation"]
+    assert train_fp["telephony_mode"] == mode
+    assert train_fp["telephony_prob"] == expected_fp_prob
+    assert eval_fp["telephony_mode"] == "clean"
+    assert eval_fp["telephony_prob"] == 0.0
+
+
 def test_run_attempt_number_reads_latest_attempt(tmp_path):
     train_lora = _train_lora()
     run_dir = _run(tmp_path)

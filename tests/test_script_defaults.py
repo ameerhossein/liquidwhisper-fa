@@ -129,6 +129,23 @@ def test_run_train_script_matches_fast_defaults():
     assert "--preflight_samples" not in text
 
 
+def test_yaml_telephony_mode_is_applied_and_validated(monkeypatch, tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from scripts.train_lora import parse_args
+
+    valid = tmp_path / "valid.yaml"
+    valid.write_text("telephony:\n  mode: clean\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["train_lora.py", "--config", str(valid)])
+    assert parse_args().telephony_mode == "clean"
+
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_text("telephony:\n  mode: disjointt\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["train_lora.py", "--config", str(invalid)])
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_web_ui_eval_default_is_1000():
     html = (ROOT / "server" / "static" / "index.html").read_text(encoding="utf-8")
     match = re.search(r'id="inputEvalSteps"[^>]*value="(\d+)"', html)

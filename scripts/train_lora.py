@@ -134,7 +134,7 @@ def parse_args():
         "--telephony_mode",
         choices=("paired", "disjoint", "clean"),
         default="paired",
-        help="paired=clean+phone rows (2 epochs), disjoint=50/50 coin, clean=no augmentation",
+        help="paired=clean+phone rows (2 epochs), disjoint=prob-weighted coin, clean=no augmentation",
     )
     parser.add_argument("--telephony_profiles", type=str, default="customer", help="Comma-separated phone profiles: customer (default); legacy gated,mobile,pstn also accepted")
     parser.add_argument("--telephony_seed", type=int, default=42, help="RNG seed for training-time phone augmentation")
@@ -154,6 +154,13 @@ def parse_args():
             print("Warning: PyYAML not installed; ignoring --config. pip install pyyaml")
         else:
             _apply_yaml_config(parser, args, args.config)
+    # The YAML overlay bypasses argparse's choices; reject a typo here so a
+    # misspelled telephony.mode cannot silently train a different mode.
+    if args.telephony_mode not in ("paired", "disjoint", "clean"):
+        parser.error(
+            "telephony_mode must be one of paired, disjoint, clean "
+            f"(got {args.telephony_mode!r})."
+        )
     # load_best_model_at_end needs save_steps to be a multiple of eval_steps; the
     # Trainer only checks this after data prep and model load.
     if args.save_steps % args.eval_steps != 0:
@@ -283,6 +290,18 @@ def _label_format(base_model: str):
 
     with open(hf_hub_download(base_model, "generation_config.json"), encoding="utf-8") as f:
         return persian_label_ids(json.load(f))
+
+
+def _effective_train_prob(mode: str, telephony_prob) -> float:
+    """Phone-on-the-fly probability the train pipeline actually uses.
+
+    Only ``disjoint`` draws phone augmentation per row. ``paired`` materializes
+    both halves up front and ``clean`` trains without augmentation, so both
+    (and any unknown mode) use 0.0.
+    """
+    if mode == "disjoint":
+        return float(telephony_prob or 0.0)
+    return 0.0
 
 
 def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, telephony_prob: float) -> Dict[str, Any]:
@@ -1145,12 +1164,15 @@ def _run_training(args, run_dir):
         # runs first (train gets phone augmentation, eval stays clean).
         label_prefix_ids, label_eos_id = _label_format(args.base_model)
         mode = getattr(args, "telephony_mode", "paired")
+        effective_train_prob = _effective_train_prob(
+            mode, getattr(args, "telephony_prob", 0.0)
+        )
         train_pipeline = PersianASRDataPipeline(
             processor=processor,
             dataset_name=args.dataset_name,
             normalizer=normalizer,
             num_proc=args.num_proc,
-            telephony_prob=0.0 if mode != "disjoint" else float(getattr(args, "telephony_prob", 0.0) or 0.0),
+            telephony_prob=effective_train_prob,
             telephony_profiles=args.telephony_profiles,
             telephony_seed=int(getattr(args, "telephony_seed", 42) or 42),
             telephony_use_ffmpeg=bool(getattr(args, "telephony_use_ffmpeg", True)),
@@ -1190,7 +1212,7 @@ def _run_training(args, run_dir):
             os.makedirs(prep_cache_dir, exist_ok=True)
         except Exception:
             pass
-        train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), mode, getattr(args, "telephony_prob", 0.0))
+        train_fp = _prep_fingerprint(args, "train", getattr(args, "max_train_samples", None), mode, effective_train_prob)
         eval_fp = _prep_fingerprint(args, "validation", getattr(args, "max_eval_samples", None), "clean", 0.0)
         if reuse_prep and not overwrite_prep:
             train_dataset = _try_load_prep_cache(os.path.join(prep_cache_dir, "train"), train_fp)
