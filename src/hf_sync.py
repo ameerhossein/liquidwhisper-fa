@@ -623,25 +623,73 @@ def _listed_files(api: Any, repo_id: str) -> list[str]:
     return files
 
 
-def _prepare_run_dir(runs_root: Path, run_id: str, *, force: bool) -> Path:
-    """Create the local run folder, refusing to overwrite unless forced."""
-    run_dir = Path(runs_root) / run_id
-    if run_dir.exists():
-        is_dir = run_dir.is_dir()
-        nonempty = not is_dir or any(run_dir.iterdir())
-        if nonempty and not force:
-            raise HFRestoreConflict(
-                f"local run directory already exists: {run_dir}; "
-                "pass --force to replace it"
-            )
-        if nonempty:
-            if is_dir:
-                shutil.rmtree(run_dir)
-            else:
-                run_dir.unlink()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "output").mkdir(exist_ok=True)
-    return run_dir
+def _run_dir_is_nonempty(run_dir: Path) -> bool:
+    run_dir = Path(run_dir)
+    if not run_dir.exists():
+        return False
+    if not run_dir.is_dir():
+        return True
+    return any(run_dir.iterdir())
+
+
+def _refuse_existing_run(run_dir: Path, *, force: bool) -> None:
+    if not force and _run_dir_is_nonempty(run_dir):
+        raise HFRestoreConflict(
+            f"local run directory already exists: {run_dir}; "
+            "pass --force to replace it"
+        )
+
+
+def _remove_path(path: Path) -> None:
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _make_staging_run_dir(runs_root: Path, run_id: str) -> Path:
+    """Create a hidden sibling directory that becomes the run when complete."""
+    runs_root = Path(runs_root)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{run_id}.restore-", dir=str(runs_root))
+    )
+    (staging / "output").mkdir(exist_ok=True)
+    return staging
+
+
+def _install_staged_run(staging: Path, run_dir: Path, *, force: bool) -> None:
+    """Move a fully restored staging tree into the final run directory."""
+    _refuse_existing_run(run_dir, force=force)
+    if not run_dir.exists():
+        os.replace(staging, run_dir)
+        return
+    if run_dir.is_dir() and not any(run_dir.iterdir()):
+        run_dir.rmdir()
+        os.replace(staging, run_dir)
+        return
+
+    # Keep the old run until the staged replacement is ready, then swap.
+    backup = run_dir.with_name(
+        f".{run_dir.name}.restore-old-{os.getpid()}-{time.time_ns()}"
+    )
+    os.replace(run_dir, backup)
+    try:
+        os.replace(staging, run_dir)
+    except Exception:
+        try:
+            os.replace(backup, run_dir)
+        except Exception:
+            pass
+        raise
+    try:
+        _remove_path(backup)
+    except OSError:
+        # The new run is already installed; a leftover backup is harmless.
+        pass
 
 
 def _download_tree(
@@ -670,11 +718,12 @@ def _download_checkpoint(
 ) -> tuple[int | None, list[str]]:
     """Download the newest checkpoint that verifies locally.
 
-    A listing-complete checkpoint can still fail to materialize (network error
-    or a truncated remote folder). Each attempt lands in a hidden temporary
-    directory and is only moved into ``output/checkpoint-<step>`` after
-    ``is_complete_checkpoint`` accepts it, so a failed attempt never leaves a
-    half checkpoint behind.
+    A listing-complete checkpoint can still fail local verification (for
+    example, a remote listing that disagrees with the downloaded tree). Each
+    attempt lands in a hidden temporary directory and is only moved into
+    ``output/checkpoint-<step>`` after ``is_complete_checkpoint`` accepts it.
+    A failed local verification falls back to the next lower complete
+    checkpoint; download and write errors propagate to the caller.
     """
     prefix = f"{repo_run_path(run_id)}/"
     candidates = [
@@ -699,10 +748,9 @@ def _download_checkpoint(
                     shutil.rmtree(destination)
                 os.replace(temp_dir, destination)
                 return step, downloaded
-        except Exception:
-            # Fall through to the next lower complete checkpoint.
-            pass
         finally:
+            # Verification failure falls through to the next lower complete
+            # checkpoint. Download/write errors propagate after temp cleanup.
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -913,6 +961,7 @@ def restore_run(
     """
     validate_repo_id(repo_id)
     run_prefix = repo_run_path(run_id)
+    run_dir = Path(runs_root) / run_id
 
     status("listing", f"Listing {repo_id} for run {run_id}")
     files = _listed_files(api, repo_id)
@@ -925,63 +974,78 @@ def restore_run(
             f"expected {manifest_path}"
         )
 
-    # Only touch the local filesystem after confirming the remote run exists,
-    # so a bad id never deletes an existing local run or leaves an empty one.
-    run_dir = _prepare_run_dir(Path(runs_root), run_id, force=force)
-    output_dir = run_dir / "output"
-
-    status("ledger", f"Downloading the run ledger for {run_id}")
-    manifest_payload: dict | None = None
-    downloaded: list[str] = []
-    for relative in RESTORE_LEDGER_FILES:
-        remote_path = f"{run_prefix}/{relative}"
-        if remote_path not in file_set:
-            continue
-        data = _fetch(download, repo_id, remote_path)
-        _write_bytes_atomic(run_dir / relative, data)
-        downloaded.append(remote_path)
-        if relative == MANIFEST_FILE:
-            manifest_payload = _json_payload(data)
-    if manifest_payload is None:
-        raise HFRestoreError(
-            f"the manifest for run {run_id} in {repo_id} is not a JSON object"
-        )
-
-    status("checkpoint", f"Restoring the newest complete checkpoint for {run_id}")
-    checkpoint_step, checkpoint_files = _download_checkpoint(
-        download, repo_id, run_id, files, output_dir
-    )
-    downloaded.extend(checkpoint_files)
-
-    downloaded.extend(
-        _download_best_adapter(download, repo_id, files, run_prefix, output_dir)
-    )
-    downloaded.extend(
-        _download_reports(
-            download, repo_id, files, run_prefix, run_dir, output_dir
-        )
-    )
-    downloaded.extend(
-        _download_newest_adapter_snapshot(
-            download, repo_id, files, run_prefix, output_dir
-        )
-    )
-    if include_merged:
-        downloaded.extend(
-            _download_merged(download, repo_id, files, run_prefix, run_dir)
-        )
-
-    run = manifest_payload
-    rewrite_run_paths(run, run_dir)
-    normalize_restored_run(run)
-    run["run_id"] = run_id
-    run["updated_at"] = time.time()
+    # Refuse a conflicting local run before downloading anything, but keep it
+    # in place until the replacement has been fully staged and validated.
+    _refuse_existing_run(run_dir, force=force)
+    staging_dir = _make_staging_run_dir(Path(runs_root), run_id)
+    output_dir = staging_dir / "output"
 
     try:
-        (run_dir / "training.pid").unlink(missing_ok=True)
-    except OSError:
-        pass
-    _write_json_atomic(run_dir / MANIFEST_FILE, run)
+        status("ledger", f"Downloading the run ledger for {run_id}")
+        manifest_payload: dict | None = None
+        downloaded: list[str] = []
+        for relative in RESTORE_LEDGER_FILES:
+            remote_path = f"{run_prefix}/{relative}"
+            if remote_path not in file_set:
+                continue
+            data = _fetch(download, repo_id, remote_path)
+            _write_bytes_atomic(staging_dir / relative, data)
+            downloaded.append(remote_path)
+            if relative == MANIFEST_FILE:
+                manifest_payload = _json_payload(data)
+        if manifest_payload is None:
+            raise HFRestoreError(
+                f"the manifest for run {run_id} in {repo_id} is not a JSON object"
+            )
+
+        status(
+            "checkpoint",
+            f"Restoring the newest complete checkpoint for {run_id}",
+        )
+        checkpoint_step, checkpoint_files = _download_checkpoint(
+            download, repo_id, run_id, files, output_dir
+        )
+        downloaded.extend(checkpoint_files)
+
+        downloaded.extend(
+            _download_best_adapter(
+                download, repo_id, files, run_prefix, output_dir
+            )
+        )
+        downloaded.extend(
+            _download_reports(
+                download, repo_id, files, run_prefix, staging_dir, output_dir
+            )
+        )
+        downloaded.extend(
+            _download_newest_adapter_snapshot(
+                download, repo_id, files, run_prefix, output_dir
+            )
+        )
+        if include_merged:
+            downloaded.extend(
+                _download_merged(
+                    download, repo_id, files, run_prefix, staging_dir
+                )
+            )
+
+        run = manifest_payload
+        rewrite_run_paths(run, run_dir)
+        normalize_restored_run(run)
+        run["run_id"] = run_id
+        run["updated_at"] = time.time()
+
+        try:
+            (staging_dir / "training.pid").unlink(missing_ok=True)
+        except OSError:
+            pass
+        _write_json_atomic(staging_dir / MANIFEST_FILE, run)
+        _install_staged_run(staging_dir, run_dir, force=force)
+    except BaseException:
+        # Never leave a partial staging tree behind, and never remove the old
+        # local run unless the staged replacement was installed successfully.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
     if checkpoint_step is None:
         status(
@@ -994,7 +1058,7 @@ def restore_run(
     return {
         "run_id": run_id,
         "run_dir": str(run_dir),
-        "output_dir": str(output_dir),
+        "output_dir": str(run_dir / "output"),
         "checkpoint_step": checkpoint_step,
         "downloaded": downloaded,
         "run": run,

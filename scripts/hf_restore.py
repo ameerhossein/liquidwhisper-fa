@@ -68,8 +68,16 @@ def _write_status(
         raise
 
 
+class _RestoreArgumentParser(argparse.ArgumentParser):
+    """Argument parser that reserves exit code 2 for a ledger-only restore."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _RestoreArgumentParser(
         description="Restore a mirrored training run from Hugging Face."
     )
     parser.add_argument(

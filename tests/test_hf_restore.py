@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src import hf_sync
 from src.hf_sync import (
     HFRestoreConflict,
     HFRestoreError,
@@ -311,12 +312,42 @@ def test_restore_reports_snapshot_and_merged(tmp_path):
     assert result["checkpoint_step"] == 1000
 
 
-def test_restore_falls_back_when_newest_checkpoint_download_fails(tmp_path):
+def test_restore_propagates_checkpoint_download_failure(tmp_path):
     blobs = _blobs(2000)
     files = _files(2000) + [
         f"runs/{RUN}/checkpoint-3000/trainer_state.json",
         f"runs/{RUN}/checkpoint-3000/adapter_model.safetensors",
     ]
+    with pytest.raises(HFRestoreError, match="checkpoint-3000"):
+        restore_run(
+            _api(files),
+            "me/run",
+            RUN,
+            tmp_path,
+            download=_download(blobs),
+        )
+    assert not (tmp_path / RUN).exists()
+    assert not list(tmp_path.glob(f".{RUN}.restore-*"))
+
+
+def test_restore_falls_back_when_checkpoint_verification_fails(
+    tmp_path, monkeypatch
+):
+    blobs = _blobs(2000)
+    blobs[f"runs/{RUN}/checkpoint-3000/trainer_state.json"] = b"{}"
+    blobs[f"runs/{RUN}/checkpoint-3000/adapter_model.safetensors"] = b""
+    files = _files(2000) + [
+        f"runs/{RUN}/checkpoint-3000/trainer_state.json",
+        f"runs/{RUN}/checkpoint-3000/adapter_model.safetensors",
+    ]
+    real_is_complete = hf_sync.is_complete_checkpoint
+
+    def fake_is_complete(path):
+        if Path(path).name == ".restore-checkpoint-3000.tmp":
+            return False
+        return real_is_complete(path)
+
+    monkeypatch.setattr(hf_sync, "is_complete_checkpoint", fake_is_complete)
     result = restore_run(
         _api(files),
         "me/run",
@@ -343,6 +374,30 @@ def test_restore_force_replaces_existing_run(tmp_path):
     )
     assert result["checkpoint_step"] == 1000
     assert not (old_run / "old.txt").exists()
+    assert not list(tmp_path.glob(f".{RUN}.restore-*"))
+
+
+def test_force_preserves_existing_run_when_restore_fails(tmp_path):
+    local = tmp_path / RUN
+    local.mkdir()
+    (local / "run.json").write_text('{"local": true}')
+    (local / "keep.txt").write_text("keep")
+    blobs = _blobs(1000)
+    del blobs[f"runs/{RUN}/steps.jsonl"]
+
+    with pytest.raises(HFRestoreError, match="steps.jsonl"):
+        restore_run(
+            _api(_files(1000)),
+            "me/run",
+            RUN,
+            tmp_path,
+            force=True,
+            download=_download(blobs),
+        )
+
+    assert json.loads((local / "run.json").read_text()) == {"local": True}
+    assert (local / "keep.txt").read_text() == "keep"
+    assert not list(tmp_path.glob(f".{RUN}.restore-*"))
 
 
 def test_restore_missing_remote_run_does_not_touch_local(tmp_path):
@@ -381,6 +436,22 @@ def _script_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_cli_usage_errors_exit_one(capsys):
+    script = _script_module()
+    with pytest.raises(SystemExit) as excinfo:
+        script.main([])
+    assert excinfo.value.code == 1
+    assert "required" in capsys.readouterr().err
+
+
+def test_cli_help_exits_zero(capsys):
+    script = _script_module()
+    with pytest.raises(SystemExit) as excinfo:
+        script.main(["--help"])
+    assert excinfo.value.code == 0
+    assert "usage:" in capsys.readouterr().out
 
 
 def test_cli_writes_completed_status_and_resume_hint(tmp_path, monkeypatch, capsys):
