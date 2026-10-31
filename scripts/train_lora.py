@@ -692,7 +692,13 @@ def _write_cli_pid(run_dir: Path) -> None:
 
 def _abort_cli_setup(run_dir: Path) -> None:
     """Close any attempt opened during CLI setup and drop the PID file."""
-    if run_state.load_run(run_dir) is not None:
+    try:
+        run = run_state.load_run(run_dir)
+    except Exception as exc:
+        # A corrupt/unreadable ledger must not mask the original setup error.
+        print(f"Warning: could not read run ledger: {exc}", file=sys.stderr)
+        run = None
+    if run is not None:
         try:
             run_state.finalize_attempt(run_dir, exit_code=1, reason="nonzero_exit")
         except Exception as exc:

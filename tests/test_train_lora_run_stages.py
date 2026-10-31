@@ -857,6 +857,31 @@ def test_main_setup_failure_before_ledger_is_silent(tmp_path, monkeypatch, capsy
     assert "could not finalize" not in capsys.readouterr().err
 
 
+def test_main_setup_failure_with_unreadable_ledger_keeps_original_error(
+    tmp_path, monkeypatch, capsys
+):
+    train_lora = _train_lora()
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / RUN_ID
+    monkeypatch.setenv("ASR_RUNS_DIR", str(runs_root))
+    args = _canonical_args(tmp_path, run_dir)
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+
+    def _unreadable(_run_dir):
+        raise OSError("ledger disk boom")
+
+    monkeypatch.setattr(train_lora.run_state, "load_run", _unreadable)
+
+    def _boom(_run_dir, _args):
+        raise RuntimeError("original setup failure")
+
+    monkeypatch.setattr(train_lora, "_ensure_cli_run", _boom)
+    with pytest.raises(RuntimeError, match="original setup failure"):
+        train_lora.main()
+
+    assert "could not read run ledger" in capsys.readouterr().err
+
+
 def test_preflight_detail_update_preserves_started_at(tmp_path):
     train_lora = _train_lora()
     run_dir = _run(tmp_path)

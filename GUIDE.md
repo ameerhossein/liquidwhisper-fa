@@ -186,7 +186,10 @@ RunPod when `/workspace` exists, otherwise repo-local `results/runs`);
 - **Start** = preflight → training → post-eval. Merge is a later, optional
   stage; `merge` stays pending until you trigger it.
 - **Reload/restart:** on page load the cockpit restores the latest run id,
-  config, stepper, and saved steps. Server startup reconciles the ledger: a run
+  config, stepper, and saved steps. The saved-steps line is exact for the
+  active run (live telemetry `step_count`, counted once per new optimizer
+  step); historical runs fall back to the deduplicated manifest count.
+  Server startup reconciles the ledger: a run
   whose trainer PID is alive is reattached; one that disappeared without a
   recorded exit becomes `interrupted` (Resume available); older runs remain in
   the run picker.
@@ -203,7 +206,12 @@ RunPod when `/workspace` exists, otherwise repo-local `results/runs`);
 
 Set `ASR_FAKE_TRAINER=1` to run the cockpit end to end without CUDA. The server
 uses `scripts/dev_fake_trainer.py` and `scripts/dev_fake_merge.py`, marks the run
-`source: "fake"`, and writes placeholder artifacts.
+`source: "fake"`, and writes placeholder artifacts. Fake runs mirror the real
+lifecycle: `--fresh_start` clears prior fake telemetry, benchmarks, stop
+signal, and best adapter (ignored with `--post_eval_only`), and a directly
+launched fake trainer owns its attempt and `<run>/training.pid`, closing it on
+exit, while a cockpit-spawned fake trainer leaves the server-owned attempt
+alone.
 
 ```bash
 export ASR_RESULTS_DIR=/tmp/asr-demo/results

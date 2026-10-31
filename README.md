@@ -64,7 +64,11 @@ otherwise the repo-local `results/runs`. `ASR_RUNS_DIR` overrides it.
   completed. `POST /api/train/start` creates the run; the cockpit polls
   `/api/runs/latest`, `/api/runs/<run_id>`, and `/api/runs/<run_id>/steps`.
 * **Reload / server restart.** On load the cockpit restores the latest run —
-  run id, config, stepper, and saved steps. On startup the server reconciles
+  run id, config, stepper, and saved steps. The saved-steps line is exact for
+  the active run: it reports the live telemetry `step_count`, which increments
+  once per new optimizer step (a resumed or replayed step is not
+  double-counted); historical runs fall back to the deduplicated manifest
+  count. On startup the server reconciles
   the ledger: a run whose trainer PID is still alive is reattached; a trainer
   that disappeared without a recorded exit is marked `interrupted` (Resume
   available); older runs remain browsable from the run picker.
@@ -99,7 +103,11 @@ The server spawns `scripts/dev_fake_trainer.py` and `scripts/dev_fake_merge.py`
 instead of the real trainer/merge; runs are marked `source: "fake"` and write
 placeholder artifacts only. Fake runs use `<runs root>/_shared-fake` for their
 preflight cache, so the real `_shared/baselines/preflight.json` is never
-overwritten.
+overwritten. Fake runs mirror the real lifecycle: `--fresh_start` clears prior
+fake telemetry, benchmarks, stop signal, and best adapter (and is ignored with
+`--post_eval_only`, like the real trainer), and a directly launched fake
+trainer owns its attempt and `<run>/training.pid`, closing it on exit, while a
+cockpit-spawned fake trainer leaves the server-owned attempt alone.
 
 ```bash
 # Isolated ledger; fake trainer, no GPU.
@@ -244,7 +252,7 @@ tmux new -s train_asr
 * `--learning_rate 1e-4`: Optimal for LoRA.
 * `--epochs 4`: 4 full epochs with cosine scheduler and validation checkpointing.
 * `--config configs/l40s_train_config.yaml`: YAML defaults (CLI flags override file).
-* `--run_dir <dir>`: self-contained CLI run ledger. It must be a canonical run directory directly under the resolved runs root (`<runs-root>/YYYYMMDD-HHMMSS-xxxxxx`); anything else exits with an error telling you to use `ASR_RUNS_DIR`/a canonical id. When `--results_dir` is not given it defaults to the run directory, and a default `--output_dir` becomes `<run>/output`. The trainer records its PID/attempt, writes `<run>/training.pid`, tees stdout/stderr to `<run>/training_live.log`, and closes the attempt at exit; the cockpit detects the live CLI run from the pid file. Explicit `--results_dir`/`--output_dir` still win.
+* `--run_dir <dir>`: self-contained CLI run ledger. It must be a canonical run directory directly under the resolved runs root (`<runs-root>/YYYYMMDD-HHMMSS-xxxxxx`); anything else exits with an error telling you to use `ASR_RUNS_DIR`/a canonical id. When `--results_dir` is not given it defaults to the run directory, and a default `--output_dir` becomes `<run>/output`. The trainer records its PID/attempt, writes `<run>/training.pid`, tees stdout/stderr to `<run>/training_live.log`, and closes the attempt at exit; the cockpit detects the live CLI run from the pid file. An explicit `--output_dir` still wins. An explicit `--results_dir` is honored for the run's telemetry (`live_telemetry.json`), benchmarks, loss history, and stop signal; the log and PID file always stay under the run directory. `--fresh_start` clears prior checkpoints, adapters, reports, and telemetry history first, including for a plain CLI run with no `--run_dir`.
 * `--eval_batch_size 16 --preflight_samples 1000 --max_benchmark_samples 1000`: the mandatory preflight and the per-epoch matrix both evaluate the first 1,000 test rows. Set both to `0` (`--preflight_samples 0 --max_benchmark_samples 0`) for the full 2,149-sample test set; keep them aligned.
 * `--no-enable-telemetry / --no-run-epoch-benchmark`: disable live telemetry or epoch eval.
 * Training keeps punctuation in targets; eval strips it for standardized WER (intentional, see `src/data.py`).

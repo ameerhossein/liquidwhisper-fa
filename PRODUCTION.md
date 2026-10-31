@@ -48,7 +48,7 @@ Only `/workspace` survives pod restarts. Container disk (`~/stt`, `/tmp`, `~/.ca
 
 Persistent by default (when `/workspace` exists):
 - `ASR_OUTPUT_DIR` default: `/workspace/stt-outputs/buzzasr-neyshekar-lora` (`scripts/train_lora.py`, `run_train.sh`, `configs/l40s_train_config.yaml`). CLI training writes `checkpoint-*/`, `best_adapter/`, `final_evaluation_report.json/md` there. Cockpit runs are run-scoped: `output/` lives inside the run directory unless the start payload sets an explicit `output_dir` (recorded in `run.json`).
-- `ASR_RESULTS_DIR` default: `/workspace/stt-outputs/results`. Top-level `live_telemetry.json`, `loss_history.json`, `epoch_benchmarks.json`, `training_live.log`, and `training.pid` remain for legacy/no-ledger views and the CLI preflight cache at `baselines/preflight.json` (plus per-model `baselines/preflight/` evaluation details). Cockpit runs keep the same files inside their run directory.
+- `ASR_RESULTS_DIR` default: `/workspace/stt-outputs/results`. Top-level `live_telemetry.json`, `loss_history.json`, `epoch_benchmarks.json`, `training_live.log`, and `training.pid` remain for legacy/no-ledger views and the CLI preflight cache at `baselines/preflight.json` (plus per-model `baselines/preflight/` evaluation details). Cockpit runs keep the same files inside their run directory. A CLI `--run_dir` with an explicit `--results_dir` splits them: telemetry, benchmarks, loss history, and the stop signal live in `--results_dir`, while `training_live.log` and `training.pid` stay under the run directory.
 - **Run ledger** (`ASR_RUNS_DIR`, default `$ASR_RESULTS_DIR/runs`):
 
   ```
