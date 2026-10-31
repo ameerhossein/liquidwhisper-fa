@@ -31,21 +31,21 @@ def _fake_env(**overrides):
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("ASR_FAKE_")
+        if not key.startswith("ASR_FAKE_") and key != "ASR_COCKPIT_SPAWNED"
     }
     env.update({"ASR_FAKE_STEPS": "12", "ASR_FAKE_STEP_DELAY": "0"})
     env.update({key: str(value) for key, value in overrides.items()})
     return env
 
 
-def _trainer_command(run_dir, cache_dir, extra_args=()):
+def _trainer_command(run_dir, cache_dir, extra_args=(), results_dir=None):
     return [
         sys.executable,
         str(TRAINER),
         "--run_dir",
         str(run_dir),
         "--results_dir",
-        str(run_dir),
+        str(results_dir if results_dir is not None else run_dir),
         "--output_dir",
         str(run_dir / "output"),
         "--preflight_cache_dir",
@@ -55,14 +55,13 @@ def _trainer_command(run_dir, cache_dir, extra_args=()):
         "BuzzASR/persian",
         "--epochs",
         "4",
-        "--fresh_start",
         *extra_args,
     ]
 
 
-def _run_trainer(run_dir, cache_dir, extra_args=(), **env):
+def _run_trainer(run_dir, cache_dir, extra_args=(), results_dir=None, **env):
     return subprocess.run(
-        _trainer_command(run_dir, cache_dir, extra_args),
+        _trainer_command(run_dir, cache_dir, extra_args, results_dir),
         cwd=str(ROOT),
         env=_fake_env(**env),
         capture_output=True,
@@ -485,3 +484,210 @@ def test_fake_scripts_do_not_import_heavy_ml_modules(script):
         assert not re.search(
             rf"^\s*(?:import|from)\s+{module}\b", source, re.MULTILINE
         ), f"{script.name} imports {module}"
+
+
+def test_fake_trainer_failure_telemetry_preserves_progress(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    result = _run_trainer(
+        run_dir,
+        tmp_path / "cache",
+        ASR_FAKE_STEPS="5",
+        ASR_FAKE_FAIL_STAGE="post_eval",
+    )
+
+    assert result.returncode == 1, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "failed"
+    assert run["failed_stage"] == "post_eval"
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "failed"
+    assert telemetry["failed_stage"] == "post_eval"
+    assert telemetry["error"]
+    assert telemetry["step"] == 5
+    assert telemetry["max_steps"] == 5
+    assert telemetry["epoch"] > 0
+    assert telemetry["loss"] is not None
+    assert telemetry["gpu"]["available"] is False
+    # The failed attempt is closed even though the fake owns the run.
+    assert run["current_pid"] is None
+    assert len(run["attempts"]) == 1
+    assert run["attempts"][-1]["ended_at"] is not None
+    assert run["attempts"][-1]["exit_code"] == 1
+    assert not (run_dir / "training.pid").exists()
+
+
+def test_fake_trainer_fresh_start_clears_previous_artifacts(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    first = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="5")
+    assert first.returncode == 0, first.stderr
+    assert run_state.step_count(run_dir) == 5
+    assert (run_dir / "output" / "best_adapter").is_dir()
+    # A stale stop signal must not halt the fresh run.
+    (run_dir / "stop_training.signal").write_text("stop", encoding="utf-8")
+
+    second = _run_trainer(
+        run_dir,
+        tmp_path / "cache",
+        extra_args=("--fresh_start",),
+        ASR_FAKE_STEPS="3",
+    )
+
+    assert second.returncode == 0, second.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    # The reused directory restarts instead of appending to old history.
+    assert run_state.step_count(run_dir) == 3
+    assert [record["step"] for record in run_state.read_steps(run_dir)] == [1, 2, 3]
+    history = json.loads(
+        (run_dir / "loss_history.json").read_text(encoding="utf-8")
+    )
+    assert [point["step"] for point in history] == [1, 2, 3]
+    assert not (run_dir / "stop_training.signal").exists()
+    telemetry = json.loads(
+        (run_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["step"] == 3
+    assert telemetry["max_steps"] == 3
+    assert (run_dir / "output" / "best_adapter" / "adapter_config.json").is_file()
+
+
+def test_fake_trainer_direct_run_closes_its_attempt(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    result = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="3")
+
+    assert result.returncode == 0, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    assert len(run["attempts"]) == 1
+    attempt = run["attempts"][0]
+    assert attempt["ended_at"] is not None
+    assert attempt["exit_code"] == 0
+    assert isinstance(attempt["pid"], int)
+    assert run["current_pid"] is None
+    assert not (run_dir / "training.pid").exists()
+
+
+def test_fake_trainer_cockpit_spawned_leaves_attempt_to_server(tmp_path):
+    runs = tmp_path / "runs"
+    run_state.create_run(
+        runs, config={}, trainer_args={}, source="cockpit", run_id=RUN_ID
+    )
+    run_dir = runs / RUN_ID
+    server_pid = 424242
+    run_state.start_attempt(run_dir, server_pid, "initial")
+    (run_dir / "training.pid").write_text(str(server_pid), encoding="utf-8")
+
+    result = _run_trainer(
+        run_dir, tmp_path / "cache", ASR_FAKE_STEPS="3", ASR_COCKPIT_SPAWNED="1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    # The server owns the attempt and PID file; the fake must not double-close.
+    assert len(run["attempts"]) == 1
+    assert run["attempts"][0]["pid"] == server_pid
+    assert run["attempts"][0]["ended_at"] is None
+    assert run["current_pid"] == server_pid
+    assert (run_dir / "training.pid").read_text(encoding="utf-8").strip() == str(
+        server_pid
+    )
+
+
+def test_fake_trainer_live_foreign_attempt_is_left_alone(tmp_path):
+    runs = tmp_path / "runs"
+    run_state.create_run(
+        runs, config={}, trainer_args={}, source="cockpit", run_id=RUN_ID
+    )
+    run_dir = runs / RUN_ID
+    # This process is alive for the whole test, so the fake must treat the
+    # open attempt as owned by someone else and stay hands-off.
+    owner_pid = os.getpid()
+    run_state.start_attempt(run_dir, owner_pid, "initial")
+    (run_dir / "training.pid").write_text(str(owner_pid), encoding="utf-8")
+
+    result = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="3")
+
+    assert result.returncode == 0, result.stderr
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert len(run["attempts"]) == 1
+    assert run["attempts"][0]["pid"] == owner_pid
+    assert run["attempts"][0]["ended_at"] is None
+    assert run["current_pid"] == owner_pid
+    assert (run_dir / "training.pid").read_text(encoding="utf-8").strip() == str(
+        owner_pid
+    )
+
+
+def test_fake_trainer_malformed_benchmark_rows_do_not_crash(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+
+    first = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="3")
+    assert first.returncode == 0, first.stderr
+    path = run_dir / "epoch_benchmarks.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    rows.extend(["junk", 42, None, {"type": "mystery"}])
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+    second = _run_trainer(run_dir, tmp_path / "cache", ASR_FAKE_STEPS="2")
+
+    assert second.returncode == 0, second.stderr
+    assert run_state.load_run(run_dir)["status"] == "completed"
+    final = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(final, list)
+    assert all(isinstance(row, dict) for row in final)
+    assert any(row.get("is_baseline") for row in final)
+    assert any(row.get("type") == "checkpoint" for row in final)
+    assert run_state.step_count(run_dir) == 5
+
+
+def test_fake_trainer_separate_results_dir(tmp_path):
+    run_dir = tmp_path / "runs" / RUN_ID
+    results_dir = tmp_path / "results"
+
+    result = _run_trainer(
+        run_dir, tmp_path / "cache", ASR_FAKE_STEPS="4", results_dir=results_dir
+    )
+
+    assert result.returncode == 0, result.stderr
+    for name in (
+        "live_telemetry.json",
+        "loss_history.json",
+        "steps.jsonl",
+        "epoch_benchmarks.json",
+    ):
+        assert (results_dir / name).is_file(), name
+    assert not (results_dir / "run.json").exists()
+    assert not (results_dir / "training_live.log").exists()
+    assert (run_dir / "run.json").is_file()
+    assert (run_dir / "training_live.log").is_file()
+    assert (run_dir / "events.jsonl").is_file()
+    assert not (run_dir / "live_telemetry.json").exists()
+    assert not (run_dir / "steps.jsonl").exists()
+    assert run_state.step_count(results_dir) == 4
+    assert [record["step"] for record in run_state.read_steps(results_dir)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    run = run_state.load_run(run_dir)
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["step_count"] == 4
+    assert run["paths"]["results_dir"] == str(results_dir.resolve())
+    telemetry = json.loads(
+        (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
+    )
+    assert telemetry["status"] == "completed"
+    assert telemetry["step"] == 4

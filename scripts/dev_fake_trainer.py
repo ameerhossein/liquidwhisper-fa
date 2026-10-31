@@ -189,6 +189,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Only rerun post-eval from the existing best_adapter",
     )
+    parser.add_argument(
+        "--fresh_start",
+        "--fresh-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Start fresh: clear prior fake results (loss history, steps, "
+            "benchmarks, telemetry, stop signal) and the fake best_adapter."
+        ),
+    )
     # The real trainer passes many more flags. The fake does not need them, but
     # it must accept them so the server can build one command shape.
     args, _unknown = parser.parse_known_args(argv)
@@ -303,7 +313,11 @@ def _seed_benchmarks(results_dir: Path, preflight: dict) -> None:
     existing = _read_json(path, [])
     preserved = []
     if isinstance(existing, list):
-        preserved = [row for row in existing if not row.get("is_baseline")]
+        preserved = [
+            row
+            for row in existing
+            if isinstance(row, dict) and not row.get("is_baseline")
+        ]
     rows = []
     for key in ("buzzasr_base", "whisper_v3"):
         model = (preflight.get("models") or {}).get(key)
@@ -359,7 +373,11 @@ def _record_final_benchmark(results_dir: Path) -> tuple[dict, list]:
     rows = _read_json(path, [])
     if not isinstance(rows, list):
         rows = []
-    rows = [item for item in rows if item.get("epoch") != row["epoch"]]
+    rows = [
+        item
+        for item in rows
+        if isinstance(item, dict) and item.get("epoch") != row["epoch"]
+    ]
     rows.append(row)
     _write_json(path, rows)
     return row, rows
@@ -486,6 +504,180 @@ def _remove_signal(path: Path) -> None:
         pass
 
 
+_FRESH_RESULT_FILES = (
+    "loss_history.json",
+    "steps.jsonl",
+    "events.jsonl",
+    "epoch_benchmarks.json",
+    "live_telemetry.json",
+)
+
+
+def _is_cockpit_spawned() -> bool:
+    """True when the server already owns the log/PID/attempt for this process."""
+    return (os.environ.get("ASR_COCKPIT_SPAWNED", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when *pid* refers to a running process (or an unkillable one)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _server_owns_attempt(run_dir: Path) -> bool:
+    """True when a live foreign process already holds this run's open attempt.
+
+    Fallback for detecting a server-owned run when ``ASR_COCKPIT_SPAWNED`` is
+    unavailable: the server records its child's PID before spawning, so an open
+    attempt whose PID belongs to another live process means this invocation
+    must stay hands-off instead of double-closing the attempt.
+    """
+    ours = os.getpid()
+    run = run_state.load_run(run_dir) or {}
+    attempts = run.get("attempts") or []
+    for item in reversed(attempts):
+        if not isinstance(item, dict) or item.get("ended_at") is not None:
+            continue
+        try:
+            pid = int(item.get("pid") or 0)
+        except (TypeError, ValueError):
+            return True
+        return pid != ours and _pid_alive(pid)
+    return False
+
+
+def _clear_fake_previous_state(
+    output_dir: Path, results_dir: Path
+) -> list[str]:
+    """Delete prior fake results so ``--fresh_start`` truly starts clean.
+
+    Removes the fake telemetry history and stop signal from the results dir
+    plus the fake best adapter. Mirrors the real trainer's fresh-start
+    clearing; the run ledger itself (``run.json``) is preserved.
+    """
+    removed: list[str] = []
+    for name in (*_FRESH_RESULT_FILES, "stop_training.signal"):
+        try:
+            target = results_dir / name
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
+                removed.append(name)
+        except OSError:
+            continue
+    try:
+        adapter = output_dir / "best_adapter"
+        if adapter.is_dir() and not adapter.is_symlink():
+            shutil.rmtree(adapter, ignore_errors=True)
+            removed.append("best_adapter")
+    except OSError:
+        pass
+    return removed
+
+
+def _reset_fake_progress(run_dir: Path) -> None:
+    """Restart step numbering after a fresh start on a reused run dir."""
+    run_state.set_progress(
+        run_dir, step=0, step_count=0, last_step_at=time.time()
+    )
+
+    def clear(run: dict) -> dict:
+        run["stop_requested_at"] = None
+        return run
+
+    run_state.update_run(run_dir, clear)
+
+
+def _ensure_fake_attempt(run_dir: Path) -> None:
+    """Record this process as an attempt unless it already owns one."""
+    pid = os.getpid()
+    run = run_state.load_run(run_dir) or {}
+    attempts = run.get("attempts") or []
+    open_attempts = [
+        item
+        for item in attempts
+        if isinstance(item, dict) and item.get("ended_at") is None
+    ]
+    if open_attempts:
+        try:
+            same_pid = int(open_attempts[-1].get("pid") or 0) == pid
+        except (TypeError, ValueError):
+            same_pid = False
+        if same_pid:
+            try:
+                current = int(run.get("current_pid") or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current != pid:
+                run_state.update_run(
+                    run_dir,
+                    lambda current_run: {**current_run, "current_pid": pid},
+                )
+            return
+        # A dead earlier attempt must not stay open forever.
+        run_state.finalize_attempt(run_dir, exit_code=None, reason="process_lost")
+        run = run_state.load_run(run_dir) or {}
+        attempts = run.get("attempts") or []
+    run_state.start_attempt(
+        run_dir, pid, reason="initial" if not attempts else "resume"
+    )
+
+
+def _write_fake_pid(run_dir: Path) -> None:
+    try:
+        (run_dir / "training.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: could not write {run_dir / 'training.pid'}: {exc}")
+
+
+def _abort_fake_setup(run_dir: Path) -> None:
+    """Close any attempt opened during setup and drop the PID file."""
+    if run_state.load_run(run_dir) is not None:
+        try:
+            run_state.finalize_attempt(run_dir, exit_code=1, reason="nonzero_exit")
+        except Exception as exc:
+            print(
+                f"Warning: could not finalize run attempt: {exc}", file=sys.stderr
+            )
+    try:
+        (Path(run_dir) / "training.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _finalize_fake_attempt(run_dir: Path, exit_code: int) -> None:
+    """Close the owned attempt and remove its PID file on every exit path."""
+    try:
+        run = run_state.load_run(run_dir)
+        if run is not None:
+            if run.get("stop_requested_at") or run.get("status") == "stopped":
+                reason = "halted"
+            elif exit_code == 0:
+                reason = "completed"
+            else:
+                reason = "nonzero_exit"
+            run_state.finalize_attempt(
+                run_dir, exit_code=exit_code, reason=reason
+            )
+    except Exception as exc:
+        print(f"Warning: could not finalize run attempt: {exc}", file=sys.stderr)
+    try:
+        (run_dir / "training.pid").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _fail(
     run_dir: Path,
     results_dir: Path,
@@ -494,11 +686,18 @@ def _fail(
     log: _Logger,
 ) -> int:
     log(f"{stage} failed: {message}")
-    _write_json(
-        results_dir / "live_telemetry.json",
-        {"status": "failed", "failed_stage": stage, "error": message,
-         "updated_at": time.time()},
+    payload = _read_json(results_dir / "live_telemetry.json", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(
+        {
+            "status": "failed",
+            "failed_stage": stage,
+            "error": message,
+            "updated_at": time.time(),
+        }
     )
+    _write_json(results_dir / "live_telemetry.json", payload)
     run_state.set_stage(run_dir, stage, "failed", detail=message)
     run_state.set_status(
         run_dir, "failed", failed_stage=stage, last_error=message
@@ -594,6 +793,55 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (run_dir, results_dir, output_dir, cache_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
+    post_eval_only = bool(args.post_eval_only)
+    fresh_start = bool(getattr(args, "fresh_start", False))
+    if fresh_start and not post_eval_only:
+        for name in _clear_fake_previous_state(output_dir, results_dir):
+            print(f"[fake-trainer] fresh start: cleared {name}", flush=True)
+
+    trainer_args = {
+        "run_dir": str(run_dir),
+        "results_dir": str(results_dir),
+        "output_dir": str(output_dir),
+        "preflight_cache_dir": str(cache_dir),
+    }
+    run = _ensure_run(run_dir, results_dir, output_dir, cache_dir, trainer_args)
+    if fresh_start and not post_eval_only:
+        _reset_fake_progress(run_dir)
+    # The server records the attempt before spawning its child; a standalone
+    # invocation owns its own attempt and PID file.
+    owned = not _is_cockpit_spawned() and not _server_owns_attempt(run_dir)
+    if owned:
+        try:
+            _ensure_fake_attempt(run_dir)
+            _write_fake_pid(run_dir)
+        except Exception:
+            _abort_fake_setup(run_dir)
+            raise
+
+    exit_code = 0
+    try:
+        exit_code = _run(args, run, run_dir, results_dir, output_dir, cache_dir)
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        if owned:
+            _finalize_fake_attempt(run_dir, exit_code)
+    return exit_code
+
+
+def _run(
+    args: argparse.Namespace,
+    run: dict,
+    run_dir: Path,
+    results_dir: Path,
+    output_dir: Path,
+    cache_dir: Path,
+) -> int:
     steps = max(0, _env_int("ASR_FAKE_STEPS", 200))
     delay = max(0.0, _env_float("ASR_FAKE_STEP_DELAY", 0.05))
     fail_stage = (os.environ.get("ASR_FAKE_FAIL_STAGE") or "").strip().lower()
@@ -604,17 +852,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     hang = _env_flag("ASR_FAKE_HANG")
 
-    trainer_args = {
-        "run_dir": str(run_dir),
-        "results_dir": str(results_dir),
-        "output_dir": str(output_dir),
-        "preflight_cache_dir": str(cache_dir),
-    }
-    run = _ensure_run(
-        run_dir, results_dir, output_dir, cache_dir, trainer_args
-    )
     source = run.get("source") or "fake"
-    log = _Logger(results_dir / "training_live.log")
+    log = _Logger(run_dir / "training_live.log")
+    if bool(args.post_eval_only) and bool(getattr(args, "fresh_start", False)):
+        log("Note: --fresh_start is ignored with --post_eval_only.")
     signal_path = results_dir / "stop_training.signal"
     telemetry_path = results_dir / "live_telemetry.json"
     started_at = time.time()
