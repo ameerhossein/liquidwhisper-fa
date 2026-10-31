@@ -29,7 +29,8 @@ assert.strictEqual(stageMap(run).get("post_eval").status, "completed");
 assert.strictEqual(runStatusLabel(run), "Run completed");
 assert.strictEqual(savedStepsLabel({ count: 1234 }), "1,234 steps saved");
 assert.strictEqual(isMergeAvailable(run, true), true);
-assert.strictEqual(isMergeAvailable({ ...run, status: "running" }, true), true);
+assert.strictEqual(isMergeAvailable({ ...run, status: "running" }, true), false);
+assert.strictEqual(isMergeAvailable({ ...run, status: "starting" }, true), false);
 assert.strictEqual(isMergeAvailable(run, false), false);
 
 // Missing stages and stage metadata normalize to pending.
@@ -115,6 +116,29 @@ assert.strictEqual(
   isMergeAvailable({ ...mergeable, status: "stopped" }, true),
   true,
   "a stopped post-eval must not hide a completed training adapter",
+);
+assert.strictEqual(
+  isMergeAvailable({ ...mergeable, status: "starting" }, true),
+  false,
+  "a starting run must not offer merge",
+);
+assert.strictEqual(
+  isMergeAvailable({ ...mergeable, status: "running" }, true),
+  false,
+  "a running run must not offer merge",
+);
+assert.strictEqual(
+  isMergeAvailable(
+    {
+      ...mergeable,
+      stages: mergeable.stages.map((stage) =>
+        stage.name === "training" ? { ...stage, status: "pending" } : stage,
+      ),
+    },
+    true,
+  ),
+  false,
+  "merge requires training to have completed",
 );
 assert.strictEqual(
   isMergeAvailable(

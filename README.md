@@ -76,11 +76,11 @@ otherwise the repo-local `results/runs`. `ASR_RUNS_DIR` overrides it.
 * **Merge.** Once the **training stage is completed** and
   `output/best_adapter/adapter_config.json` exists, the cockpit offers Merge
   even when post-eval failed or was stopped (the overall run status may be
-  `completed`, `failed`, or `stopped`). No stage may still be running, and a
-  run whose merge stage already completed is not offered again. The Merge
-  action (or `POST /api/runs/<run_id>/merge`) writes the standalone merged
-  model to `<run_dir>/merged/` (`config.json`, `model.safetensors`, tokenizer
-  files).
+  `completed`, `failed`, `stopped`, or `interrupted`). The overall run must not
+  still be `starting`/`running`, no stage may still be running, and a run whose
+  merge stage already completed is not offered again. The Merge action (or
+  `POST /api/runs/<run_id>/merge`) writes the standalone merged model to
+  `<run_dir>/merged/` (`config.json`, `model.safetensors`, tokenizer files).
 
 A runs root outside `/workspace` or `/runpod-volume` is **not persistent**: the
 cockpit shows `Runs are not on persistent storage (<path>). Set ASR_RUNS_DIR to

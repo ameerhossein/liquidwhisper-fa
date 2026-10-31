@@ -167,6 +167,70 @@ def test_fresh_start_clears_step_and_event_logs(tmp_path):
     assert (results_dir / "training_live.log").exists()
 
 
+def test_plain_cli_fresh_start_clears_previous_state(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    output_dir = tmp_path / "output"
+    results_dir = tmp_path / "results"
+    output_dir.mkdir()
+    results_dir.mkdir()
+    (output_dir / "checkpoint-1").mkdir()
+    (output_dir / "checkpoint-1" / "trainer_state.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (output_dir / "best_adapter").mkdir()
+    (output_dir / "best_adapter" / "adapter_config.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    for name in (
+        "loss_history.json",
+        "steps.jsonl",
+        "events.jsonl",
+        "epoch_benchmarks.json",
+        "stop_training.signal",
+    ):
+        (results_dir / name).write_text("stale", encoding="utf-8")
+
+    args = SimpleNamespace(
+        run_dir=None,
+        output_dir=str(output_dir),
+        results_dir=str(results_dir),
+        fresh_start=True,
+        post_eval_only=False,
+        telephony_profiles="customer",
+    )
+    monkeypatch.setattr(train_lora, "parse_args", lambda: args)
+    observed = {}
+
+    def fake_run(parsed, run_dir):
+        observed["run_dir"] = run_dir
+        observed["checkpoint"] = (output_dir / "checkpoint-1").exists()
+        observed["adapter"] = (output_dir / "best_adapter").exists()
+        for name in (
+            "loss_history.json",
+            "steps.jsonl",
+            "events.jsonl",
+            "epoch_benchmarks.json",
+            "stop_training.signal",
+        ):
+            observed[name] = (results_dir / name).exists()
+
+    monkeypatch.setattr(train_lora, "_run_training", fake_run)
+
+    train_lora.main()
+
+    assert observed["run_dir"] is None
+    assert observed["checkpoint"] is False
+    assert observed["adapter"] is False
+    for name in (
+        "loss_history.json",
+        "steps.jsonl",
+        "events.jsonl",
+        "epoch_benchmarks.json",
+        "stop_training.signal",
+    ):
+        assert observed[name] is False, name
+
+
 def test_main_halts_before_data_prep_when_signal_exists(tmp_path, monkeypatch):
     train_lora = _train_lora()
     run_dir = _run(tmp_path)

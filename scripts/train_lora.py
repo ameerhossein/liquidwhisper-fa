@@ -993,8 +993,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
 
-    if run_dir is not None and not bool(getattr(args, "post_eval_only", False)):
+    if not bool(getattr(args, "post_eval_only", False)):
         if bool(getattr(args, "fresh_start", False)):
+            # Always honor --fresh_start, including a plain CLI run with no
+            # ledger directory. A new run directory is already empty, so the
+            # same clearing is harmless there.
             _clear_previous_state(args.output_dir, results_dir=args.results_dir)
 
     if run_dir is not None:

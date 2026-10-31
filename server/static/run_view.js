@@ -79,6 +79,9 @@ function runLogUrl(runId, historical = false) {
 
 function isMergeAvailable(run, adapterExists = false) {
   if (!run || !adapterExists) return false;
+  // The server blocks merge while the run is still starting/running, even if
+  // its training stage already completed (R12).
+  if (run.status === "starting" || run.status === "running") return false;
   const stages = stageMap(run);
   if (stages.get("training").status !== "completed") return false;
   if (stages.get("merge").status === "completed") return false;
