@@ -157,9 +157,13 @@ The former `configs/` baseline file (`baselines.json`) is gone. Every training r
 ## 6. Durable HF Run Mirror
 
 Enable mirroring with `ASR_HF_RUN_REPO=<owner>/<name>` and `HF_TOKEN`
-(`HF_TOKEN` is the same token used by `scripts/upload_to_hf.py`). Unset means
-off. The repo is created **private by default**, and uploads are best effort
-with retries, so a Hugging Face outage never blocks training or merging.
+(`HF_TOKEN` is the same token used by `scripts/upload_to_hf.py`). For new runs,
+unset means off; an existing run keeps the repo recorded in its `run.json`
+(`hf.repo_id`) and a cockpit merge still reuses it — remove that field to opt
+the run out. The repo is created **private by default**, and uploads are best
+effort with retries: a Hugging Face outage does not fail training or merging,
+though `start()`/`close()` can delay process exit while they retry and drain
+(up to about 120 seconds).
 
 The remote layout is one self-contained folder per run:
 
@@ -184,8 +188,10 @@ runs/<run_id>/merged/
   `loss_history.json`, `epoch_benchmarks.json`, and
   `baselines/preflight.json`) is refreshed at stage transitions.
 - `best_adapter/`, the final reports, and the merged model are uploaded when
-  available. The cockpit merge passes `--run_dir`/`--hf_run_repo` to
-  `scripts/merge_lora.py`; a manual merge can add `--run_dir <run_dir>`.
+  available. When a repo is configured, the cockpit merge passes
+  `--run_dir`/`--hf_run_repo` to `scripts/merge_lora.py`; a manual merge must
+  pass `--run_dir <run_dir> --hf_run_repo <owner/name>` (or set
+  `ASR_HF_RUN_REPO`).
 
 Restore by run id on a fresh pod (repo from `ASR_HF_RUN_REPO`, or `--repo`):
 

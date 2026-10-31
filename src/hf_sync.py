@@ -98,12 +98,6 @@ The repository is private by default.
 
 ADAPTER_CONFIG_FILE = "adapter_config.json"
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
-MERGED_WEIGHT_FILES = (
-    "model.safetensors",
-    "model.safetensors.index.json",
-    "pytorch_model.bin",
-    "pytorch_model.bin.index.json",
-)
 MERGED_SINGLE_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin")
 MERGED_INDEX_FILES = (
     "model.safetensors.index.json",

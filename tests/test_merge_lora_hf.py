@@ -97,6 +97,66 @@ def test_merge_upload_failure_does_not_raise(tmp_path, monkeypatch):
     merge_lora._upload_merged_to_hf(_args(tmp_path))
 
 
+def test_merge_upload_start_failure_still_closes(tmp_path, monkeypatch):
+    merge_lora = _merge_lora()
+    from src import hf_sync
+
+    calls = []
+
+    class _StartFails:
+        def __init__(self, config, **kwargs):
+            calls.append("init")
+
+        def start(self):
+            calls.append("start")
+            raise RuntimeError("Hugging Face is offline")
+
+        def enqueue_merged(self, path):
+            calls.append("merged")
+
+        def enqueue_ledger(self, status):
+            calls.append("ledger")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(hf_sync, "HFRunMirror", _StartFails)
+
+    merge_lora._upload_merged_to_hf(_args(tmp_path))
+
+    assert calls == ["init", "start", "close"]
+
+
+def test_merge_upload_close_failure_does_not_raise(tmp_path, monkeypatch):
+    merge_lora = _merge_lora()
+    from src import hf_sync
+
+    calls = []
+
+    class _CloseFails:
+        def __init__(self, config, **kwargs):
+            calls.append("init")
+
+        def start(self):
+            calls.append("start")
+
+        def enqueue_merged(self, path):
+            calls.append("merged")
+
+        def enqueue_ledger(self, status):
+            calls.append("ledger")
+
+        def close(self):
+            calls.append("close")
+            raise RuntimeError("drain failed")
+
+    monkeypatch.setattr(hf_sync, "HFRunMirror", _CloseFails)
+
+    merge_lora._upload_merged_to_hf(_args(tmp_path))
+
+    assert calls == ["init", "start", "merged", "ledger", "close"]
+
+
 def test_merge_upload_is_skipped_without_run_dir_or_repo(tmp_path, monkeypatch):
     merge_lora = _merge_lora()
     from src import hf_sync

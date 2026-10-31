@@ -134,9 +134,13 @@ simulated UI and does not create ledger runs.
 
 Set `ASR_HF_RUN_REPO=<owner>/<name>` (for example `user/stt-experiment`) and
 authenticate with `HF_TOKEN` to mirror the run ledger and artifacts to a
-Hugging Face repo. The repo is created **private by default**. Mirroring is off
-when the variable is unset, and uploads are best effort: training and merging
-continue when Hugging Face is unreachable.
+Hugging Face repo. The repo is created **private by default**. For new runs,
+mirroring is off when the variable is unset; an existing run keeps the repo
+recorded in its `run.json` (`hf.repo_id`) and a cockpit merge still reuses it
+(remove that field to opt an old run out). Uploads are best effort: a Hugging
+Face outage does not fail training or merging, although background uploads
+may keep a training/merge process alive while they retry and drain (up to
+about 120 seconds on close).
 
 Each run is self-contained under `runs/<run_id>/`:
 
@@ -147,9 +151,10 @@ Each run is self-contained under `runs/<run_id>/`:
 * The ledger is refreshed at stage transitions: `run.json`, `steps.jsonl`,
   `events.jsonl`, telemetry, benchmark, loss, and preflight files.
 * `best_adapter/`, the final reports, and the cockpit's `merged/` model are
-  uploaded when available. The cockpit merge passes `--run_dir` and
-  `--hf_run_repo`; a manual `scripts/merge_lora.py --run_dir <run_dir>` also
-  uploads the merged model with a status-`merge` ledger.
+  uploaded when available. When a repo is configured, the cockpit merge passes
+  `--run_dir` and `--hf_run_repo`; a manual merge needs both
+  `--run_dir <run_dir>` and `--hf_run_repo <owner/name>` (or `ASR_HF_RUN_REPO`
+  set) to upload the merged model with a status-`merge` ledger.
 * `latest.json` points at the most recently active run.
 
 Restore by run id on a fresh pod (the repo comes from `ASR_HF_RUN_REPO`, or

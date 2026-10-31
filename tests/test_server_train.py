@@ -121,6 +121,23 @@ def _write_merge_artifacts(client, run_id, *, weights="model.safetensors"):
     return merged
 
 
+def _write_sharded_merge_artifacts(client, run_id):
+    """Write the index + shard layout of a real large-v3 fp32 merge."""
+    merged = client.mod.RUNS_DIR / run_id / "merged"
+    merged.mkdir(parents=True, exist_ok=True)
+    (merged / "config.json").write_text("{}", encoding="utf-8")
+    weight_map = {
+        "model.encoder.a": "model-00001-of-00002.safetensors",
+        "model.decoder.b": "model-00002-of-00002.safetensors",
+    }
+    (merged / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+    for shard in sorted(set(weight_map.values())):
+        (merged / shard).write_text("", encoding="utf-8")
+    return merged
+
+
 def test_refresh_finds_older_live_run(client, monkeypatch):
     monkeypatch.setattr(
         client.mod, "_is_process_running", lambda pid=None: pid == os.getpid()
@@ -1406,6 +1423,51 @@ def test_merge_completes_on_zero_exit_with_artifacts(client):
     assert run["merge_pid"] is None
 
 
+def test_merge_artifacts_accept_sharded_model(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-5a5a5a"
+    )
+    _write_sharded_merge_artifacts(client, run["run_id"])
+
+    loaded = run_state.load_run(client.mod.RUNS_DIR / run["run_id"])
+    assert client.mod._merge_artifacts_complete(loaded) is True
+
+
+def test_finish_merge_completes_sharded_artifacts(client):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-5c5c5c"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_dir = client.mod.RUNS_DIR / run["run_id"]
+    _terminal_stages(run_dir)
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+
+    _write_sharded_merge_artifacts(client, run["run_id"])
+    client.mod._finish_merge(run["run_id"], 0)
+
+    merge_stage = run_state.load_run(run_dir)["stages"][3]
+    assert merge_stage["status"] == "completed"
+    assert merge_stage["exit_code"] == 0
+
+
+def test_merge_completes_on_zero_exit_with_sharded_artifacts(client):
+    start = client.post("/api/train/start", json={}).json()
+    run_dir = client.mod.RUNS_DIR / start["run_id"]
+    _seed_adapter(client, start["run_id"])
+    _terminal_stages(run_dir)
+    assert client.post(f"/api/runs/{start['run_id']}/merge").status_code == 200
+
+    _write_sharded_merge_artifacts(client, start["run_id"])
+    client.mod.merge_process = _ExitedProcess(0)
+
+    assert client.mod._merge_running() is False
+    run = run_state.load_run(run_dir)
+    merge_stage = run["stages"][3]
+    assert merge_stage["status"] == "completed"
+    assert merge_stage["exit_code"] == 0
+    assert run["merge_pid"] is None
+
+
 def test_merge_fails_on_zero_exit_without_artifacts(client):
     start = client.post("/api/train/start", json={}).json()
     run_dir = client.mod.RUNS_DIR / start["run_id"]
@@ -1493,6 +1555,27 @@ def test_merge_recovery_rejects_stale_artifacts_without_pid(client, monkeypatch)
     run_dir = _mark_merge_running(client, run["run_id"], pid=None)
     stage = run_state.load_run(run_dir)["stages"][3]
     _age_artifacts(merged, float(stage["started_at"]) - 60.0)
+
+    assert client.mod._merge_running() is False
+    stage = run_state.load_run(run_dir)["stages"][3]
+    assert stage["status"] == "failed"
+    assert "predate" in stage["detail"]
+
+
+def test_merge_recovery_rejects_stale_sharded_shard_without_pid(client, monkeypatch):
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-5b5b5b"
+    )
+    merged = _write_sharded_merge_artifacts(client, run["run_id"])
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    run_dir = _mark_merge_running(client, run["run_id"], pid=None)
+    stage = run_state.load_run(run_dir)["stages"][3]
+    stale = float(stage["started_at"]) - 60.0
+    # Only the newest shard is stale: freshness must inspect every file in the
+    # sharded layout, not just config.json and the index.
+    os.utime(
+        merged / "model-00002-of-00002.safetensors", (stale, stale)
+    )
 
     assert client.mod._merge_running() is False
     stage = run_state.load_run(run_dir)["stages"][3]
@@ -1687,9 +1770,10 @@ def test_merge_command_passes_hf_context(client, monkeypatch):
     run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
     assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
     cmd = client.launched[-1]
-    assert "--run_dir" in cmd
-    assert "--hf_run_repo" in cmd
-    assert "me/run" in cmd
+    assert _flag_value(cmd, "--run_dir") == str(
+        client.mod.RUNS_DIR / run["run_id"]
+    )
+    assert _flag_value(cmd, "--hf_run_repo") == "me/run"
 
 
 def test_merge_command_omits_hf_flags_without_repo(client, monkeypatch):
@@ -1703,7 +1787,7 @@ def test_merge_command_omits_hf_flags_without_repo(client, monkeypatch):
     assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
 
     cmd = client.launched[-1]
-    assert "--run_dir" in cmd
+    assert "--run_dir" not in cmd
     assert "--hf_run_repo" not in cmd
 
 

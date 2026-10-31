@@ -988,7 +988,6 @@ def _merge_stage(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
 
 
-_MERGE_WEIGHT_NAMES = ("model.safetensors", "pytorch_model.bin", "model.bin")
 _TERMINAL_STAGE_STATUSES = (
     "completed",
     "stopped",
@@ -1000,29 +999,53 @@ _TERMINAL_STAGE_STATUSES = (
 
 def _merge_artifact_paths(
     run: Dict[str, Any]
-) -> Optional[tuple[Path, Path]]:
-    """The merged model's ``(config, weights)`` when both are present."""
+) -> Optional[List[Path]]:
+    """All files of a complete merged model, or ``None``.
+
+    Real large-v3 merges are sharded: ``save_pretrained`` writes an index plus
+    ``model-*-of-*.safetensors`` shards. Validation reuses the HF mirror's
+    validator so the cockpit and the uploader agree on what is complete.
+    """
     _run_dir_path, merged_dir, _log, _pid = _merge_paths(run)
-    config = merged_dir / "config.json"
-    if not config.is_file():
+    if not hf_sync.validate_merged(merged_dir)[0]:
         return None
-    for name in _MERGE_WEIGHT_NAMES:
-        weights = merged_dir / name
-        if weights.is_file():
-            return config, weights
+
+    paths = [merged_dir / "config.json"]
+    for name in hf_sync.MERGED_SINGLE_WEIGHT_FILES:
+        weight = merged_dir / name
+        if weight.is_file():
+            paths.append(weight)
+            return paths
+
+    for index_name in hf_sync.MERGED_INDEX_FILES:
+        index = merged_dir / index_name
+        if not index.is_file():
+            continue
+        paths.append(index)
+        try:
+            payload = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        if not isinstance(weight_map, dict):
+            return None
+        for shard in sorted({str(value) for value in weight_map.values()}):
+            paths.append(merged_dir / shard)
+        return paths
     return None
 
 
 def _merge_artifacts_complete(run: Dict[str, Any]) -> bool:
-    """True when the merged model has its config and a model weights file."""
+    """True when the merged model has its config and every weight file."""
     return _merge_artifact_paths(run) is not None
 
 
 def _merge_artifacts_fresh(run: Dict[str, Any], stage: Dict[str, Any]) -> bool:
-    """True when both merged artifacts were written at/after the stage start.
+    """True when every merged artifact was written at/after the stage start.
 
     Used only for no-PID recovery: a crash before ``merge.pid`` was recorded
-    must not inherit a previous attempt's complete output.
+    must not inherit a previous attempt's complete output. Sharded merges must
+    check each shard, not just the index.
     """
     artifacts = _merge_artifact_paths(run)
     if artifacts is None:
@@ -2738,10 +2761,12 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
         "--base_model", base_model,
         "--adapter_path", str(adapter_dir),
         "--output_dir", str(merged_dir),
-        "--run_dir", str(run_dir_path),
     ]
     if hf_repo:
-        cmd.extend(["--hf_run_repo", hf_repo])
+        cmd.extend([
+            "--run_dir", str(run_dir_path),
+            "--hf_run_repo", hf_repo,
+        ])
 
     run_dir_path.mkdir(parents=True, exist_ok=True)
     # A crashed retry must never read the previous attempt's PID.

@@ -100,6 +100,55 @@ def test_merged_index_requires_referenced_shards(tmp_path):
     assert validate_merged(merged)[0] is True
 
 
+@pytest.mark.parametrize(
+    ("payload", "reason_fragment"),
+    [
+        ("not json", "not valid JSON"),
+        (json.dumps({}), "weight_map"),
+        (json.dumps({"weight_map": []}), "weight_map"),
+        (json.dumps({"weight_map": {}}), "weight_map"),
+        (
+            json.dumps({"weight_map": {"model.a": "/abs/model.safetensors"}}),
+            "shard",
+        ),
+        (
+            json.dumps({"weight_map": {"model.a": "shard\\model.safetensors"}}),
+            "shard",
+        ),
+        (
+            json.dumps({"weight_map": {"model.a": "../model.safetensors"}}),
+            "shard",
+        ),
+    ],
+)
+def test_merged_index_rejects_invalid_or_unsafe_shards(
+    tmp_path, payload, reason_fragment
+):
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "config.json").write_text("{}")
+    (merged / "model.safetensors.index.json").write_text(payload)
+
+    ok, reason = validate_merged(merged)
+
+    assert ok is False
+    assert reason_fragment in reason
+
+
+def test_merged_bin_index_accepts_existing_shards(tmp_path):
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "config.json").write_text("{}")
+    (merged / "pytorch_model.bin.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"model.a": "pytorch_model-00001-of-00001.bin"}}
+        )
+    )
+    (merged / "pytorch_model-00001-of-00001.bin").write_text("")
+
+    assert validate_merged(merged)[0] is True
+
+
 def test_select_checkpoint_step_ignores_incomplete_and_bad_names():
     files = [
         f"runs/{RUN}/checkpoint-1000/trainer_state.json",
