@@ -569,6 +569,36 @@ def test_smoke_start_fails_when_hf_reset_fails(client, monkeypatch):
     assert client.launched == []
 
 
+def test_smoke_start_custom_hf_repo_and_scratch_clean(client, monkeypatch):
+    resets = []
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", lambda repo: resets.append(repo))
+
+    scratch_runs = client.mod._smoke_results_dir() / "runs"
+    scratch_runs.mkdir(parents=True, exist_ok=True)
+    stale_file = scratch_runs / "old_run.txt"
+    stale_file.write_text("old", encoding="utf-8")
+
+    res = client.post("/api/train/smoke", json={"hf_repo": "custom/repo"})
+    assert res.status_code == 200, res.text
+    assert resets == ["custom/repo"]
+    assert res.json().get("hf_repo") == "custom/repo"
+    assert not stale_file.exists()
+
+    status_res = client.get("/api/train/smoke/status")
+    assert status_res.json().get("hf_repo") == "custom/repo"
+
+
+def test_smoke_start_null_hf_repo_falls_back_to_default(client, monkeypatch):
+    resets = []
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", lambda repo: resets.append(repo))
+
+    res = client.post("/api/train/smoke", json={"hf_repo": None})
+    assert res.status_code == 200, res.text
+    assert resets == [client.mod.SMOKE_DEFAULT_HF_REPO]
+    assert res.json().get("hf_repo") == client.mod.SMOKE_DEFAULT_HF_REPO
+
+
+
 
 def test_smoke_start_rejects_unknown_telephony_mode(client):
     res = client.post("/api/train/smoke", json={"telephony_mode": "satellite"})

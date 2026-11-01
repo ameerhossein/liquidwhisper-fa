@@ -675,6 +675,9 @@ def reset_repo(repo_id: str, api: Optional[Any] = None, private: bool = True) ->
         if callable(list_files) and callable(delete_files):
             try:
                 files = list_files(repo_id=repo_id)
+            except Exception:
+                files = None
+            if files:
                 deletable = [f for f in files if f not in (".gitattributes",)]
                 if deletable:
                     delete_files(
@@ -682,8 +685,6 @@ def reset_repo(repo_id: str, api: Optional[Any] = None, private: bool = True) ->
                         delete_patterns=deletable,
                         commit_message="Reset smoke test repository",
                     )
-            except Exception:
-                pass
 
     create_repo = getattr(api, "create_repo", None)
     if callable(create_repo):

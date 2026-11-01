@@ -320,6 +320,26 @@ def test_reset_repo_falls_back_to_delete_files_on_permission_error():
     assert ("create_repo", "me/smoke-test", "model", True, True) in calls
 
 
+def test_reset_repo_raises_when_fallback_delete_files_fails():
+    class FakeApi:
+        def delete_repo(self, repo_id, repo_type="model", missing_ok=False):
+            raise RuntimeError("403 Forbidden: delete_repo not allowed")
+
+        def list_repo_files(self, repo_id, revision="main"):
+            return ["README.md"]
+
+        def delete_files(self, repo_id, delete_patterns, commit_message=None):
+            raise RuntimeError("403 Forbidden: delete_files token lacks write permission")
+
+        def create_repo(self, repo_id, repo_type="model", private=True, exist_ok=False):
+            pass
+
+    api = FakeApi()
+    with pytest.raises(RuntimeError, match="delete_files token lacks write permission"):
+        reset_repo("me/smoke-test", api=api)
+
+
+
 def test_reset_repo_validates_repo_id():
     with pytest.raises(ValueError):
         reset_repo("invalid_repo_name")

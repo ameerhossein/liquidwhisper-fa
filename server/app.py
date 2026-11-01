@@ -1882,13 +1882,19 @@ async def get_smoke_status():
         else:
             reason = "ended_without_result"
 
+    hf_repo = (
+        attempt.get("hf_repo")
+        if isinstance(attempt, dict) and attempt.get("hf_repo")
+        else SMOKE_HF_REPO
+    )
+
     payload: Dict[str, Any] = {
         "status": status,
         "running": running,
         "exit_code": effective_exit,
         "output_dir": output_dir,
         "adapter_exists": adapter_exists,
-        "hf_repo": SMOKE_HF_REPO,
+        "hf_repo": hf_repo,
     }
     if reason:
         payload["reason"] = reason
@@ -2031,7 +2037,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
 
     target_repo = (
-        str(config.get("hf_repo", "")).strip()
+        str(config.get("hf_repo") or "").strip()
         or SMOKE_HF_REPO
     )
     try:
@@ -2062,7 +2068,8 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     _smoke_pid_file().unlink(missing_ok=True)
     _smoke_attempt_file().parent.mkdir(parents=True, exist_ok=True)
     _smoke_attempt_file().write_text(
-        json.dumps({"started_at": time.time()}), encoding="utf-8"
+        json.dumps({"started_at": time.time(), "hf_repo": target_repo}),
+        encoding="utf-8",
     )
     smoke_last_exit_code = None
 
