@@ -27,6 +27,11 @@ try:
 except Exception:
     pass
 
+try:
+    from .cache import get_hf_cache_dir
+except Exception:
+    pass
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 PERSISTENT_ROOTS = ("workspace", "runpod-volume")

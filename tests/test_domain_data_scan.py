@@ -37,6 +37,27 @@ def test_scan_csv_metadata_filters_duration(tmp_path):
     assert records[0]["text"] == "سلام دنیا"
     assert 2.9 <= records[0]["duration"] <= 3.1
 
+def test_scan_tsv_metadata(tmp_path):
+    from src.domain_data import scan_custom_audio_dir
+
+    audio_dir = tmp_path / "audio_tsv"
+    audio_dir.mkdir()
+
+    _create_mock_wav(audio_dir / "clip1.wav", 3.0)
+    _create_mock_wav(audio_dir / "short.wav", 0.2)
+
+    meta_file = audio_dir / "metadata.tsv"
+    with open(meta_file, "w", newline="", encoding="utf-8") as f:
+        f.write("file_name\ttranscript\n")
+        f.write("clip1.wav\tمتن تب دار معتبر\n")
+        f.write("short.wav\tکوتاه\n")
+
+    records = scan_custom_audio_dir(audio_dir)
+    assert len(records) == 1
+    assert records[0]["audio"] == str(audio_dir / "clip1.wav")
+    assert records[0]["text"] == "متن تب دار معتبر"
+    assert 2.9 <= records[0]["duration"] <= 3.1
+
 def test_scan_paired_wav_txt(tmp_path):
     from src.domain_data import scan_custom_audio_dir
 

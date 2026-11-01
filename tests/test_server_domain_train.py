@@ -32,6 +32,9 @@ def test_normalize_start_config_domain_adaptation(tmp_path):
     assert norm["epochs"] == 3
     assert norm["lora_r"] == 16
     assert norm["lora_alpha"] == 32
+    assert norm["eval_steps"] == 50
+    assert norm["save_steps"] == 50
+    assert norm["warmup_steps"] == 25
 
 
 def test_normalize_start_config_domain_rejects_missing_paths():
@@ -171,6 +174,9 @@ def test_build_trainer_command_domain_adaptation(tmp_path):
         "learning_rate": 2e-5,
         "lora_r": 16,
         "lora_alpha": 32,
+        "eval_steps": 50,
+        "save_steps": 50,
+        "warmup_steps": 25,
     }
     cmd = _build_trainer_command(
         trainer_args=trainer_args,
@@ -190,6 +196,12 @@ def test_build_trainer_command_domain_adaptation(tmp_path):
     assert str(run_dir) in cmd
     assert "--results_dir" in cmd
     assert str(run_dir) in cmd
+    assert "--eval_steps" in cmd
+    assert "50" in cmd
+    assert "--save_steps" in cmd
+    assert "50" in cmd
+    assert "--warmup_steps" in cmd
+    assert "25" in cmd
 
 
 def test_start_new_run_domain_adaptation(tmp_path, monkeypatch):

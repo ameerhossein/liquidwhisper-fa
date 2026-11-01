@@ -153,6 +153,12 @@ def test_domain_adaptation_end_to_end(tmp_path):
         assert "4" in cmd
         assert "--telephony_mode" in cmd
         assert "paired" in cmd
+        assert "--eval_steps" in cmd
+        assert "50" in cmd
+        assert "--save_steps" in cmd
+        assert "50" in cmd
+        assert "--warmup_steps" in cmd
+        assert "25" in cmd
 
         # Verify prepared dataset was saved to disk and can be loaded
         assert prepared_ds_dir.is_dir()

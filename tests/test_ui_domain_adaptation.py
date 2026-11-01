@@ -38,6 +38,7 @@ def test_app_js_includes_domain_adaptation_in_payload():
     assert "inputCustomDataPath: document.getElementById(\"inputCustomDataPath\")" in content
     assert "inputMergedModelPath: document.getElementById(\"inputMergedModelPath\")" in content
     assert "inputReplaySamples: document.getElementById(\"inputReplaySamples\")" in content
+    assert "inputSaveSteps: document.getElementById(\"inputSaveSteps\")" in content
 
     # Check payload keys
     assert "domain_adaptation" in content
@@ -50,3 +51,7 @@ def test_app_js_includes_domain_adaptation_in_payload():
     assert '"3"' in content
     assert "0.0001" in content
     assert '"2"' in content
+
+    # Check toggling updates eval_steps and save_steps
+    assert '"50"' in content
+    assert '"1000"' in content

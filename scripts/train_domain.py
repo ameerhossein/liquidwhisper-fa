@@ -35,6 +35,12 @@ try:
 except Exception:
     pass
 
+try:
+    from src.cache import setup_hf_cache
+    setup_hf_cache()
+except Exception:
+    pass
+
 from src.domain_data import build_domain_dataset
 
 logger = logging.getLogger("train_domain")
@@ -50,14 +56,14 @@ if not logger.handlers:
 def validate_inputs(
     base_model: Union[str, Path],
     custom_data_path: Union[str, Path],
-    require_weights: bool = False,
+    require_weights: bool = True,
 ) -> None:
     """Validate that base_model is an existing directory with config.json and custom_data_path exists.
 
     Args:
         base_model: Path to standalone model directory. Must contain config.json.
         custom_data_path: Path to custom domain audio directory.
-        require_weights: If True, raise ValueError if weight files are missing. Default False (logs warning).
+        require_weights: If True, raise ValueError if weight files are missing. Default True.
     """
     base_p = Path(base_model)
     if not base_p.is_dir():
@@ -183,6 +189,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Telephony augmentation mode (default: paired)",
     )
     parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=50,
+        help="Evaluate every N steps (default: 50)",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=50,
+        help="Save checkpoint every N steps (default: 50)",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=25,
+        help="Linear warmup steps (default: 25)",
+    )
+    parser.add_argument(
         "--fresh_start",
         action="store_true",
         default=False,
@@ -248,6 +272,9 @@ def run_domain_adaptation(
     batch_size: Optional[int] = None,
     grad_accum: Optional[int] = None,
     telephony_mode: Optional[str] = None,
+    eval_steps: Optional[int] = None,
+    save_steps: Optional[int] = None,
+    warmup_steps: Optional[int] = None,
     fresh_start: Optional[bool] = None,
     seed: Optional[int] = None,
     **extra_kwargs: Any,
@@ -282,6 +309,12 @@ def run_domain_adaptation(
             grad_accum = getattr(args, "grad_accum", None)
         if telephony_mode is None:
             telephony_mode = getattr(args, "telephony_mode", None)
+        if eval_steps is None:
+            eval_steps = getattr(args, "eval_steps", None)
+        if save_steps is None:
+            save_steps = getattr(args, "save_steps", None)
+        if warmup_steps is None:
+            warmup_steps = getattr(args, "warmup_steps", None)
         if fresh_start is None:
             fresh_start = getattr(args, "fresh_start", None)
         if seed is None:
@@ -306,25 +339,40 @@ def run_domain_adaptation(
     batch_size = 8 if batch_size is None else batch_size
     grad_accum = 4 if grad_accum is None else grad_accum
     telephony_mode = telephony_mode or "paired"
+    eval_steps = 50 if eval_steps is None else eval_steps
+    save_steps = 50 if save_steps is None else save_steps
+    warmup_steps = 25 if warmup_steps is None else warmup_steps
     fresh_start = bool(fresh_start)
     seed = 42 if seed is None else seed
 
-    validate_inputs(base_model=base_model, custom_data_path=custom_data_path)
+    require_weights = extra_kwargs.pop("require_weights", True)
+    validate_inputs(base_model=base_model, custom_data_path=custom_data_path, require_weights=require_weights)
+
+    if run_dir:
+        try:
+            from src import run_state
+            run_state.set_stage(Path(run_dir), "preflight", "running", detail="preparing domain dataset")
+        except Exception as e:
+            logger.debug("Could not update run stage: %s", e)
 
     if run_dir:
         dataset_dir = Path(run_dir) / "dataset"
     else:
         dataset_dir = Path(output_dir) / "prepared_domain_dataset"
 
-    dataset_dir.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Building domain adaptation dataset in %s", dataset_dir)
-    build_domain_dataset(
-        custom_path=str(custom_data_path),
-        replay_samples=replay_samples,
-        replay_ratio=replay_ratio,
-        output_dir=str(dataset_dir),
-        seed=seed,
-    )
+    dataset_dict_file = dataset_dir / "dataset_dict.json"
+    if not fresh_start and dataset_dict_file.is_file():
+        logger.info("Prepared domain dataset already exists at %s; skipping dataset build", dataset_dir)
+    else:
+        dataset_dir.parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Building domain adaptation dataset in %s", dataset_dir)
+        build_domain_dataset(
+            custom_path=str(custom_data_path),
+            replay_samples=replay_samples,
+            replay_ratio=replay_ratio,
+            output_dir=str(dataset_dir),
+            seed=seed,
+        )
 
     train_lora_script = BASE_DIR / "scripts" / "train_lora.py"
     cmd = [
@@ -342,6 +390,9 @@ def run_domain_adaptation(
         "--batch_size", str(batch_size),
         "--grad_accum", str(grad_accum),
         "--telephony_mode", str(telephony_mode),
+        "--eval_steps", str(eval_steps),
+        "--save_steps", str(save_steps),
+        "--warmup_steps", str(warmup_steps),
     ]
     if run_dir:
         cmd.extend(["--run_dir", str(run_dir)])
@@ -362,6 +413,17 @@ def run_domain_adaptation(
             continue
         else:
             cmd.extend([flag, str(v)])
+
+    unknown_args = getattr(args, "unknown_args", None) if isinstance(args, argparse.Namespace) else None
+    if unknown_args:
+        cmd.extend([str(item) for item in unknown_args])
+
+    if run_dir:
+        try:
+            from src import run_state
+            run_state.set_stage(Path(run_dir), "training", "running", detail="running domain adaptation LoRA fine-tuning")
+        except Exception as e:
+            logger.debug("Could not update run stage: %s", e)
 
     logger.info("Starting domain adaptation LoRA fine-tuning...")
     return _run_training_subprocess(cmd, cwd=str(BASE_DIR))

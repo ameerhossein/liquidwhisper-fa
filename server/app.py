@@ -2204,6 +2204,12 @@ def _build_trainer_command(
             cmd += ["--grad_accum", str(trainer_args["grad_accum"])]
         if "telephony_mode" in trainer_args and trainer_args["telephony_mode"] is not None:
             cmd += ["--telephony_mode", str(trainer_args["telephony_mode"])]
+        if "eval_steps" in trainer_args and trainer_args["eval_steps"] is not None:
+            cmd += ["--eval_steps", str(trainer_args["eval_steps"])]
+        if "save_steps" in trainer_args and trainer_args["save_steps"] is not None:
+            cmd += ["--save_steps", str(trainer_args["save_steps"])]
+        if "warmup_steps" in trainer_args and trainer_args["warmup_steps"] is not None:
+            cmd += ["--warmup_steps", str(trainer_args["warmup_steps"])]
         if _as_bool(trainer_args.get("fresh_start")):
             cmd.append("--fresh_start")
         if resume_from_checkpoint:
@@ -2249,11 +2255,16 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
     domain_mode = _as_bool(config.get("domain_adaptation", False))
     epochs_default = 3 if domain_mode else 2
     lr_default = 2e-5 if domain_mode else 1e-4
+    eval_steps_default = 50 if domain_mode else 1000
+    save_steps_default = 50 if domain_mode else 1000
+    warmup_steps_default = 25 if domain_mode else 500
     try:
         epochs_i = int(config.get("epochs", epochs_default))
         batch_i = int(config.get("batch_size", 8))
         accum_i = int(config.get("grad_accum", 4))
-        eval_steps_i = int(config.get("eval_steps", 1000))
+        eval_steps_i = int(config.get("eval_steps", eval_steps_default))
+        save_steps_i = int(config.get("save_steps", save_steps_default if "eval_steps" not in config else eval_steps_i))
+        warmup_steps_i = int(config.get("warmup_steps", warmup_steps_default))
         lr_f = float(config.get("learning_rate", lr_default))
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 1000)
@@ -2292,6 +2303,10 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         )
     if not (1 <= eval_steps_i <= 10000):
         raise HTTPException(status_code=400, detail="eval_steps must be 1..10000.")
+    if not (1 <= save_steps_i <= 10000):
+        raise HTTPException(status_code=400, detail="save_steps must be 1..10000.")
+    if not (0 <= warmup_steps_i <= 10000):
+        raise HTTPException(status_code=400, detail="warmup_steps must be 0..10000.")
     ckpt_raw = config.get("gradient_checkpointing", False)
     gradient_ckpt = (
         str(ckpt_raw).strip().lower() in ("1", "true", "yes", "on")
@@ -2344,6 +2359,8 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "batch_size": batch_i,
         "grad_accum": accum_i,
         "eval_steps": eval_steps_i,
+        "save_steps": save_steps_i,
+        "warmup_steps": warmup_steps_i,
         "learning_rate": lr_f,
         "eval_batch_size": eval_bs_i,
         "max_benchmark_samples": max_bench_i,
@@ -2583,10 +2600,10 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "batch_size": values["batch_size"],
         "grad_accum": values["grad_accum"],
         "learning_rate": values["learning_rate"],
-        "warmup_steps": 500,
+        "warmup_steps": values["warmup_steps"],
         "lr_scheduler_type": "cosine",
         "eval_steps": values["eval_steps"],
-        "save_steps": values["eval_steps"],
+        "save_steps": values["save_steps"],
         "save_total_limit": 2,
         "eval_batch_size": values["eval_batch_size"],
         "max_benchmark_samples": values["max_benchmark_samples"],
@@ -2626,7 +2643,8 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "learning_rate": values["learning_rate"],
         "eval_batch_size": values["eval_batch_size"],
         "eval_steps": values["eval_steps"],
-        "save_steps": values["eval_steps"],
+        "save_steps": values["save_steps"],
+        "warmup_steps": values["warmup_steps"],
         "max_benchmark_samples": values["max_benchmark_samples"],
         "preflight_samples": values["max_benchmark_samples"],
         "num_proc": values["num_proc"],
@@ -2660,6 +2678,8 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "learning_rate": str(values["learning_rate"]),
         "grad_accum": str(values["grad_accum"]),
         "eval_steps": str(values["eval_steps"]),
+        "save_steps": str(values["save_steps"]),
+        "warmup_steps": str(values["warmup_steps"]),
         "gradient_checkpointing": values["gradient_checkpointing"],
         "num_proc": str(values["num_proc"]),
         "telephony_prob": str(values["telephony_prob"]),

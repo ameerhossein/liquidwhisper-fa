@@ -41,6 +41,42 @@ def test_sample_balanced_neyshekar_fallback_colloquial():
     assert len(sampled) == 8
 
 
+def test_sample_balanced_neyshekar_fallback_no_audio_decode():
+    from src.domain_data import sample_balanced_neyshekar
+    from datasets import Audio
+
+    # Dataset has Audio feature attached with non-existent audio files, and no is_informal column
+    data = [
+        {"audio": f"/nonexistent/path/formal_{i}.wav", "text": f"این یک گزارش رسمی استاندارد است شماره {i}"}
+        for i in range(10)
+    ] + [
+        {"audio": f"/nonexistent/path/informal_{i}.wav", "text": f"می‌خوام الان برم بیرون شماره {i}"}
+        for i in range(10)
+    ]
+    ds = Dataset.from_list(data).cast_column("audio", Audio(sampling_rate=16000))
+
+    # Accessing row by row would decode audio and fail; column access succeeds
+    sampled = sample_balanced_neyshekar(ds, sample_count=6, seed=42)
+    assert len(sampled) == 6
+
+
+def test_build_domain_dataset_passes_hf_cache_dir(tmp_path):
+    from src.domain_data import build_domain_dataset
+
+    mock_records = [{"audio": f"custom_{i}.wav", "text": f"سفارشی {i}", "duration": 2.0} for i in range(10)]
+    mock_ds = Dataset.from_list([{"audio": {"path": f"n_{i}.wav"}, "text": f"متن {i}", "is_informal": False} for i in range(10)])
+
+    with patch("src.domain_data.scan_custom_audio_dir", return_value=mock_records), \
+         patch("src.domain_data.load_dataset") as mock_ld, \
+         patch("src.domain_data.get_hf_cache_dir", return_value="/test/hf/cache"):
+
+        mock_ld.return_value = mock_ds
+        build_domain_dataset(custom_path=str(tmp_path / "custom"), replay_samples=4)
+
+        for call in mock_ld.call_args_list:
+            assert call.kwargs.get("cache_dir") == "/test/hf/cache"
+
+
 def test_build_domain_dataset_structure(tmp_path):
     from src.domain_data import build_domain_dataset
 

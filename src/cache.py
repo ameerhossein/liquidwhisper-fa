@@ -89,6 +89,11 @@ def default_datasets_cache_dir() -> str:
     return os.path.join(default_hf_cache_dir(), "datasets")
 
 
+def get_hf_cache_dir() -> str:
+    """Effective Hugging Face datasets cache directory."""
+    return default_datasets_cache_dir()
+
+
 def setup_hf_cache(verbose: bool = True) -> str:
     """Point HF caches at the big disk. Returns chosen base.
 

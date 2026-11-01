@@ -66,6 +66,7 @@ const el = {
   inputGradAccum: document.getElementById("inputGradAccum"),
   inputGradCheckpoint: document.getElementById("inputGradCheckpoint"),
   inputEvalSteps: document.getElementById("inputEvalSteps"),
+  inputSaveSteps: document.getElementById("inputSaveSteps"),
   inputLearningRate: document.getElementById("inputLearningRate"),
   chkDomainAdaptation: document.getElementById("chkDomainAdaptation"),
   domainSection: document.getElementById("domainSection"),
@@ -1828,9 +1829,13 @@ if (el.chkDomainAdaptation) {
     if (isDomain) {
       if (el.inputLearningRate) el.inputLearningRate.value = "0.00002";
       if (el.inputEpochs) el.inputEpochs.value = "3";
+      if (el.inputEvalSteps) el.inputEvalSteps.value = "50";
+      if (el.inputSaveSteps) el.inputSaveSteps.value = "50";
     } else {
       if (el.inputLearningRate) el.inputLearningRate.value = "0.0001";
       if (el.inputEpochs) el.inputEpochs.value = "2";
+      if (el.inputEvalSteps) el.inputEvalSteps.value = "1000";
+      if (el.inputSaveSteps) el.inputSaveSteps.value = "1000";
     }
   });
 }

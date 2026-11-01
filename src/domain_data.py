@@ -36,6 +36,14 @@ except ImportError:
 
 from src.normalizer import PersianTextNormalizer
 
+try:
+    from src.cache import get_hf_cache_dir
+except ImportError:
+    try:
+        from src.paths import get_hf_cache_dir
+    except ImportError:
+        get_hf_cache_dir = None
+
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
@@ -139,6 +147,7 @@ def scan_custom_audio_dir(
 
     csv_meta = root_path / "metadata.csv"
     jsonl_meta = root_path / "metadata.jsonl"
+    tsv_meta = root_path / "metadata.tsv"
 
     records: List[Dict[str, Any]] = []
 
@@ -227,6 +236,38 @@ def scan_custom_audio_dir(
                     "duration": dur,
                 })
         return records
+
+    if tsv_meta.is_file():
+        with open(tsv_meta, "r", encoding="utf-8-sig", errors="replace") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            if reader.fieldnames:
+                audio_col = _find_column(list(reader.fieldnames), AUDIO_COL_CANDIDATES)
+                text_col = _find_column(list(reader.fieldnames), TEXT_COL_CANDIDATES)
+
+                if audio_col and text_col:
+                    for row in reader:
+                        audio_val = (row.get(audio_col) or "").strip()
+                        text_val = (row.get(text_col) or "").strip()
+                        if not audio_val or not text_val:
+                            continue
+
+                        audio_p = Path(audio_val)
+                        audio_file = audio_p if audio_p.is_absolute() else root_path / audio_p
+                        if not audio_file.is_file():
+                            logger.warning("Audio file referenced in metadata not found: %s", audio_file)
+                            continue
+
+                        dur = _get_audio_duration(audio_file)
+                        if dur is None or dur < min_duration or dur > max_duration:
+                            logger.debug("Dropping clip %s with duration %s (bounds: [%s, %s])", audio_file, dur, min_duration, max_duration)
+                            continue
+
+                        records.append({
+                            "audio": str(audio_file),
+                            "text": text_val,
+                            "duration": dur,
+                        })
+                    return records
 
     # Fallback: paired audio and .txt files
     candidate_audio_files = sorted(
@@ -326,7 +367,9 @@ def sample_balanced_neyshekar(
         neyshekar_ds = None
 
     if neyshekar_ds is None:
-        neyshekar_ds = load_dataset("shekar-ai/Neyshekar", split="train")
+        hf_cache = get_hf_cache_dir() if callable(get_hf_cache_dir) else None
+        load_kwargs = {"cache_dir": hf_cache} if hf_cache else {}
+        neyshekar_ds = load_dataset("shekar-ai/Neyshekar", split="train", **load_kwargs)
 
     if sample_count <= 0 or len(neyshekar_ds) == 0:
         return neyshekar_ds.select([])
@@ -361,14 +404,9 @@ def sample_balanced_neyshekar(
                 else:
                     formal_indices.append(idx)
     else:
-        for idx in range(len(neyshekar_ds)):
-            row = neyshekar_ds[idx]
-            flag = row.get("is_informal") if "is_informal" in row else row.get("informal")
-            if flag is not None:
-                is_inf = bool(flag)
-            else:
-                is_inf = normalizer.is_colloquial(row.get("text", "") or "")
-            if is_inf:
+        texts = neyshekar_ds["text"] if has_text else [None] * len(neyshekar_ds)
+        for idx, txt in enumerate(texts):
+            if normalizer.is_colloquial(txt or ""):
                 informal_indices.append(idx)
             else:
                 formal_indices.append(idx)
@@ -438,9 +476,12 @@ def build_domain_dataset(
     if not train_records and not val_records:
         raise ValueError(f"No valid custom audio records found in: {custom_path}")
 
-    neyshekar_train = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="train"))
-    neyshekar_val = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="validation"))
-    neyshekar_test = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="test"))
+    hf_cache = get_hf_cache_dir() if callable(get_hf_cache_dir) else None
+    load_kwargs = {"cache_dir": hf_cache} if hf_cache else {}
+
+    neyshekar_train = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="train", **load_kwargs))
+    neyshekar_val = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="validation", **load_kwargs))
+    neyshekar_test = _ensure_audio_column(load_dataset("shekar-ai/Neyshekar", split="test", **load_kwargs))
 
     custom_train_ds = Dataset.from_list(train_records) if train_records else Dataset.from_list([])
     custom_val_ds = Dataset.from_list(val_records) if val_records else Dataset.from_list([])

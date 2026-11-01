@@ -20,6 +20,7 @@ def test_train_domain_cli_validates_custom_path(tmp_path):
     model_dir = tmp_path / "valid_model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
 
     with pytest.raises((SystemExit, ValueError)):
         validate_inputs(
@@ -34,6 +35,7 @@ def test_train_domain_cli_orchestration(tmp_path):
     model_dir = tmp_path / "valid_model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
 
     custom_dir = tmp_path / "valid_custom"
     custom_dir.mkdir()
@@ -102,6 +104,7 @@ def test_train_domain_cli_command_assembly(tmp_path):
     model_dir = tmp_path / "valid_model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
 
     custom_dir = tmp_path / "valid_custom"
     custom_dir.mkdir()
@@ -168,6 +171,12 @@ def test_train_domain_cli_command_assembly(tmp_path):
         assert cmd[cmd.index("--grad_accum") + 1] == "8"
         assert "--telephony_mode" in cmd
         assert cmd[cmd.index("--telephony_mode") + 1] == "disjoint"
+        assert "--eval_steps" in cmd
+        assert cmd[cmd.index("--eval_steps") + 1] == "50"
+        assert "--save_steps" in cmd
+        assert cmd[cmd.index("--save_steps") + 1] == "50"
+        assert "--warmup_steps" in cmd
+        assert cmd[cmd.index("--warmup_steps") + 1] == "25"
         assert "--fresh_start" in cmd
 
 
@@ -177,6 +186,7 @@ def test_train_domain_cli_main_entrypoint(tmp_path):
     model_dir = tmp_path / "valid_model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
 
     custom_dir = tmp_path / "valid_custom"
     custom_dir.mkdir()
@@ -204,12 +214,11 @@ def test_train_domain_cli_require_weights(tmp_path):
     custom_dir = tmp_path / "valid_custom"
     custom_dir.mkdir()
 
-    # Fails when weights are required but absent
+    # Fails by default when weights are absent
     with pytest.raises(ValueError) as exc_info:
         validate_inputs(
             base_model=str(model_dir),
             custom_data_path=str(custom_dir),
-            require_weights=True,
         )
     assert "model weights" in str(exc_info.value)
 
@@ -218,7 +227,6 @@ def test_train_domain_cli_require_weights(tmp_path):
     validate_inputs(
         base_model=str(model_dir),
         custom_data_path=str(custom_dir),
-        require_weights=True,
     )
 
 
@@ -241,6 +249,7 @@ def test_train_domain_cli_namespace_input(tmp_path):
     model_dir = tmp_path / "valid_model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
 
     custom_dir = tmp_path / "valid_custom"
     custom_dir.mkdir()
@@ -259,4 +268,136 @@ def test_train_domain_cli_namespace_input(tmp_path):
         assert ret == 0
         mock_build.assert_called_once()
         mock_run.assert_called_once()
+
+
+def test_train_domain_dataset_caching(tmp_path):
+    from scripts.train_domain import run_domain_adaptation
+
+    model_dir = tmp_path / "valid_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
+
+    custom_dir = tmp_path / "valid_custom"
+    custom_dir.mkdir()
+
+    out_dir = tmp_path / "out_cache"
+    prepared_dir = out_dir / "prepared_domain_dataset"
+    prepared_dir.mkdir(parents=True)
+    (prepared_dir / "dataset_dict.json").write_text("{}", encoding="utf-8")
+
+    with patch("scripts.train_domain.build_domain_dataset") as mock_build, \
+         patch("scripts.train_domain._run_training_subprocess") as mock_run:
+        mock_run.return_value = 0
+
+        # When dataset_dict.json exists and not fresh_start, build_domain_dataset is skipped
+        run_domain_adaptation(
+            base_model=str(model_dir),
+            custom_data_path=str(custom_dir),
+            output_dir=str(out_dir),
+            fresh_start=False,
+        )
+        mock_build.assert_not_called()
+
+        # When fresh_start is True, build_domain_dataset is called despite existing dataset
+        run_domain_adaptation(
+            base_model=str(model_dir),
+            custom_data_path=str(custom_dir),
+            output_dir=str(out_dir),
+            fresh_start=True,
+        )
+        mock_build.assert_called_once()
+
+
+def test_train_domain_cli_unknown_args_forwarding(tmp_path):
+    from scripts.train_domain import parse_args, run_domain_adaptation
+
+    model_dir = tmp_path / "valid_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
+
+    custom_dir = tmp_path / "valid_custom"
+    custom_dir.mkdir()
+
+    args = parse_args([
+        "--base_model", str(model_dir),
+        "--custom_data_path", str(custom_dir),
+        "--fp16",
+        "--num_proc", "8",
+    ])
+    assert hasattr(args, "unknown_args")
+    assert "--fp16" in args.unknown_args
+
+    with patch("scripts.train_domain.build_domain_dataset"), \
+         patch("scripts.train_domain._run_training_subprocess") as mock_run:
+        mock_run.return_value = 0
+        run_domain_adaptation(args)
+        cmd = mock_run.call_args[0][0]
+        assert "--fp16" in cmd
+        assert "--num_proc" in cmd
+        assert cmd[cmd.index("--num_proc") + 1] == "8"
+
+
+def test_train_domain_cli_run_stage_updates(tmp_path):
+    from scripts.train_domain import run_domain_adaptation
+
+    model_dir = tmp_path / "valid_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
+
+    custom_dir = tmp_path / "valid_custom"
+    custom_dir.mkdir()
+
+    run_dir = tmp_path / "run_stage"
+    run_dir.mkdir()
+
+    with patch("src.run_state.set_stage") as mock_set_stage, \
+         patch("scripts.train_domain.build_domain_dataset"), \
+         patch("scripts.train_domain._run_training_subprocess") as mock_run:
+        mock_run.return_value = 0
+
+        run_domain_adaptation(
+            base_model=str(model_dir),
+            custom_data_path=str(custom_dir),
+            run_dir=str(run_dir),
+        )
+
+        stages_called = [call.args[1] for call in mock_set_stage.call_args_list]
+        assert "preflight" in stages_called
+        assert "training" in stages_called
+
+
+def test_train_domain_cli_step_args(tmp_path):
+    from scripts.train_domain import parse_args, run_domain_adaptation
+
+    model_dir = tmp_path / "valid_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").touch()
+
+    custom_dir = tmp_path / "valid_custom"
+    custom_dir.mkdir()
+
+    args = parse_args([
+        "--base_model", str(model_dir),
+        "--custom_data_path", str(custom_dir),
+        "--eval_steps", "30",
+        "--save_steps", "60",
+        "--warmup_steps", "15",
+    ])
+    assert args.eval_steps == 30
+    assert args.save_steps == 60
+    assert args.warmup_steps == 15
+
+    with patch("scripts.train_domain.build_domain_dataset"), \
+         patch("scripts.train_domain._run_training_subprocess") as mock_run:
+        mock_run.return_value = 0
+        run_domain_adaptation(args)
+        cmd = mock_run.call_args[0][0]
+        assert cmd[cmd.index("--eval_steps") + 1] == "30"
+        assert cmd[cmd.index("--save_steps") + 1] == "60"
+        assert cmd[cmd.index("--warmup_steps") + 1] == "15"
+
 
