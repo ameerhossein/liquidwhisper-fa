@@ -118,8 +118,8 @@ def resolve_github_token() -> str:
     )
 
 
-def resolve_ssh_public_key(key_path: Optional[str] = None) -> str:
-    """Read SSH public key from given path or auto-detect from ~/.ssh/."""
+def resolve_ssh_key_pair(key_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Read SSH public key and locate its corresponding private key file."""
     candidates = []
     if key_path:
         candidates.append(Path(key_path))
@@ -136,7 +136,13 @@ def resolve_ssh_public_key(key_path: Optional[str] = None) -> str:
             try:
                 content = p.read_text(encoding="utf-8").strip()
                 if content:
-                    return content
+                    # Look for corresponding private key
+                    priv_candidate = None
+                    if p.name.endswith(".pub"):
+                        priv_file = p.parent / p.name[:-4]
+                        if priv_file.is_file():
+                            priv_candidate = str(priv_file)
+                    return content, priv_candidate
             except Exception:
                 pass
 
@@ -144,6 +150,12 @@ def resolve_ssh_public_key(key_path: Optional[str] = None) -> str:
         f"No SSH public key found. Checked: {[str(c) for c in candidates]}\n"
         "Remediation: Generate one with `ssh-keygen -t ed25519` or pass --ssh-key-path."
     )
+
+
+def resolve_ssh_public_key(key_path: Optional[str] = None) -> str:
+    """Read SSH public key from given path or auto-detect from ~/.ssh/."""
+    pub, _ = resolve_ssh_key_pair(key_path)
+    return pub
 
 
 class RunPodClient:

@@ -47,6 +47,17 @@ def test_resolve_ssh_public_key(tmp_path):
     assert resolve_ssh_public_key(key_path=str(pub_file)) == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@test"
 
 
+def test_resolve_ssh_key_pair(tmp_path):
+    priv_file = tmp_path / "id_ed25519"
+    priv_file.write_text("dummy_private_key")
+    pub_file = tmp_path / "id_ed25519.pub"
+    pub_file.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@test")
+    from src.runpod_deploy.client import resolve_ssh_key_pair
+    pub, priv = resolve_ssh_key_pair(key_path=str(pub_file))
+    assert pub == "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@test"
+    assert priv == str(priv_file)
+
+
 def test_check_l40s_availability_in_stock():
     client = RunPodClient(api_key="mock_key")
     mock_catalog = [

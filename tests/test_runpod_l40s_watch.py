@@ -41,7 +41,7 @@ def test_full_lifecycle_simulation(capsys):
     ]
     with patch("src.runpod_deploy.client.resolve_runpod_key", return_value="mock_key"), \
          patch("src.runpod_deploy.client.resolve_github_token", return_value="mock_gh_token"), \
-         patch("src.runpod_deploy.client.resolve_ssh_public_key", return_value="ssh-ed25519 AAA..."), \
+         patch("src.runpod_deploy.client.resolve_ssh_key_pair", return_value=("ssh-ed25519 AAA...", "/path/to/id_ed25519")), \
          patch("src.runpod_deploy.client.RunPodClient.check_l40s_availability", side_effect=poll_results), \
          patch("src.runpod_deploy.client.RunPodClient.create_pod", return_value={"id": "pod_live_123"}), \
          patch("src.runpod_deploy.client.RunPodClient.get_pod", return_value={
@@ -50,6 +50,7 @@ def test_full_lifecycle_simulation(capsys):
              "runtimeStatus": "running",
              "runtime": {"ports": [{"privatePort": 22, "publicPort": 12345, "ip": "1.2.3.4"}]},
          }), \
+         patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.wait_ssh_ready", return_value=True), \
          patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.bootstrap_pod", return_value=True), \
          patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.wait_web_ready", return_value=True), \
          patch("src.runpod_deploy.notify.send_desktop_notification", return_value=True), \
@@ -62,4 +63,39 @@ def test_full_lifecycle_simulation(capsys):
         assert "https://pod_live_123-7860.proxy.runpod.net" in captured.out
         assert "https://pod_live_123-8080.proxy.runpod.net" in captured.out
         assert "ssh root@1.2.3.4 -p 12345" in captured.out
+
+
+def test_cli_health_check_failure_exits_1(capsys):
+    with patch("src.runpod_deploy.client.resolve_runpod_key", return_value="mock_key"), \
+         patch("src.runpod_deploy.client.resolve_github_token", return_value="mock_gh_token"), \
+         patch("src.runpod_deploy.client.resolve_ssh_key_pair", return_value=("ssh-ed25519 AAA...", "/path/to/id_ed25519")), \
+         patch("src.runpod_deploy.client.RunPodClient.check_l40s_availability", return_value=(True, "US-NV-1", [{"id": "US-NV-1"}])), \
+         patch("src.runpod_deploy.client.RunPodClient.create_pod", return_value={"id": "pod_live_123"}), \
+         patch("src.runpod_deploy.client.RunPodClient.get_pod", return_value={
+             "id": "pod_live_123",
+             "desiredStatus": "RUNNING",
+             "runtimeStatus": "running",
+             "runtime": {"ports": [{"privatePort": 22, "publicPort": 12345, "ip": "1.2.3.4"}]},
+         }), \
+         patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.wait_ssh_ready", return_value=True), \
+         patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.bootstrap_pod", return_value=True), \
+         patch("src.runpod_deploy.ssh_bootstrap.SSHExecutor.wait_web_ready", return_value=False), \
+         patch("src.runpod_deploy.notify.send_desktop_notification") as mock_notify:
+
+        ret = main(["--interval", "0.01"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "Web Cockpit did not return HTTP 200" in captured.err
+        assert "RUNPOD L40S COCKPIT IS LIVE!" not in captured.out
+        mock_notify.assert_not_called()
+
+
+def test_cli_auth_error_halts_immediately(capsys):
+    with patch("src.runpod_deploy.client.resolve_runpod_key", return_value="bad_key"), \
+         patch("src.runpod_deploy.client.RunPodClient.check_l40s_availability", side_effect=RuntimeError("RunPod API error (401 Unauthorized): invalid api key")):
+        ret = main(["--interval", "0.01"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "Authentication failed (401/403)" in captured.err
+
 

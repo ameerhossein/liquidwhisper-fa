@@ -16,14 +16,14 @@ def send_desktop_notification(title: str, message: str) -> bool:
     if not notify_bin:
         return False
     try:
-        subprocess.run(
+        res = subprocess.run(
             [notify_bin, "-u", "critical", "-i", "computer", title, message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
             check=False,
         )
-        return True
+        return res.returncode == 0
     except Exception:
         return False
 
@@ -66,15 +66,21 @@ def format_ready_banner(
     web_cockpit_url: str,
     web_terminal_url: str,
     ssh_cmd: str,
+    terminal_user: str = "",
+    terminal_pass: str = "",
 ) -> str:
     """Format an ASCII banner announcing deployment readiness."""
     console_url = f"https://console.runpod.io/pod/{pod_id}"
+    term_line = f"  Web Terminal    : {web_terminal_url}"
+    if terminal_user and terminal_pass:
+        term_line += f"  (login: {terminal_user} / password: {terminal_pass})"
+
     lines = [
         "=" * 72,
         "  🚀 RUNPOD L40S COCKPIT IS LIVE!",
         "=" * 72,
         f"  Web Cockpit URL : {web_cockpit_url}",
-        f"  Web Terminal    : {web_terminal_url}",
+        term_line,
         f"  RunPod Console  : {console_url}",
         f"  SSH Access      : {ssh_cmd}",
         "  Working Dir     : /workspace/stt",

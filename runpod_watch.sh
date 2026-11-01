@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
+# Run from project root
+cd "$(dirname "$0")"
+
 # Load .env if present
-if [ -f "$(dirname "$0")/.env" ]; then
-    set -a; . "$(dirname "$0")/.env"; set +a
-elif [ -f ".env" ]; then
+if [ -f ".env" ]; then
     set -a; . "./.env"; set +a
 fi
 

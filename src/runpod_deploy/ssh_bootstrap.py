@@ -86,6 +86,8 @@ def build_ssh_command(
 
 def build_bootstrap_script(
     gh_token: str,
+    terminal_user: str = "cockpit",
+    terminal_pass: str = "",
     repo_url: str = "https://github.com/ameerhossein/liquidwhisper-fa.git",
     branch: str = "main",
 ) -> str:
@@ -94,10 +96,11 @@ def build_bootstrap_script(
     auth_repo_url = repo_url
     if "github.com" in repo_url:
         clean_url = repo_url.replace("https://", "").replace("http://", "")
-        # Remove any existing user info
         if "@" in clean_url:
             clean_url = clean_url.split("@", 1)[1]
         auth_repo_url = f"https://x-access-token:{gh_token}@{clean_url}"
+
+    ttyd_auth_flag = f"-c {terminal_user}:{terminal_pass}" if terminal_pass else ""
 
     script = f"""#!/usr/bin/env bash
 set -e
@@ -111,7 +114,7 @@ fi
 
 if command -v ttyd >/dev/null 2>&1 && ! pgrep -x "ttyd" >/dev/null 2>&1; then
     echo "Starting ttyd on port 8080..."
-    nohup ttyd -p 8080 -W bash > /workspace/ttyd.log 2>&1 &
+    nohup ttyd -p 8080 {ttyd_auth_flag} -W bash > /workspace/ttyd.log 2>&1 &
     sleep 1
 fi
 
@@ -121,13 +124,15 @@ cd /workspace
 if [ -d "/workspace/stt/.git" ]; then
     echo "Existing git repo found in /workspace/stt, updating..."
     cd /workspace/stt
-    git fetch origin {branch} || true
+    git fetch {auth_repo_url} {branch} || true
     git checkout {branch} || true
-    git pull origin {branch} || true
+    git pull {auth_repo_url} {branch} || true
 else
     echo "Cloning {repo_url} into /workspace/stt..."
     git clone --branch {branch} {auth_repo_url} /workspace/stt
     cd /workspace/stt
+    # Sanitize remote origin so personal access token is not retained on persistent volume
+    git remote set-url origin {repo_url} 2>/dev/null || true
 fi
 
 echo "=== [3/4] Running setup_server.sh ==="
@@ -200,16 +205,41 @@ class SSHExecutor:
         return proc.returncode
 
     @classmethod
+    def wait_ssh_ready(
+        cls,
+        conn: SSHConnectionInfo,
+        timeout_sec: int = 120,
+        poll_interval: float = 3.0,
+        identity_file: Optional[str] = None,
+    ) -> bool:
+        """Poll SSH port until SSH accepts a command."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rc, _ = cls.run_command(conn, "true", identity_file=identity_file, timeout=8)
+            if rc == 0:
+                return True
+            time.sleep(poll_interval)
+        return False
+
+    @classmethod
     def bootstrap_pod(
         cls,
         conn: SSHConnectionInfo,
         gh_token: str,
+        terminal_user: str = "cockpit",
+        terminal_pass: str = "",
         repo_url: str = "https://github.com/ameerhossein/liquidwhisper-fa.git",
         branch: str = "main",
         identity_file: Optional[str] = None,
         on_line: Optional[Callable[[str], None]] = None,
     ) -> bool:
-        script = build_bootstrap_script(gh_token=gh_token, repo_url=repo_url, branch=branch)
+        script = build_bootstrap_script(
+            gh_token=gh_token,
+            terminal_user=terminal_user,
+            terminal_pass=terminal_pass,
+            repo_url=repo_url,
+            branch=branch,
+        )
         # Pass script via base64 or inline bash -c
         import base64
         encoded_script = base64.b64encode(script.encode("utf-8")).decode("ascii")

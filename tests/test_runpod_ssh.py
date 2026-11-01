@@ -61,6 +61,8 @@ def test_build_ssh_command():
 def test_build_bootstrap_script_contains_ttyd_and_token():
     script = build_bootstrap_script(
         gh_token="secret_token",
+        terminal_user="cockpit",
+        terminal_pass="secret_pass_123",
         repo_url="https://github.com/ameerhossein/liquidwhisper-fa.git",
         branch="main",
     )
@@ -68,8 +70,18 @@ def test_build_bootstrap_script_contains_ttyd_and_token():
     assert "secret_token" in script
     assert "ttyd" in script
     assert "8080" in script
+    assert "-c cockpit:secret_pass_123" in script
     assert "setup_server.sh" in script
     assert "runpod_web.sh" in script
+
+
+def test_wait_ssh_ready():
+    conn = SSHConnectionInfo(host="1.2.3.4", port=22, user="root")
+    with patch.object(SSHExecutor, "run_command", side_effect=[(1, "Connection refused"), (0, "")]):
+        assert SSHExecutor.wait_ssh_ready(conn, timeout_sec=5, poll_interval=0.05) is True
+
+    with patch.object(SSHExecutor, "run_command", return_value=(1, "Connection refused")):
+        assert SSHExecutor.wait_ssh_ready(conn, timeout_sec=0.1, poll_interval=0.05) is False
 
 
 def test_wait_web_ready():
