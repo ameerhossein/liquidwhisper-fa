@@ -199,6 +199,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "benchmarks, telemetry, stop signal) and the fake best_adapter."
         ),
     )
+    parser.add_argument("--base_model", default=None, help="Base model path")
+    parser.add_argument("--custom_data_path", default=None, help="Custom data path")
+    parser.add_argument("--replay_samples", type=int, default=1000, help="Replay samples")
+    parser.add_argument("--replay_ratio", type=float, default=0.25, help="Replay ratio")
     # The real trainer passes many more flags. The fake does not need them, but
     # it must accept them so the server can build one command shape.
     args, _unknown = parser.parse_known_args(argv)

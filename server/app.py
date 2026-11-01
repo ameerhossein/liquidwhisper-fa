@@ -2174,6 +2174,44 @@ def _build_trainer_command(
     resume_from_checkpoint: Optional[str] = None,
 ) -> List[str]:
     """Rebuild the trainer command from a run's stored argument mapping."""
+    if trainer_args.get("domain_adaptation"):
+        name = "dev_fake_trainer.py" if _fake_trainer_enabled() else "train_domain.py"
+        script = BASE_DIR / "scripts" / name
+        cmd = [
+            sys.executable,
+            "-u",
+            str(script),
+            "--base_model", str(trainer_args.get("base_model", "models/buzzasr-neyshekar-standalone")),
+            "--custom_data_path", str(trainer_args.get("custom_data_path", "")),
+            "--run_dir", str(run_dir),
+            "--output_dir", str(output_dir),
+            "--results_dir", str(results_dir),
+            "--replay_samples", str(trainer_args.get("replay_samples", 1000)),
+        ]
+        if "replay_ratio" in trainer_args and trainer_args["replay_ratio"] is not None:
+            cmd += ["--replay_ratio", str(trainer_args["replay_ratio"])]
+        if "epochs" in trainer_args and trainer_args["epochs"] is not None:
+            cmd += ["--epochs", str(trainer_args["epochs"])]
+        if "learning_rate" in trainer_args and trainer_args["learning_rate"] is not None:
+            cmd += ["--learning_rate", str(trainer_args["learning_rate"])]
+        if "lora_r" in trainer_args and trainer_args["lora_r"] is not None:
+            cmd += ["--lora_r", str(trainer_args["lora_r"])]
+        if "lora_alpha" in trainer_args and trainer_args["lora_alpha"] is not None:
+            cmd += ["--lora_alpha", str(trainer_args["lora_alpha"])]
+        if "batch_size" in trainer_args and trainer_args["batch_size"] is not None:
+            cmd += ["--batch_size", str(trainer_args["batch_size"])]
+        if "grad_accum" in trainer_args and trainer_args["grad_accum"] is not None:
+            cmd += ["--grad_accum", str(trainer_args["grad_accum"])]
+        if "telephony_mode" in trainer_args and trainer_args["telephony_mode"] is not None:
+            cmd += ["--telephony_mode", str(trainer_args["telephony_mode"])]
+        if _as_bool(trainer_args.get("fresh_start")):
+            cmd.append("--fresh_start")
+        if resume_from_checkpoint:
+            cmd += ["--resume_from_checkpoint", str(resume_from_checkpoint)]
+        if post_eval_only:
+            cmd.append("--post_eval_only")
+        return cmd
+
     cmd = [
         sys.executable,
         "-u",
@@ -2208,18 +2246,26 @@ def _build_trainer_command(
 
 def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and normalize a new-run payload (legacy rules unchanged)."""
+    domain_mode = _as_bool(config.get("domain_adaptation", False))
+    epochs_default = 3 if domain_mode else 2
+    lr_default = 2e-5 if domain_mode else 1e-4
     try:
-        epochs_i = int(config.get("epochs", 2))
+        epochs_i = int(config.get("epochs", epochs_default))
         batch_i = int(config.get("batch_size", 8))
         accum_i = int(config.get("grad_accum", 4))
         eval_steps_i = int(config.get("eval_steps", 1000))
-        lr_f = float(config.get("learning_rate", 1e-4))
+        lr_f = float(config.get("learning_rate", lr_default))
         eval_bs_i = int(config.get("eval_batch_size", 16))
         max_bench = config.get("max_benchmark_samples", 1000)
         max_bench_i = int(max_bench) if max_bench not in (None, "") else 1000
         # Preprocessing workers for datasets.map (fork-based). Default 8.
         num_proc_i = int(config.get("num_proc", 8))
         tele_f = float(config.get("telephony_prob", 0.5))
+        if domain_mode:
+            replay_samples_i = int(config.get("replay_samples", 1000))
+            replay_ratio_f = float(config.get("replay_ratio", 0.25))
+            lora_r_i = int(config.get("lora_r", 16))
+            lora_alpha_i = int(config.get("lora_alpha", 32))
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="epochs/batch_size/grad_accum/eval_batch_size/num_proc must be integers; learning_rate/telephone_prob numeric.")
     if not (1 <= epochs_i <= 20):
@@ -2266,7 +2312,34 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
     auto_resume_on = (_as_bool(auto_resume) if isinstance(auto_resume, str) else bool(auto_resume))
     if fresh_start:
         auto_resume_on = False
-    return {
+
+    if domain_mode:
+        if not (100 <= replay_samples_i <= 5000):
+            raise HTTPException(status_code=400, detail="replay_samples must be 100..5000.")
+        if not (0.0 <= replay_ratio_f <= 1.0):
+            raise HTTPException(status_code=400, detail="replay_ratio must be 0..1.")
+        if not (1 <= lora_r_i <= 256):
+            raise HTTPException(status_code=400, detail="lora_r must be 1..256.")
+        if not (1 <= lora_alpha_i <= 512):
+            raise HTTPException(status_code=400, detail="lora_alpha must be 1..512.")
+
+        base_model_str = str(config.get("base_model", "models/buzzasr-neyshekar-standalone") or "").strip()
+        if not base_model_str:
+            base_model_str = "models/buzzasr-neyshekar-standalone"
+        base_model_path = Path(base_model_str)
+        if not base_model_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"base_model directory '{base_model_str}' does not exist.")
+        if not (base_model_path / "config.json").is_file():
+            raise HTTPException(status_code=400, detail=f"base_model directory '{base_model_str}' is missing config.json.")
+
+        custom_data_str = str(config.get("custom_data_path", "") or "").strip()
+        if not custom_data_str:
+            raise HTTPException(status_code=400, detail="custom_data_path is required for domain adaptation.")
+        custom_data_path = Path(custom_data_str)
+        if not custom_data_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"custom_data_path directory '{custom_data_str}' does not exist.")
+
+    normalized = {
         "epochs": epochs_i,
         "batch_size": batch_i,
         "grad_accum": accum_i,
@@ -2282,7 +2355,16 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "fresh_start": fresh_start,
         "resume_explicit": resume_explicit,
         "auto_resume": auto_resume_on,
+        "domain_adaptation": domain_mode,
     }
+    if domain_mode:
+        normalized["base_model"] = base_model_str
+        normalized["custom_data_path"] = custom_data_str
+        normalized["replay_samples"] = replay_samples_i
+        normalized["replay_ratio"] = replay_ratio_f
+        normalized["lora_r"] = lora_r_i
+        normalized["lora_alpha"] = lora_alpha_i
+    return normalized
 
 
 def _write_initial_telemetry(path: Path) -> None:
@@ -2491,8 +2573,9 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "merged_dir": str(run_dir / "merged"),
         "preflight_cache": str(preflight_cache_dir / "baselines" / "preflight.json"),
     }
+    domain_mode = values.get("domain_adaptation", False)
     trainer_args = {
-        "base_model": "BuzzASR/persian",
+        "base_model": values["base_model"] if domain_mode else "BuzzASR/persian",
         "dataset_name": values["dataset_name"],
         "output_dir": output_dir,
         "results_dir": str(run_dir),
@@ -2520,17 +2603,22 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "run_post_test_eval": True,
         "run_epoch_benchmark": True,
         "enable_telemetry": True,
-        "lora_r": 64,
-        "lora_alpha": 128,
+        "lora_r": values.get("lora_r", 16 if domain_mode else 64),
+        "lora_alpha": values.get("lora_alpha", 32 if domain_mode else 128),
         "lora_dropout": 0.05,
         "auto_resume": values["auto_resume"],
         "fresh_start": values["fresh_start"],
         "run_dir": str(run_dir),
     }
+    if domain_mode:
+        trainer_args["domain_adaptation"] = True
+        trainer_args["custom_data_path"] = values["custom_data_path"]
+        trainer_args["replay_samples"] = values["replay_samples"]
+        trainer_args["replay_ratio"] = values.get("replay_ratio", 0.25)
     if values["resume_explicit"]:
         trainer_args["resume_from_checkpoint"] = values["resume_explicit"]
     run_config = {
-        "base_model": "BuzzASR/persian",
+        "base_model": values["base_model"] if domain_mode else "BuzzASR/persian",
         "dataset_name": values["dataset_name"],
         "epochs": values["epochs"],
         "batch_size": values["batch_size"],
@@ -2551,6 +2639,13 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "output_dir": output_dir,
         "results_dir": str(run_dir),
     }
+    if domain_mode:
+        run_config["domain_adaptation"] = True
+        run_config["custom_data_path"] = values["custom_data_path"]
+        run_config["replay_samples"] = values["replay_samples"]
+        run_config["replay_ratio"] = values.get("replay_ratio", 0.25)
+        run_config["lora_r"] = values.get("lora_r", 16)
+        run_config["lora_alpha"] = values.get("lora_alpha", 32)
     run = run_state.create_run(
         RUNS_DIR,
         config=run_config,
@@ -2575,6 +2670,14 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "fresh_start": values["fresh_start"],
         "resume_from_checkpoint": values["resume_explicit"] or None,
     }
+    if domain_mode:
+        response_config["domain_adaptation"] = True
+        response_config["base_model"] = values["base_model"]
+        response_config["custom_data_path"] = values["custom_data_path"]
+        response_config["replay_samples"] = values["replay_samples"]
+        response_config["replay_ratio"] = values.get("replay_ratio", 0.25)
+        response_config["lora_r"] = values.get("lora_r", 16)
+        response_config["lora_alpha"] = values.get("lora_alpha", 32)
     return _spawn_trainer(
         run_id=run_id,
         run_dir=run_dir,
