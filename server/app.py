@@ -878,6 +878,24 @@ def _reset_smoke_repo(repo_id: str) -> None:
     hf_sync.reset_repo(repo_id)
 
 
+def _resolve_smoke_hf_repo(requested_repo: Optional[str] = None) -> str:
+    explicit = str(requested_repo or "").strip()
+    if explicit:
+        return explicit
+    env_repo = str(os.environ.get("ASR_SMOKE_HF_REPO", "") or "").strip()
+    if env_repo:
+        return env_repo
+    user = hf_sync.get_authenticated_user()
+    if user:
+        return f"{user}/stt-smoke-test"
+    mirror_repo = str(os.environ.get("ASR_HF_RUN_REPO", "") or "").strip()
+    if mirror_repo and "/" in mirror_repo:
+        owner = mirror_repo.split("/", 1)[0].strip()
+        if owner:
+            return f"{owner}/stt-smoke-test"
+    return SMOKE_DEFAULT_HF_REPO
+
+
 def _smoke_results_dir() -> Path:
     production = _default_results_dir().resolve()
     candidates = [
@@ -1885,7 +1903,7 @@ async def get_smoke_status():
     hf_repo = (
         attempt.get("hf_repo")
         if isinstance(attempt, dict) and attempt.get("hf_repo")
-        else SMOKE_HF_REPO
+        else _resolve_smoke_hf_repo()
     )
 
     payload: Dict[str, Any] = {
@@ -2036,10 +2054,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
 
-    target_repo = (
-        str(config.get("hf_repo") or "").strip()
-        or SMOKE_HF_REPO
-    )
+    target_repo = _resolve_smoke_hf_repo(config.get("hf_repo"))
     try:
         _reset_smoke_repo(target_repo)
     except Exception as e:
@@ -2180,6 +2195,7 @@ _TRAINER_VALUE_ARGS = (
     "max_train_samples",
     "max_eval_samples",
     "prep_cache_dir",
+    "hf_run_repo",
 )
 _TRAINER_LIST_ARGS = ("telephony_profiles",)
 _TRAINER_BOOL_ARGS = (
@@ -2704,6 +2720,21 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         run_config["replay_ratio"] = values.get("replay_ratio", 0.25)
         run_config["lora_r"] = values.get("lora_r", 16)
         run_config["lora_alpha"] = values.get("lora_alpha", 32)
+    hf_repo_val = config.get("hf_run_repo")
+    if hf_repo_val is not None:
+        hf_repo_str = str(hf_repo_val).strip()
+        if hf_repo_str.lower() in hf_sync.DISABLE_HF_VALUES:
+            resolved_hf_repo = None
+        else:
+            hf_sync.validate_repo_id(hf_repo_str)
+            resolved_hf_repo = hf_repo_str
+    else:
+        resolved_hf_repo = hf_sync.resolve_default_repo()
+
+    if resolved_hf_repo:
+        trainer_args["hf_run_repo"] = resolved_hf_repo
+        run_config["hf_run_repo"] = resolved_hf_repo
+
     run = run_state.create_run(
         RUNS_DIR,
         config=run_config,
@@ -2916,7 +2947,7 @@ def _start_merge(run_id: str) -> Dict[str, Any]:
     if isinstance(hf_section, dict):
         hf_repo = str(hf_section.get("repo_id") or "").strip()
     if not hf_repo:
-        hf_repo = (os.environ.get("ASR_HF_RUN_REPO", "") or "").strip()
+        hf_repo = hf_sync.resolve_default_repo() or ""
     cmd = [
         sys.executable,
         "-u",
@@ -3196,7 +3227,7 @@ async def get_hf_config():
         enabled = False
     return {
         "enabled": enabled,
-        "repo_id": (os.environ.get("ASR_HF_RUN_REPO", "") or "").strip(),
+        "repo_id": hf_sync.resolve_default_repo() or "",
         "runs_root": str(RUNS_DIR),
     }
 
@@ -3206,9 +3237,7 @@ def list_hf_runs(repo: Optional[str] = None):
     # Deliberately synchronous: FastAPI runs a plain ``def`` path operation in
     # its threadpool, so the blocking HF listing cannot stall the event loop
     # (and therefore the 1s WebSocket telemetry tick).
-    repo_id = str(repo or "").strip() or (
-        os.environ.get("ASR_HF_RUN_REPO", "") or ""
-    ).strip()
+    repo_id = str(repo or "").strip() or (hf_sync.resolve_default_repo() or "")
     if not repo_id:
         raise HTTPException(
             status_code=400,

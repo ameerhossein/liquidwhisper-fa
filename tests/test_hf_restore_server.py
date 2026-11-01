@@ -52,6 +52,13 @@ def test_hf_config_redacts_token(client, monkeypatch):
     assert "hf_secret" not in json.dumps(data)
 
 
+def test_hf_config_returns_default_repo_when_authenticated(client, monkeypatch):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
+    data = client.get("/api/hf/config").json()
+    assert data["repo_id"] == "carol/liquidwhisper-neyshekar"
+
+
 def test_restore_rejects_invalid_run_id(client):
     assert client.post("/api/hf/restore", json={"run_id": "../bad"}).status_code == 400
 

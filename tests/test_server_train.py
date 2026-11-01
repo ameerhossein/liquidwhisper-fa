@@ -598,6 +598,37 @@ def test_smoke_start_null_hf_repo_falls_back_to_default(client, monkeypatch):
     assert res.json().get("hf_repo") == client.mod.SMOKE_DEFAULT_HF_REPO
 
 
+def test_smoke_start_auto_resolves_authenticated_hf_user(client, monkeypatch):
+    resets = []
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", lambda repo: resets.append(repo))
+    monkeypatch.setattr(client.mod.hf_sync, "get_authenticated_user", lambda api=None: "myuser")
+
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 200, res.text
+    expected_repo = "myuser/stt-smoke-test"
+    assert resets == [expected_repo]
+    assert res.json().get("hf_repo") == expected_repo
+    flags = _flags(client.launched[0])
+    assert flags["--hf_run_repo"] == expected_repo
+
+    status_res = client.get("/api/train/smoke/status")
+    assert status_res.json().get("hf_repo") == expected_repo
+
+
+def test_smoke_start_auto_resolves_from_mirror_repo_when_unauthenticated(client, monkeypatch):
+    resets = []
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", lambda repo: resets.append(repo))
+    monkeypatch.setattr(client.mod.hf_sync, "get_authenticated_user", lambda api=None: None)
+    monkeypatch.setenv("ASR_HF_RUN_REPO", "myorg/production-run")
+
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 200, res.text
+    expected_repo = "myorg/stt-smoke-test"
+    assert resets == [expected_repo]
+    assert res.json().get("hf_repo") == expected_repo
+
+
+
 
 
 def test_smoke_start_rejects_unknown_telephony_mode(client):
@@ -1840,6 +1871,7 @@ def test_merge_command_passes_hf_context(client, monkeypatch):
 
 def test_merge_command_omits_hf_flags_without_repo(client, monkeypatch):
     monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: None)
     run = _create_run(
         client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
     )
@@ -1851,6 +1883,30 @@ def test_merge_command_omits_hf_flags_without_repo(client, monkeypatch):
     cmd = client.launched[-1]
     assert "--run_dir" not in cmd
     assert "--hf_run_repo" not in cmd
+
+
+def test_merge_command_uses_default_hf_repo_when_authenticated(client, monkeypatch):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
+    run = _create_run(
+        client, pid=999999, status="completed", run_id="20261030-194700-abcdef"
+    )
+    _seed_adapter(client, run["run_id"])
+    run_state.set_stage(client.mod.RUNS_DIR / run["run_id"], "training", "completed")
+
+    assert client.post(f"/api/runs/{run['run_id']}/merge").status_code == 200
+
+    cmd = client.launched[-1]
+    assert _flag_value(cmd, "--hf_run_repo") == "carol/liquidwhisper-neyshekar"
+
+
+def test_start_run_passes_default_hf_repo_when_authenticated(client, monkeypatch):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
+    start = client.post("/api/train/start", json={}).json()
+    assert start["status"] == "started"
+    cmd = client.launched[-1]
+    assert _flag_value(cmd, "--hf_run_repo") == "carol/liquidwhisper-neyshekar"
 
 
 def test_merge_command_prefers_recorded_hf_repo(client, monkeypatch):
