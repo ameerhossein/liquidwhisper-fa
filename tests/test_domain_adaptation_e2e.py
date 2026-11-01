@@ -1,19 +1,14 @@
 import json
-import os
 from pathlib import Path
-import sys
-from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 import wave
 
 import pytest
-from datasets import Audio, Dataset, DatasetDict, load_from_disk
+from datasets import Audio, Dataset, load_from_disk
 from fastapi.testclient import TestClient
 
 from scripts.train_domain import (
-    build_parser,
     main,
-    parse_args,
     run_domain_adaptation,
     validate_inputs,
 )
