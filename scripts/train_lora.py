@@ -36,8 +36,9 @@ try:
     _setup_hf_cache(verbose=True)
 except Exception:
     pass
+import contextlib
 from pathlib import Path
-from typing import Dict, Any, Mapping, Optional, Callable
+from typing import Dict, Any, Mapping, Optional, Callable, List, Union
 import torch
 import evaluate
 from transformers import (
@@ -78,6 +79,77 @@ from src import paths as _managed_paths
 from src import prep_cache
 from src import run_state
 from src import hf_sync
+
+
+def _model_float_dtype(model: torch.nn.Module) -> Optional[torch.dtype]:
+    """Inspect model for floating-point parameter dtype (bfloat16, float16, float32)."""
+    dtype = getattr(model, "dtype", None)
+    if dtype is not None and getattr(dtype, "is_floating_point", False):
+        return dtype
+    try:
+        p = next(model.parameters())
+        if p.is_floating_point():
+            return p.dtype
+    except (StopIteration, Exception):
+        pass
+    return None
+
+
+class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer that ensures Whisper input_features and generation match model precision.
+
+    Whisper models expect audio spectrograms (`input_features`) rather than
+    integer tokens. When trained with mixed precision (bfloat16/float16),
+    Transformers' Seq2SeqTrainer.prediction_step invokes `model.generate()`
+    without an autocast context or float-to-model-dtype conversion, causing
+    PyTorch Conv1d to fail with:
+        RuntimeError: Input type (float) and bias type (c10::BFloat16) should be the same
+    This trainer casts input_features to the model's float dtype and wraps
+    evaluation generation in the accelerator's autocast context.
+    """
+
+    def _prepare_inputs(
+        self, inputs: Dict[str, Union[torch.Tensor, Any]]
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
+        inputs = super()._prepare_inputs(inputs)
+        if isinstance(inputs, dict) and "input_features" in inputs:
+            target_dtype = _model_float_dtype(self.model)
+            if target_dtype is not None:
+                feat = inputs["input_features"]
+                if isinstance(feat, torch.Tensor) and feat.is_floating_point() and feat.dtype != target_dtype:
+                    inputs["input_features"] = feat.to(dtype=target_dtype)
+        return inputs
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+        **gen_kwargs,
+    ) -> tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.args.predict_with_generate:
+            autocast_ctx = (
+                self.accelerator.autocast()
+                if hasattr(self, "accelerator") and self.accelerator is not None
+                else contextlib.nullcontext()
+            )
+            with autocast_ctx:
+                return super().prediction_step(
+                    model,
+                    inputs,
+                    prediction_loss_only=prediction_loss_only,
+                    ignore_keys=ignore_keys,
+                    **gen_kwargs,
+                )
+        return super().prediction_step(
+            model,
+            inputs,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            **gen_kwargs,
+        )
+
 
 
 def _default_output_dir() -> str:
@@ -2048,10 +2120,10 @@ def _run_training_stages(args, run_dir, mirror):
     # tokenizer's <|endoftext|> (id 0), and generation would stop on the wrong token.
     # The processor is saved explicitly after training.
     try:
-        trainer = Seq2SeqTrainer(processing_class=None, **_trainer_common)
+        trainer = WhisperSeq2SeqTrainer(processing_class=None, **_trainer_common)
     except TypeError:
         # Older transformers: no processing_class kwarg.
-        trainer = Seq2SeqTrainer(**_trainer_common)
+        trainer = WhisperSeq2SeqTrainer(**_trainer_common)
 
     # 9. Execute Training (auto-resumable from persistent-volume checkpoints)
     resume_ckpt = _resolve_resume_checkpoint(args)

@@ -1405,3 +1405,40 @@ def test_run_training_stages_does_not_shadow_evaluate():
     train_lora = _train_lora()
     assert "evaluate" not in train_lora._run_training_stages.__code__.co_varnames
     assert "evaluate" not in train_lora._run_post_eval_only.__code__.co_varnames
+
+
+def test_whisper_seq2seq_trainer_prediction_step_handles_dtype_mismatch(tmp_path):
+    train_lora = _train_lora()
+    import torch
+    from types import SimpleNamespace
+    from transformers import GenerationConfig
+
+    class _FakeWhisper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Conv1d(80, 16, kernel_size=3, padding=1)
+            self.config = SimpleNamespace(pad_token_id=50257)
+            self.generation_config = GenerationConfig(max_length=10)
+            self.dtype = torch.bfloat16
+            self.to(torch.bfloat16)
+
+        def forward(self, input_features=None, labels=None):
+            hidden = self.encoder(input_features)
+            return {"loss": hidden.sum()}
+
+        def generate(self, input_features=None, **kwargs):
+            hidden = self.encoder(input_features)
+            return torch.tensor([[50258, 50259]])
+
+    model = _FakeWhisper()
+    args = train_lora.Seq2SeqTrainingArguments(
+        output_dir=str(tmp_path),
+        predict_with_generate=True,
+        use_cpu=True,
+    )
+    trainer = train_lora.WhisperSeq2SeqTrainer(model=model, args=args)
+    batch = {"input_features": torch.randn(1, 80, 50, dtype=torch.float32)}
+
+    loss, preds, labels = trainer.prediction_step(model, batch, prediction_loss_only=False)
+    assert preds is not None
+
