@@ -194,13 +194,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=42,
         help="Random seed for data partitioning and sampling (default: 42)",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint or 'last' to resume from",
+    )
+    parser.add_argument(
+        "--post_eval_only",
+        action="store_true",
+        default=False,
+        help="Run only post-training evaluation",
+    )
     return parser
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = build_parser()
-    return parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        setattr(args, "unknown_args", unknown)
+    return args
 
 
 def _run_training_subprocess(
@@ -332,6 +347,12 @@ def run_domain_adaptation(
         cmd.extend(["--run_dir", str(run_dir)])
     if fresh_start:
         cmd.append("--fresh_start")
+    resume_ckpt = extra_kwargs.pop("resume_from_checkpoint", getattr(args, "resume_from_checkpoint", None) if isinstance(args, argparse.Namespace) else None)
+    if resume_ckpt:
+        cmd.extend(["--resume_from_checkpoint", str(resume_ckpt)])
+    post_eval = extra_kwargs.pop("post_eval_only", getattr(args, "post_eval_only", False) if isinstance(args, argparse.Namespace) else False)
+    if post_eval:
+        cmd.append("--post_eval_only")
 
     for k, v in extra_kwargs.items():
         flag = f"--{k}"
