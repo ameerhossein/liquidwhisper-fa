@@ -15,6 +15,17 @@ import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 import wave
 
+from datasets import (
+    Audio,
+    Dataset,
+    DatasetDict,
+    concatenate_datasets,
+    interleave_datasets,
+    load_dataset,
+)
+
+from src.normalizer import PersianTextNormalizer
+
 logger = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
@@ -280,3 +291,218 @@ def split_custom_dataset(
     val_records = shuffled[train_count:]
 
     return train_records, val_records
+
+
+def sample_balanced_neyshekar(
+    neyshekar_ds: Optional[Dataset] = None,
+    sample_count: int = 1000,
+    seed: int = 42,
+) -> Dataset:
+    """Extract a 50/50 balanced replay buffer of formal and informal Persian utterances.
+
+    Uses `is_informal` or `informal` boolean column if available; falls back to
+    PersianTextNormalizer.is_colloquial(text).
+
+    Args:
+        neyshekar_ds: Hugging Face Dataset (defaults to 'shekar-ai/Neyshekar' train split).
+        sample_count: Total number of utterances to draw (~50% formal, ~50% informal).
+        seed: Random seed for deterministic sampling.
+
+    Returns:
+        Balanced Dataset containing sampled utterances.
+    """
+    if isinstance(neyshekar_ds, int):
+        sample_count = neyshekar_ds
+        neyshekar_ds = None
+
+    if neyshekar_ds is None:
+        neyshekar_ds = load_dataset("shekar-ai/Neyshekar", split="train")
+
+    if sample_count <= 0 or len(neyshekar_ds) == 0:
+        return neyshekar_ds.select([])
+
+    normalizer = PersianTextNormalizer()
+    target_each = sample_count // 2
+    rem = sample_count - (target_each * 2)
+    target_formal = target_each + rem
+    target_informal = target_each
+
+    formal_indices: List[int] = []
+    informal_indices: List[int] = []
+
+    has_is_informal = "is_informal" in getattr(neyshekar_ds, "column_names", [])
+    has_informal = "informal" in getattr(neyshekar_ds, "column_names", [])
+    has_text = "text" in getattr(neyshekar_ds, "column_names", [])
+
+    if has_is_informal or has_informal:
+        col_name = "is_informal" if has_is_informal else "informal"
+        flags = neyshekar_ds[col_name]
+        texts = neyshekar_ds["text"] if has_text else [None] * len(neyshekar_ds)
+        for idx, flag in enumerate(flags):
+            if flag is not None:
+                if bool(flag):
+                    informal_indices.append(idx)
+                else:
+                    formal_indices.append(idx)
+            else:
+                txt = texts[idx] or ""
+                if normalizer.is_colloquial(txt):
+                    informal_indices.append(idx)
+                else:
+                    formal_indices.append(idx)
+    else:
+        for idx in range(len(neyshekar_ds)):
+            row = neyshekar_ds[idx]
+            flag = row.get("is_informal") if "is_informal" in row else row.get("informal")
+            if flag is not None:
+                is_inf = bool(flag)
+            else:
+                is_inf = normalizer.is_colloquial(row.get("text", "") or "")
+            if is_inf:
+                informal_indices.append(idx)
+            else:
+                formal_indices.append(idx)
+
+    rng = random.Random(seed)
+    chosen_formal = rng.sample(formal_indices, min(target_formal, len(formal_indices))) if formal_indices else []
+    chosen_informal = rng.sample(informal_indices, min(target_informal, len(informal_indices))) if informal_indices else []
+
+    if len(chosen_formal) < target_formal and len(informal_indices) > len(chosen_informal):
+        needed = min(target_formal - len(chosen_formal), len(informal_indices) - len(chosen_informal))
+        avail = sorted(set(informal_indices) - set(chosen_informal))
+        chosen_informal.extend(rng.sample(avail, needed))
+    elif len(chosen_informal) < target_informal and len(formal_indices) > len(chosen_formal):
+        needed = min(target_informal - len(chosen_informal), len(formal_indices) - len(chosen_formal))
+        avail = sorted(set(formal_indices) - set(chosen_formal))
+        chosen_formal.extend(rng.sample(avail, needed))
+
+    selected = chosen_formal + chosen_informal
+    rng.shuffle(selected)
+    return neyshekar_ds.select(selected)
+
+
+def build_domain_dataset(
+    custom_path: Union[str, Path],
+    replay_samples: int = 1000,
+    replay_ratio: float = 0.25,
+    output_dir: Optional[Union[str, Path]] = None,
+    seed: int = 42,
+) -> DatasetDict:
+    """Build domain-adapted DatasetDict interleaving custom domain data with Neyshekar replay buffer.
+
+    Args:
+        custom_path: Directory containing custom audio files (or train/val subdirectories).
+        replay_samples: Number of balanced Neyshekar samples to draw for train replay (default: 1000).
+        replay_ratio: Proportion of replay samples in interleaved training set (default: 0.25).
+        output_dir: Optional path to save DatasetDict via save_to_disk.
+        seed: Random seed for deterministic partitioning and sampling.
+
+    Returns:
+        DatasetDict with 'train', 'validation', and 'test' splits.
+    """
+    custom_root = Path(custom_path)
+    train_dir = custom_root / "train"
+    val_dir = custom_root / "val"
+    if not val_dir.is_dir():
+        val_dir = custom_root / "validation"
+
+    if train_dir.is_dir() and val_dir.is_dir():
+        train_records = scan_custom_audio_dir(train_dir)
+        val_records = scan_custom_audio_dir(val_dir)
+    else:
+        records = scan_custom_audio_dir(custom_root)
+        train_records, val_records = split_custom_dataset(records, eval_ratio=0.15, seed=seed)
+
+    if not train_records and not val_records:
+        raise ValueError(f"No valid custom audio records found in: {custom_path}")
+
+    neyshekar_train = load_dataset("shekar-ai/Neyshekar", split="train")
+    neyshekar_val = load_dataset("shekar-ai/Neyshekar", split="validation")
+    neyshekar_test = load_dataset("shekar-ai/Neyshekar", split="test")
+
+    is_hf_audio = isinstance(getattr(neyshekar_train, "features", {}).get("audio"), Audio)
+    is_dict_audio = isinstance(getattr(neyshekar_train, "features", {}).get("audio"), dict)
+
+    def _format_records(recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        formatted = []
+        for r in recs:
+            item = dict(r)
+            raw_audio = item.get("audio")
+            if is_dict_audio:
+                if isinstance(raw_audio, str):
+                    item["audio"] = {"path": raw_audio}
+            elif isinstance(raw_audio, dict) and not is_hf_audio:
+                item["audio"] = raw_audio.get("path", "")
+            formatted.append(item)
+        return formatted
+
+    c_train_recs = _format_records(train_records)
+    c_val_recs = _format_records(val_records)
+
+    custom_train_ds = Dataset.from_list(c_train_recs) if c_train_recs else Dataset.from_list([])
+    custom_val_ds = Dataset.from_list(c_val_recs) if c_val_recs else Dataset.from_list([])
+
+    if is_hf_audio:
+        if len(custom_train_ds) > 0 and "audio" in custom_train_ds.column_names:
+            custom_train_ds = custom_train_ds.cast_column("audio", Audio(sampling_rate=16000))
+        if len(custom_val_ds) > 0 and "audio" in custom_val_ds.column_names:
+            custom_val_ds = custom_val_ds.cast_column("audio", Audio(sampling_rate=16000))
+
+    if replay_samples > 0 and len(neyshekar_train) > 0:
+        replay_train = sample_balanced_neyshekar(neyshekar_train, sample_count=replay_samples, seed=seed)
+    else:
+        replay_train = neyshekar_train.select([])
+
+    if len(custom_train_ds) > 0 and len(replay_train) > 0:
+        clamped_ratio = max(0.0, min(1.0, float(replay_ratio)))
+        probs = [1.0 - clamped_ratio, clamped_ratio]
+        train_ds = interleave_datasets(
+            [custom_train_ds, replay_train],
+            probabilities=probs,
+            seed=seed,
+            stopping_strategy="all_exhausted",
+        )
+    elif len(custom_train_ds) > 0:
+        train_ds = custom_train_ds
+    else:
+        train_ds = replay_train
+
+    val_replay_samples = int(round(replay_samples * 0.15))
+    if replay_samples > 0 and val_replay_samples == 0:
+        val_replay_samples = 1
+
+    if val_replay_samples > 0 and len(neyshekar_val) > 0:
+        sampled_val = sample_balanced_neyshekar(
+            neyshekar_val,
+            sample_count=min(val_replay_samples, len(neyshekar_val)),
+            seed=seed,
+        )
+        if len(custom_val_ds) > 0:
+            val_ds = concatenate_datasets([custom_val_ds, sampled_val])
+        else:
+            val_ds = sampled_val
+    else:
+        val_ds = custom_val_ds
+
+    test_ds = neyshekar_test
+
+    if is_hf_audio:
+        if "audio" in train_ds.column_names and not isinstance(train_ds.features["audio"], Audio):
+            train_ds = train_ds.cast_column("audio", Audio(sampling_rate=16000))
+        if "audio" in val_ds.column_names and not isinstance(val_ds.features["audio"], Audio):
+            val_ds = val_ds.cast_column("audio", Audio(sampling_rate=16000))
+        if "audio" in test_ds.column_names and not isinstance(test_ds.features["audio"], Audio):
+            test_ds = test_ds.cast_column("audio", Audio(sampling_rate=16000))
+
+    ds_dict = DatasetDict({
+        "train": train_ds,
+        "validation": val_ds,
+        "test": test_ds,
+    })
+
+    if output_dir is not None:
+        out_p = Path(output_dir)
+        out_p.mkdir(parents=True, exist_ok=True)
+        ds_dict.save_to_disk(str(out_p))
+
+    return ds_dict
