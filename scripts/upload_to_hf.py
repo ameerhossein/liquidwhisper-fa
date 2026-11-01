@@ -35,6 +35,7 @@ try:
 except Exception:
     pass
 
+from src.hf_sync import resolve_default_repo
 from src.paths import (
     find_complete_checkpoints,
     find_incomplete_checkpoints,
@@ -240,6 +241,7 @@ def derive_repo_ids(
     adapter_repo: Optional[str],
     checkpoints_repo: Optional[str],
     artifacts: List[str],
+    api: Optional[Any] = None,
 ) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if prefix:
@@ -255,10 +257,23 @@ def derive_repo_ids(
         out["best_adapter"] = adapter_repo.strip()
     if checkpoints_repo:
         out["checkpoint"] = checkpoints_repo.strip()
+
+    if any(a not in out or not out[a] for a in artifacts):
+        default_prefix = resolve_default_repo(api=api)
+        if default_prefix:
+            default_prefix = default_prefix.strip().strip("/")
+            if "merged" not in out or not out["merged"]:
+                out["merged"] = default_prefix
+            if "best_adapter" not in out or not out["best_adapter"]:
+                out["best_adapter"] = f"{default_prefix}-lora"
+            if "checkpoint" not in out or not out["checkpoint"]:
+                out["checkpoint"] = f"{default_prefix}-checkpoints"
+
     missing = [a for a in artifacts if a not in out or not out[a]]
     if missing:
         raise SystemExit(
-            f"Missing repo id for {missing}. Pass --repo-prefix <user>/<prefix> "
+            f"Missing repo id for {missing}. Authenticate with 'hf auth login' "
+            "(or set HF_TOKEN), or pass --repo-prefix <user>/<prefix> "
             "or explicit --merged-repo/--adapter-repo/--checkpoints-repo."
         )
     for k, v in out.items():
@@ -366,8 +381,21 @@ def main() -> None:
     results_dir = Path(resolve_results_dir(args.results_dir))
     adapter_path = Path(resolve_adapter_dir(str(output_dir), args.adapter_path))
     merged_path = Path(resolve_merged_dir(args.merged_path))
+
+    _require_hub()
+    from huggingface_hub import HfApi
+
+    token = args.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    api = HfApi(token=token)
+    try:
+        who = api.whoami()
+        print(f"Authenticated as: {who.get('name')}")
+    except Exception:
+        print("Warning: no valid HF auth found (export HF_TOKEN or run `hf auth login`). "
+              "Trying unauthenticated/cached credentials...")
+
     repo_ids = derive_repo_ids(args.repo_prefix, args.merged_repo, args.adapter_repo,
-                               args.checkpoints_repo, wanted)
+                               args.checkpoints_repo, wanted, api=api)
 
     # ---- gather + validate (no network yet)
     plan: Dict[str, dict] = {}
@@ -439,18 +467,6 @@ def main() -> None:
         return
     if failures:
         raise SystemExit(1)
-
-    _require_hub()
-    from huggingface_hub import HfApi
-
-    token = args.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    api = HfApi(token=token)
-    try:
-        who = api.whoami()
-        print(f"Authenticated as: {who.get('name')}")
-    except Exception:
-        print("Warning: no valid HF auth found (export HF_TOKEN or run `hf auth login`). "
-              "Trying unauthenticated/cached credentials...")
 
     base_msg = args.commit_message
 

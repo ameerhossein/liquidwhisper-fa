@@ -3,11 +3,12 @@
 import json
 import sys
 from pathlib import Path
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from scripts.upload_to_hf import build_model_card, load_metrics_summary
+from scripts.upload_to_hf import build_model_card, derive_repo_ids, load_metrics_summary
 
 
 def test_load_metrics_summary_omits_null_deltas(tmp_path):
@@ -63,3 +64,42 @@ def test_model_card_renders_present_deltas_in_pp():
     assert "clean -2.95 pp" in card
     assert "phone -4.10 pp" in card
     assert "None" not in card
+
+
+def test_derive_repo_ids_auto_resolves_when_prefix_omitted():
+    class FakeApi:
+        def whoami(self):
+            return {"name": "bob"}
+
+    repos = derive_repo_ids(
+        prefix=None,
+        merged_repo=None,
+        adapter_repo=None,
+        checkpoints_repo=None,
+        artifacts=["merged", "best_adapter", "checkpoint"],
+        api=FakeApi(),
+    )
+    assert repos == {
+        "merged": "bob/liquidwhisper-neyshekar",
+        "best_adapter": "bob/liquidwhisper-neyshekar-lora",
+        "checkpoint": "bob/liquidwhisper-neyshekar-checkpoints",
+    }
+
+
+def test_derive_repo_ids_raises_clear_error_when_unauthenticated_and_no_prefix():
+    class FakeApi:
+        def whoami(self):
+            raise RuntimeError("no token")
+
+    with pytest.raises(SystemExit) as exc_info:
+        derive_repo_ids(
+            prefix=None,
+            merged_repo=None,
+            adapter_repo=None,
+            checkpoints_repo=None,
+            artifacts=["merged", "best_adapter", "checkpoint"],
+            api=FakeApi(),
+        )
+    assert "Missing repo id" in str(exc_info.value)
+    assert "--repo-prefix" in str(exc_info.value)
+
