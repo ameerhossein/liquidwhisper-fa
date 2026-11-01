@@ -38,6 +38,7 @@ def client(tmp_path, monkeypatch):
     spec.loader.exec_module(mod)
 
     launched = []
+    launched_kwargs = []
 
     class _FakeProcess:
         pid = os.getpid()
@@ -47,13 +48,16 @@ def client(tmp_path, monkeypatch):
 
     def _fake_popen(cmd, **kwargs):
         launched.append(cmd)
+        launched_kwargs.append(kwargs)
         return _FakeProcess()
 
     monkeypatch.setattr(mod, "_check_audio_backend_or_400", lambda: None)
+    monkeypatch.setattr(mod, "_reset_smoke_repo", lambda repo_id: None)
     monkeypatch.setattr(mod.subprocess, "Popen", _fake_popen)
     client = TestClient(mod.app)
     client.mod = mod
     client.launched = launched
+    client.launched_kwargs = launched_kwargs
     try:
         yield client
     finally:
@@ -536,6 +540,34 @@ def test_smoke_command_includes_paired_mode(client):
     res = client.post("/api/train/smoke", json={})
     assert res.status_code == 200
     assert _flags(client.launched[0])["--telephony_mode"] == "paired"
+
+
+def test_smoke_start_resets_hf_repo_and_passes_flags(client, monkeypatch):
+    resets = []
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", lambda repo: resets.append(repo))
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 200, res.text
+    assert resets == [client.mod.SMOKE_DEFAULT_HF_REPO]
+    cmd = client.launched[0]
+    flags = _flags(cmd)
+    assert flags["--hf_run_repo"] == client.mod.SMOKE_DEFAULT_HF_REPO
+    assert flags["--hf_adapter_snapshot_steps"] == "5"
+    kwargs = client.launched_kwargs[0]
+    assert kwargs.get("env") is not None
+    assert str(client.mod._smoke_results_dir() / "runs") in kwargs["env"]["ASR_RUNS_DIR"]
+    assert res.json().get("hf_repo") == client.mod.SMOKE_DEFAULT_HF_REPO
+
+
+def test_smoke_start_fails_when_hf_reset_fails(client, monkeypatch):
+    def _fail_reset(repo):
+        raise RuntimeError("HF authentication failed")
+
+    monkeypatch.setattr(client.mod, "_reset_smoke_repo", _fail_reset)
+    res = client.post("/api/train/smoke", json={})
+    assert res.status_code == 500
+    assert "Could not reset Hugging Face smoke repo" in res.json()["detail"]
+    assert client.launched == []
+
 
 
 def test_smoke_start_rejects_unknown_telephony_mode(client):

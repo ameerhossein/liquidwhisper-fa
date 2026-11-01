@@ -127,6 +127,11 @@ HF_RESTORE_LOG_FILE = RUNS_DIR / "_hf_restore.log"
 last_exit_code: Optional[int] = None
 halt_requested = False
 SMOKE_DIR_NAME = "smoke-test"
+SMOKE_DEFAULT_HF_REPO = "shekar-ai/stt-smoke-test"
+SMOKE_HF_REPO = (
+    os.environ.get("ASR_SMOKE_HF_REPO", SMOKE_DEFAULT_HF_REPO).strip()
+    or SMOKE_DEFAULT_HF_REPO
+)
 smoke_process: Optional[subprocess.Popen] = None
 smoke_log_fd = None
 smoke_last_exit_code: Optional[int] = None
@@ -867,6 +872,10 @@ def _smoke_output_dir() -> str:
         detail="Smoke output would collide with the production output; "
                "set ASR_OUTPUT_DIR to a different directory.",
     )
+
+
+def _reset_smoke_repo(repo_id: str) -> None:
+    hf_sync.reset_repo(repo_id)
 
 
 def _smoke_results_dir() -> Path:
@@ -1879,6 +1888,7 @@ async def get_smoke_status():
         "exit_code": effective_exit,
         "output_dir": output_dir,
         "adapter_exists": adapter_exists,
+        "hf_repo": SMOKE_HF_REPO,
     }
     if reason:
         payload["reason"] = reason
@@ -2020,10 +2030,26 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     if len(dataset_name) > 128 or any(c in dataset_name for c in ";&|$` \n"):
         raise HTTPException(status_code=400, detail="Invalid dataset_name.")
 
+    target_repo = (
+        str(config.get("hf_repo", "")).strip()
+        or SMOKE_HF_REPO
+    )
+    try:
+        _reset_smoke_repo(target_repo)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not reset Hugging Face smoke repo '{target_repo}': {e}",
+        )
+
     output_dir = _smoke_output_dir()
     smoke_results_dir = _smoke_results_dir()
     smoke_results_dir.mkdir(parents=True, exist_ok=True)
     _abs_output_path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    smoke_runs_dir = smoke_results_dir / "runs"
+    shutil.rmtree(smoke_runs_dir, ignore_errors=True)
+    smoke_runs_dir.mkdir(parents=True, exist_ok=True)
 
     # A new attempt must never inherit a previous pass.
     adapter_dir = _abs_output_path(output_dir) / "best_adapter"
@@ -2069,6 +2095,8 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         "--fresh_start",
         "--no-auto_resume",
         "--gradient_checkpointing" if gradient_ckpt else "--no-gradient_checkpointing",
+        "--hf_run_repo", target_repo,
+        "--hf_adapter_snapshot_steps", "5",
     ]
 
     _close_smoke_log_fd()
@@ -2077,12 +2105,16 @@ async def start_smoke_test(config: Dict[str, Any] = None):
     smoke_log_fd.write(f"Command: {' '.join(cmd)}\n\n")
     smoke_log_fd.flush()
 
+    smoke_env = os.environ.copy()
+    smoke_env["ASR_RUNS_DIR"] = str(smoke_runs_dir)
+
     try:
         smoke_process = subprocess.Popen(
             cmd,
             stdout=smoke_log_fd,
             stderr=subprocess.STDOUT,
             cwd=str(BASE_DIR),
+            env=smoke_env,
             preexec_fn=os.setsid if sys.platform != "win32" else None,
         )
     except Exception as e:
@@ -2110,6 +2142,7 @@ async def start_smoke_test(config: Dict[str, Any] = None):
         "pid": smoke_process.pid,
         "output_dir": output_dir,
         "results_dir": str(smoke_results_dir),
+        "hf_repo": target_repo,
     }
 
 
