@@ -81,6 +81,59 @@ def test_build_domain_dataset_structure(tmp_path):
         assert (out_dir / "dataset_dict.json").exists()
 
 
+def test_build_domain_dataset_guarantees_audio_feature(tmp_path):
+    from src.domain_data import build_domain_dataset
+    from datasets import Audio
+
+    mock_records = [{"audio": f"custom_{i}.wav", "text": f"سفارشی {i}", "duration": 2.0} for i in range(20)]
+    mock_neyshekar = Dataset.from_list([
+        {"audio": {"path": f"n_{i}.wav"}, "text": f"متن {i}", "is_informal": (i % 2 == 0)} for i in range(20)
+    ])
+
+    with patch("src.domain_data.scan_custom_audio_dir", return_value=mock_records), \
+         patch("src.domain_data.load_dataset", return_value=mock_neyshekar):
+        ds_dict = build_domain_dataset(
+            custom_path=str(tmp_path / "custom"),
+            replay_samples=10,
+            replay_ratio=0.25,
+            seed=42,
+        )
+        for split_name in ("train", "validation", "test"):
+            audio_feat = ds_dict[split_name].features.get("audio")
+            assert isinstance(audio_feat, Audio), f"Split {split_name} audio is not Audio feature"
+            assert audio_feat.sampling_rate == 16000, f"Split {split_name} sampling rate is not 16000"
+
+
+def test_build_domain_dataset_boundary_ratios(tmp_path):
+    from src.domain_data import build_domain_dataset
+
+    mock_records = [{"audio": f"custom_{i}.wav", "text": f"سفارشی {i}", "duration": 2.0} for i in range(20)]
+    mock_neyshekar = Dataset.from_list([
+        {"audio": {"path": f"n_{i}.wav"}, "text": f"متن {i}", "is_informal": (i % 2 == 0)} for i in range(20)
+    ])
+
+    with patch("src.domain_data.scan_custom_audio_dir", return_value=mock_records), \
+         patch("src.domain_data.load_dataset", return_value=mock_neyshekar):
+        # replay_ratio = 0.0 -> pure custom train (17 samples)
+        ds_ratio_0 = build_domain_dataset(
+            custom_path=str(tmp_path / "custom"),
+            replay_samples=10,
+            replay_ratio=0.0,
+            seed=42,
+        )
+        assert len(ds_ratio_0["train"]) == 17
+
+        # replay_ratio = 1.0 -> pure replay train (10 samples)
+        ds_ratio_1 = build_domain_dataset(
+            custom_path=str(tmp_path / "custom"),
+            replay_samples=10,
+            replay_ratio=1.0,
+            seed=42,
+        )
+        assert len(ds_ratio_1["train"]) == 10
+
+
+
 def test_sample_balanced_neyshekar_pool_imbalance():
     from src.domain_data import sample_balanced_neyshekar
 
