@@ -153,24 +153,51 @@ class HFSyncConfig:
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_HF_REPO_NAME = "liquidwhisper-neyshekar"
+DISABLE_HF_VALUES = frozenset(("off", "none", "false", "0", "disabled", "no"))
+
+
+def resolve_default_repo(
+    api: Optional[Any] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Resolve the default Hugging Face repo if authenticated and not opted out."""
+    env = os.environ if environ is None else environ
+    env_repo = str(env.get("ASR_HF_RUN_REPO", "") or "").strip()
+    if env_repo:
+        if env_repo.lower() in DISABLE_HF_VALUES:
+            return None
+        validate_repo_id(env_repo)
+        return env_repo
+
+    user = get_authenticated_user(api)
+    if user:
+        return f"{user}/{DEFAULT_HF_REPO_NAME}"
+    return None
+
+
 def resolve_config(
     args: Any = None,
     environ: Mapping[str, str] | None = None,
 ) -> HFSyncConfig | None:
-    """Resolve the mirror config from CLI args, then the environment.
+    """Resolve the mirror config from CLI args, then the environment or authenticated user.
 
-    A CLI repo wins over ``ASR_HF_RUN_REPO``. With neither set the feature is
-    off and ``None`` is returned, so callers make no network calls.
+    A CLI repo wins over ``ASR_HF_RUN_REPO``. If no repo is provided, attempts to default
+    to ``<username>/liquidwhisper-neyshekar`` for authenticated users. Explicit opt-out
+    values ('off', 'none', 'false', '0') disable mirroring completely.
     """
     env = os.environ if environ is None else environ
 
     raw_repo = getattr(args, "hf_run_repo", None) if args is not None else None
-    repo_id = str(raw_repo).strip() if raw_repo else ""
-    if not repo_id:
-        repo_id = str(env.get("ASR_HF_RUN_REPO") or "").strip()
-    if not repo_id:
-        return None
-    validate_repo_id(repo_id)
+    repo_id = str(raw_repo).strip() if raw_repo is not None else ""
+    if repo_id:
+        if repo_id.lower() in DISABLE_HF_VALUES:
+            return None
+        validate_repo_id(repo_id)
+    else:
+        repo_id = resolve_default_repo(environ=env) or ""
+        if not repo_id:
+            return None
 
     raw_private = getattr(args, "hf_private", None) if args is not None else None
     private = True if raw_private is None else bool(raw_private)
@@ -648,6 +675,26 @@ def make_api() -> Any:
             "with `hf auth login` (or set HF_TOKEN)"
         ) from exc
     return HfApi()
+
+
+def get_authenticated_user(api: Optional[Any] = None) -> Optional[str]:
+    """Return the username of the authenticated Hugging Face user, or None if unauthenticated."""
+    if api is None:
+        try:
+            api = make_api()
+        except Exception:
+            return None
+    try:
+        whoami = getattr(api, "whoami", None)
+        if callable(whoami):
+            info = whoami()
+            if isinstance(info, dict):
+                name = str(info.get("name") or "").strip()
+                if name:
+                    return name
+    except Exception:
+        return None
+    return None
 
 
 def reset_repo(repo_id: str, api: Optional[Any] = None, private: bool = True) -> None:

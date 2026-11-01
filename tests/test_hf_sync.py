@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from src.hf_sync import (
+    DEFAULT_HF_REPO_NAME,
+    DISABLE_HF_VALUES,
     HFSyncConfig,
     HFCompletedRunError,
     HFRestoreError,
@@ -13,8 +15,10 @@ from src.hf_sync import (
     repo_checkpoint_path,
     repo_run_path,
     resolve_config,
+    resolve_default_repo,
     resolve_resume_run,
     reset_repo,
+    get_authenticated_user,
     select_checkpoint_step,
     validate_adapter,
     validate_merged,
@@ -343,4 +347,61 @@ def test_reset_repo_raises_when_fallback_delete_files_fails():
 def test_reset_repo_validates_repo_id():
     with pytest.raises(ValueError):
         reset_repo("invalid_repo_name")
+
+
+def test_get_authenticated_user_returns_username():
+    class FakeApi:
+        def whoami(self):
+            return {"type": "user", "name": "testuser", "email": "test@example.com"}
+
+    assert get_authenticated_user(FakeApi()) == "testuser"
+
+
+def test_get_authenticated_user_returns_none_on_error():
+    class FakeApi:
+        def whoami(self):
+            raise RuntimeError("LocalTokenNotFoundError")
+
+    assert get_authenticated_user(FakeApi()) is None
+    assert get_authenticated_user(object()) is None
+
+
+def test_resolve_default_repo_returns_authenticated_user_repo(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "alice")
+    assert resolve_default_repo(environ={}) == f"alice/{DEFAULT_HF_REPO_NAME}"
+
+
+def test_resolve_default_repo_returns_none_when_unauthenticated(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: None)
+    assert resolve_default_repo(environ={}) is None
+
+
+def test_resolve_default_repo_honors_explicit_env():
+    assert resolve_default_repo(environ={"ASR_HF_RUN_REPO": "myorg/custom-repo"}) == "myorg/custom-repo"
+
+
+def test_resolve_default_repo_honors_opt_out_env(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "alice")
+    for val in ("off", "none", "false", "0", "disabled", "no"):
+        assert resolve_default_repo(environ={"ASR_HF_RUN_REPO": val}) is None
+
+
+def test_resolve_config_defaults_to_authenticated_user_repo(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "alice")
+    cfg = resolve_config(SimpleNamespace(hf_run_repo=None), environ={})
+    assert cfg is not None
+    assert cfg.repo_id == f"alice/{DEFAULT_HF_REPO_NAME}"
+
+
+def test_resolve_config_is_off_when_unauthenticated_and_no_repo(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: None)
+    assert resolve_config(SimpleNamespace(hf_run_repo=None), environ={}) is None
+
+
+def test_resolve_config_honors_cli_opt_out(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "alice")
+    assert resolve_config(SimpleNamespace(hf_run_repo="off"), environ={}) is None
+    assert resolve_config(SimpleNamespace(hf_run_repo="none"), environ={}) is None
+
+
 
