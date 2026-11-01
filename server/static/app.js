@@ -67,6 +67,11 @@ const el = {
   inputGradCheckpoint: document.getElementById("inputGradCheckpoint"),
   inputEvalSteps: document.getElementById("inputEvalSteps"),
   inputLearningRate: document.getElementById("inputLearningRate"),
+  chkDomainAdaptation: document.getElementById("chkDomainAdaptation"),
+  domainSection: document.getElementById("domainSection"),
+  inputCustomDataPath: document.getElementById("inputCustomDataPath"),
+  inputMergedModelPath: document.getElementById("inputMergedModelPath"),
+  inputReplaySamples: document.getElementById("inputReplaySamples"),
   benchmarkTbody: document.getElementById("benchmarkTbody"),
   benchmarkSubtitle: document.getElementById("benchmarkSubtitle"),
   benchmarkSummary: document.getElementById("benchmarkSummary"),
@@ -1769,19 +1774,26 @@ async function startRun(freshStart) {
   el.btnStart.disabled = true;
   el.btnFresh.disabled = true;
   try {
+    const payload = {
+      epochs: parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS,
+      telephony_mode: el.inputTelephonyMode ? el.inputTelephonyMode.value : "paired",
+      batch_size: parseInt(el.inputBatchSize.value, 10) || 8,
+      grad_accum: parseInt(el.inputGradAccum.value, 10) || 4,
+      gradient_checkpointing: el.inputGradCheckpoint.value === "on",
+      eval_steps: parseInt(el.inputEvalSteps.value, 10) || 1000,
+      learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
+      fresh_start: freshStart,
+    };
+    if (el.chkDomainAdaptation && el.chkDomainAdaptation.checked) {
+      payload.domain_adaptation = true;
+      payload.custom_data_path = el.inputCustomDataPath ? el.inputCustomDataPath.value : "";
+      payload.base_model = el.inputMergedModelPath ? el.inputMergedModelPath.value : "";
+      payload.replay_samples = parseInt(el.inputReplaySamples.value, 10) || 1000;
+    }
     const res = await fetch("/api/train/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        epochs: parseInt(el.inputEpochs.value, 10) || DEFAULT_EPOCHS,
-        telephony_mode: el.inputTelephonyMode ? el.inputTelephonyMode.value : "paired",
-        batch_size: parseInt(el.inputBatchSize.value, 10) || 8,
-        grad_accum: parseInt(el.inputGradAccum.value, 10) || 4,
-        gradient_checkpointing: el.inputGradCheckpoint.value === "on",
-        eval_steps: parseInt(el.inputEvalSteps.value, 10) || 1000,
-        learning_rate: parseFloat(el.inputLearningRate.value) || 1e-4,
-        fresh_start: freshStart,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       alert(`Start failed: ${await errorDetail(res)}`);
@@ -1807,6 +1819,19 @@ if (el.runSelect) {
 if (el.inputTelephonyMode) {
   el.inputTelephonyMode.addEventListener("change", () => {
     el.inputEpochs.value = epochsForTelephonyMode(el.inputTelephonyMode.value);
+  });
+}
+if (el.chkDomainAdaptation) {
+  el.chkDomainAdaptation.addEventListener("change", () => {
+    const isDomain = el.chkDomainAdaptation.checked;
+    if (el.domainSection) el.domainSection.hidden = !isDomain;
+    if (isDomain) {
+      if (el.inputLearningRate) el.inputLearningRate.value = "0.00002";
+      if (el.inputEpochs) el.inputEpochs.value = "3";
+    } else {
+      if (el.inputLearningRate) el.inputLearningRate.value = "0.0001";
+      if (el.inputEpochs) el.inputEpochs.value = "2";
+    }
   });
 }
 if (el.btnResume) el.btnResume.addEventListener("click", resumeRun);

@@ -622,6 +622,47 @@ th {
   box-shadow: 0 0 0 3px var(--firoozeh-wash);
 }
 
+.domain-config-toggle {
+  display: flex;
+  align-items: center;
+  height: 36px;
+}
+
+.field-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink-2);
+  user-select: none;
+}
+
+.field-checkbox input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--firoozeh);
+}
+
+.domain-section {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--gap-md) var(--gap-lg);
+  padding: var(--gap-sm) var(--gap-md);
+  background: var(--paper-soft);
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius);
+}
+
+.domain-section[hidden] {
+  display: none !important;
+}
+
+.domain-section .field-input[type="text"] {
+  width: 280px;
+}
+
 .config-actions {
   margin-left: auto;
   display: flex;

@@ -147,6 +147,26 @@
           <span class="field-label">Learning rate</span>
           <input type="text" id="inputLearningRate" class="field-input" value="0.0001">
         </label>
+        <div class="domain-config-toggle">
+          <label class="field-checkbox">
+            <input type="checkbox" id="chkDomainAdaptation">
+            <span class="field-label-inline">Domain Adaptation (2–3h custom data)</span>
+          </label>
+        </div>
+        <div id="domainSection" class="domain-section" hidden>
+          <label class="field">
+            <span class="field-label">Custom audio path (on disk)</span>
+            <input type="text" id="inputCustomDataPath" class="field-input" placeholder="/path/to/custom_audio">
+          </label>
+          <label class="field">
+            <span class="field-label">Merged base model path</span>
+            <input type="text" id="inputMergedModelPath" class="field-input" value="models/buzzasr-neyshekar-standalone">
+          </label>
+          <label class="field">
+            <span class="field-label">Replay samples (Neyshekar)</span>
+            <input type="number" id="inputReplaySamples" class="field-input" value="1000" min="100" max="5000">
+          </label>
+        </div>
         <div class="config-actions">
           <button id="btnResume" type="button" class="btn btn-fresh" hidden>Resume run</button>
           <button id="btnMerge" type="button" class="btn btn-fresh" hidden>Merge adapter</button>
