@@ -27,10 +27,11 @@ try:
 except Exception:
     pass
 try:
-    from datasets import load_dataset, Audio, DatasetDict, Dataset, concatenate_datasets
+    from datasets import load_dataset, load_from_disk, Audio, DatasetDict, Dataset, concatenate_datasets
     _DATASETS_AVAILABLE = True
 except ImportError:
     load_dataset = None  # type: ignore
+    load_from_disk = None  # type: ignore
     Audio = None  # type: ignore
     DatasetDict = dict  # type: ignore
     Dataset = object  # type: ignore
@@ -303,15 +304,28 @@ class PersianASRDataPipeline:
             os.makedirs(_cache_dir, exist_ok=True)
         except Exception:
             _cache_dir = None
-        print(f"Loading dataset '{self.dataset_name}' (split={split})...")
-        _ld_kwargs: Dict[str, Any] = {}
-        if _cache_dir:
-            _ld_kwargs["cache_dir"] = _cache_dir
-        try:
-            ds = load_dataset(self.dataset_name, split=split, **_ld_kwargs)
-        except Exception as e:
-            print(f"Error loading {self.dataset_name}: {e}. Retrying with trust_remote_code=True...")
-            ds = load_dataset(self.dataset_name, split=split, trust_remote_code=True, **_ld_kwargs)
+        if os.path.isdir(self.dataset_name):
+            print(f"Loading local dataset from disk: '{self.dataset_name}' (split={split})...")
+            if not _DATASETS_AVAILABLE or load_from_disk is None:
+                raise ImportError("datasets package not installed; cannot load disk dataset.")
+            ds_loaded = load_from_disk(self.dataset_name)
+            if split:
+                if isinstance(ds_loaded, (DatasetDict, dict)):
+                    ds = ds_loaded[split]
+                else:
+                    ds = ds_loaded
+            else:
+                ds = ds_loaded
+        else:
+            print(f"Loading dataset '{self.dataset_name}' (split={split})...")
+            _ld_kwargs: Dict[str, Any] = {}
+            if _cache_dir:
+                _ld_kwargs["cache_dir"] = _cache_dir
+            try:
+                ds = load_dataset(self.dataset_name, split=split, **_ld_kwargs)
+            except Exception as e:
+                print(f"Error loading {self.dataset_name}: {e}. Retrying with trust_remote_code=True...")
+                ds = load_dataset(self.dataset_name, split=split, trust_remote_code=True, **_ld_kwargs)
 
         if max_samples and max_samples > 0:
             if isinstance(ds, (DatasetDict, dict)):
