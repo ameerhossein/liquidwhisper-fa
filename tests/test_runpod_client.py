@@ -15,6 +15,7 @@ def test_resolve_runpod_key_env(monkeypatch):
 
 def test_resolve_runpod_key_missing(monkeypatch, tmp_path):
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
     with pytest.raises(RuntimeError, match="RUNPOD_API_KEY is not set"):
         resolve_runpod_key(config_file=tmp_path / "empty.toml")
 
@@ -76,6 +77,13 @@ def test_check_l40s_availability_in_stock():
         assert dc_id == "US-NV-1"
         assert len(dcs) == 1
 
+    # Also test dictionary response wrapper {"gpus": [...]}
+    with patch.object(client, "_request", return_value={"gpus": mock_catalog}):
+        avail, dc_id, dcs = client.check_l40s_availability()
+        assert avail is True
+        assert dc_id == "US-NV-1"
+        assert len(dcs) == 1
+
 
 def test_check_l40s_availability_out_of_stock():
     client = RunPodClient(api_key="mock_key")
@@ -119,4 +127,4 @@ def test_create_pod_payload():
         assert "7860/http" in payload["ports"]
         assert "8080/http" in payload["ports"]
         assert "22/tcp" in payload["ports"]
-        assert payload["dataCenterId"] == "US-NV-1"
+        assert "dataCenterId" not in payload

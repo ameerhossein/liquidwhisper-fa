@@ -182,6 +182,7 @@ class RunPodClient:
         req.add_header("Authorization", f"Bearer {self.api_key}")
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -191,6 +192,13 @@ class RunPodClient:
                 return json.loads(resp_bytes.decode("utf-8"))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
+            if "Cloudflare" in err_body or "cf-error-details" in err_body:
+                raise RuntimeError(
+                    f"RunPod API blocked by Cloudflare (HTTP {e.code} {e.reason}).\n"
+                    "Your IP address or network route is being blocked by Cloudflare bot protection.\n"
+                    "Remediation: Configure an HTTP/HTTPS proxy in your terminal (e.g., export https_proxy=http://127.0.0.1:port) "
+                    "or VPN, or create the pod manually in the RunPod web console."
+                ) from e
             try:
                 err_json = json.loads(err_body)
                 msg = err_json.get("error") or err_json.get("message") or err_body
@@ -208,13 +216,22 @@ class RunPodClient:
 
         Returns (is_available, best_datacenter_id, available_datacenters).
         """
-        catalog = self._request(
+        resp = self._request(
             "GET",
             "catalog/gpus",
             params={"include": "AVAILABILITY", "product": "POD"},
         )
+        if isinstance(resp, dict):
+            catalog = resp.get("gpus", [])
+        elif isinstance(resp, list):
+            catalog = resp
+        else:
+            raise RuntimeError(f"Unexpected catalog response type from RunPod API: {type(resp).__name__} ({resp})")
+
         l40s_info = None
         for item in catalog:
+            if not isinstance(item, dict):
+                continue
             if item.get("id") == "NVIDIA L40S":
                 l40s_info = item
                 break
@@ -274,8 +291,8 @@ class RunPodClient:
             ],
             "env": env_map,
         }
-        if data_center_id:
-            payload["dataCenterId"] = data_center_id
+        # RunPod v2 REST API does not allow 'dataCenterId' at the root level;
+        # the scheduler places the pod in an available datacenter for the requested cloud & GPU.
 
         return self._request("POST", "pods", data=payload)
 

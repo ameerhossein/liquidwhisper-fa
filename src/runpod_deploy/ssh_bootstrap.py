@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -25,11 +26,24 @@ def resolve_ssh_connection(pod_data: Dict[str, Any]) -> SSHConnectionInfo:
     runtime = pod_data.get("runtime") or {}
     ports = runtime.get("ports") or []
 
-    # 1. Direct TCP port mapped for container port 22
+    # 1. Direct TCP port mapped for container port 22 in runtime.ports
     for p in ports:
-        if p.get("privatePort") == 22 and p.get("publicPort") and p.get("ip"):
+        if isinstance(p, dict) and p.get("privatePort") == 22 and p.get("publicPort") and (p.get("ip") or runtime.get("ip")):
+            host = p.get("ip") or runtime.get("ip")
             return SSHConnectionInfo(
-                host=str(p["ip"]),
+                host=str(host),
+                port=int(p["publicPort"]),
+                user="root",
+                is_proxy=False,
+            )
+
+    # 1b. Check root ports list
+    root_ports = pod_data.get("ports") or []
+    for p in root_ports:
+        if isinstance(p, dict) and p.get("privatePort") == 22 and p.get("publicPort") and (p.get("ip") or pod_data.get("ip")):
+            host = p.get("ip") or pod_data.get("ip")
+            return SSHConnectionInfo(
+                host=str(host),
                 port=int(p["publicPort"]),
                 user="root",
                 is_proxy=False,
@@ -38,13 +52,15 @@ def resolve_ssh_connection(pod_data: Dict[str, Any]) -> SSHConnectionInfo:
     # 2. Proxy Gateway info
     ssh_block = pod_data.get("ssh") or {}
     proxy_info = ssh_block.get("proxy")
-    if proxy_info and proxy_info.get("host") and proxy_info.get("user"):
-        return SSHConnectionInfo(
-            host=str(proxy_info["host"]),
-            port=int(proxy_info.get("port", 22)),
-            user=str(proxy_info["user"]),
-            is_proxy=True,
-        )
+    if proxy_info and proxy_info.get("host"):
+        user = proxy_info.get("username") or proxy_info.get("user")
+        if user:
+            return SSHConnectionInfo(
+                host=str(proxy_info["host"]),
+                port=int(proxy_info.get("port", 22)),
+                user=str(user),
+                is_proxy=True,
+            )
 
     # 3. Direct SSH block info
     direct_info = ssh_block.get("direct")
@@ -54,6 +70,28 @@ def resolve_ssh_connection(pod_data: Dict[str, Any]) -> SSHConnectionInfo:
             port=int(direct_info["port"]),
             user=str(direct_info.get("user", "root")),
             is_proxy=False,
+        )
+
+    # 4. Fallback for RunPod ssh command string / ssh.command
+    ssh_cmd = pod_data.get("sshCommand") or ssh_block.get("command") or ""
+    if ssh_cmd and "@" in ssh_cmd:
+        # e.g. "ssh user@host -p 1234" or "ssh user@ssh.runpod.io"
+        parts = ssh_cmd.split()
+        target = [pt for pt in parts if "@" in pt][0]
+        user, host = target.split("@", 1)
+        port = 22
+        if "-p" in parts:
+            p_idx = parts.index("-p")
+            if p_idx + 1 < len(parts):
+                try:
+                    port = int(parts[p_idx + 1])
+                except ValueError:
+                    pass
+        return SSHConnectionInfo(
+            host=host,
+            port=port,
+            user=user,
+            is_proxy=("runpod.io" in host),
         )
 
     pod_id = pod_data.get("id", "unknown")
@@ -76,6 +114,10 @@ def build_ssh_command(
         "-o", "ConnectTimeout=10",
         "-p", str(conn.port),
     ]
+    # RunPod proxy gateway (ssh.runpod.io) enforces PTY allocation
+    if conn.is_proxy:
+        cmd.append("-tt")
+
     if identity_file:
         cmd.extend(["-i", identity_file])
 
@@ -214,11 +256,18 @@ class SSHExecutor:
     ) -> bool:
         """Poll SSH port until SSH accepts a command."""
         deadline = time.time() + timeout_sec
+        last_out = ""
         while time.time() < deadline:
-            rc, _ = cls.run_command(conn, "true", identity_file=identity_file, timeout=8)
+            rc, out = cls.run_command(conn, "true", identity_file=identity_file, timeout=10)
             if rc == 0:
                 return True
+            last_out = out.strip()
+            # If the proxy is rejecting due to something specific, show brief status
+            sys.stdout.write(".")
+            sys.stdout.flush()
             time.sleep(poll_interval)
+        if last_out:
+            print(f"\nLast SSH response: {last_out}", file=sys.stderr)
         return False
 
     @classmethod

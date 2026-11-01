@@ -233,17 +233,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             try:
                 pod_data = client.get_pod(pod_id)
                 desired = pod_data.get("desiredStatus", "").upper()
-                runtime = pod_data.get("runtimeStatus", "").lower()
+                runtime = (pod_data.get("runtimeStatus") or pod_data.get("status") or "").lower()
 
-                if desired == "RUNNING" and runtime == "running":
+                # Print periodic progress dots / status info
+                sys.stdout.write(f"\rWaiting for container initialization... status={desired}/{runtime or 'initializing'} ")
+                sys.stdout.flush()
+
+                if (desired == "RUNNING" or not desired) and runtime == "running":
                     try:
                         conn = rp_ssh.resolve_ssh_connection(pod_data)
-                        print(f"Container is running! SSH endpoint: {conn.user}@{conn.host}:{conn.port} (proxy={conn.is_proxy})")
+                        print(f"\nContainer is running! SSH endpoint: {conn.user}@{conn.host}:{conn.port} (proxy={conn.is_proxy})")
                         break
                     except Exception:
                         pass
             except Exception as e:
-                print(f"Note: waiting for pod status ({e})...")
+                print(f"\nNote: waiting for pod status ({e})...")
 
             time.sleep(5)
 

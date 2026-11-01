@@ -26,6 +26,7 @@ def test_resolve_ssh_connection_direct():
 
 
 def test_resolve_ssh_connection_proxy():
+    # Test RunPod proxy with username key
     pod_data = {
         "id": "pod_xyz123",
         "runtime": {
@@ -35,7 +36,7 @@ def test_resolve_ssh_connection_proxy():
             "proxy": {
                 "host": "ssh.runpod.io",
                 "port": 22,
-                "user": "pod_xyz123-root",
+                "username": "pod_xyz123-root",
             }
         },
     }
