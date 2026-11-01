@@ -345,7 +345,7 @@ def _default_prep_cache_dir(output_dir: str) -> str:
 def _label_format(base_model: str):
     """(prefix_ids, eos_id) for training labels, or (None, None) for tokenizer labels."""
     gen_cfg_path = None
-    if os.path.isdir(base_model):
+    if base_model and os.path.isdir(base_model):
         candidate = os.path.join(base_model, "generation_config.json")
         if os.path.exists(candidate):
             gen_cfg_path = candidate
