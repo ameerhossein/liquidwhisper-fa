@@ -1399,3 +1399,9 @@ def test_plain_cli_post_eval_halt_writes_stopped_telemetry(tmp_path):
         (results_dir / "live_telemetry.json").read_text(encoding="utf-8")
     )
     assert telemetry["status"] == "stopped"
+
+
+def test_run_training_stages_does_not_shadow_evaluate():
+    train_lora = _train_lora()
+    assert "evaluate" not in train_lora._run_training_stages.__code__.co_varnames
+    assert "evaluate" not in train_lora._run_post_eval_only.__code__.co_varnames

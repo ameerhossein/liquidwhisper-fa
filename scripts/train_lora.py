@@ -1460,7 +1460,7 @@ def _run_post_eval_only(args) -> None:
 
     _mark_run_status(run_dir, "running")
 
-    def evaluate() -> None:
+    def post_eval() -> None:
         print(f"Post-eval-only: loading processor from {adapter_path}...")
         processor = WhisperProcessor.from_pretrained(str(adapter_path))
         normalizer = PersianTextNormalizer()
@@ -1508,7 +1508,7 @@ def _run_post_eval_only(args) -> None:
     if not _run_post_eval_stage(
         run_dir=run_dir,
         results_dir=results_dir,
-        evaluate=evaluate,
+        evaluate=post_eval,
         detail="post-eval only",
     ):
         return
@@ -2094,7 +2094,7 @@ def _run_training_stages(args, run_dir, mirror):
         print(" Running Post-Training Full Benchmark on Complete Test Set...")
         print("=======================================================")
 
-        def evaluate() -> None:
+        def post_eval() -> None:
             _run_post_training_evaluation(
                 model=trainer.model,
                 processor=processor,
@@ -2116,7 +2116,7 @@ def _run_training_stages(args, run_dir, mirror):
         if not _run_post_eval_stage(
             run_dir=run_dir,
             results_dir=args.results_dir,
-            evaluate=evaluate,
+            evaluate=post_eval,
         ):
             return
         if mirror is not None:
