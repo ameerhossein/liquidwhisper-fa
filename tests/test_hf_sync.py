@@ -14,6 +14,7 @@ from src.hf_sync import (
     repo_run_path,
     resolve_config,
     resolve_resume_run,
+    reset_repo,
     select_checkpoint_step,
     validate_adapter,
     validate_merged,
@@ -273,3 +274,53 @@ def test_resolve_explicit_missing_run_raises_restore_error():
             RUN,
             download=lambda repo, path: pytest.fail("missing run must not download"),
         )
+
+
+def test_reset_repo_deletes_and_creates_repo():
+    calls = []
+
+    class FakeApi:
+        def delete_repo(self, repo_id, repo_type="model", missing_ok=False):
+            calls.append(("delete_repo", repo_id, repo_type, missing_ok))
+
+        def create_repo(self, repo_id, repo_type="model", private=True, exist_ok=False):
+            calls.append(("create_repo", repo_id, repo_type, private, exist_ok))
+
+    api = FakeApi()
+    reset_repo("me/smoke-test", api=api, private=True)
+
+    assert ("delete_repo", "me/smoke-test", "model", True) in calls
+    assert ("create_repo", "me/smoke-test", "model", True, True) in calls
+
+
+def test_reset_repo_falls_back_to_delete_files_on_permission_error():
+    calls = []
+
+    class FakeApi:
+        def delete_repo(self, repo_id, repo_type="model", missing_ok=False):
+            calls.append(("delete_repo", repo_id))
+            raise RuntimeError("403 Forbidden: delete_repo not allowed")
+
+        def list_repo_files(self, repo_id, revision="main"):
+            calls.append(("list_repo_files", repo_id))
+            return [".gitattributes", "runs/run1/adapter.bin", "README.md"]
+
+        def delete_files(self, repo_id, delete_patterns, commit_message=None):
+            calls.append(("delete_files", repo_id, delete_patterns, commit_message))
+
+        def create_repo(self, repo_id, repo_type="model", private=True, exist_ok=False):
+            calls.append(("create_repo", repo_id, repo_type, private, exist_ok))
+
+    api = FakeApi()
+    reset_repo("me/smoke-test", api=api)
+
+    assert ("delete_repo", "me/smoke-test") in calls
+    assert ("list_repo_files", "me/smoke-test") in calls
+    assert ("delete_files", "me/smoke-test", ["runs/run1/adapter.bin", "README.md"], "Reset smoke test repository") in calls
+    assert ("create_repo", "me/smoke-test", "model", True, True) in calls
+
+
+def test_reset_repo_validates_repo_id():
+    with pytest.raises(ValueError):
+        reset_repo("invalid_repo_name")
+

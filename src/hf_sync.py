@@ -650,6 +650,47 @@ def make_api() -> Any:
     return HfApi()
 
 
+def reset_repo(repo_id: str, api: Optional[Any] = None, private: bool = True) -> None:
+    """Reset a Hugging Face repository so it starts completely fresh.
+
+    Attempts to delete and re-create the repository. If deletion is not permitted
+    or fails, deletes all files in the repository.
+    """
+    validate_repo_id(repo_id)
+    if api is None:
+        api = make_api()
+
+    deleted = False
+    delete_repo = getattr(api, "delete_repo", None)
+    if callable(delete_repo):
+        try:
+            delete_repo(repo_id=repo_id, repo_type="model", missing_ok=True)
+            deleted = True
+        except Exception:
+            pass
+
+    if not deleted:
+        list_files = getattr(api, "list_repo_files", None)
+        delete_files = getattr(api, "delete_files", None)
+        if callable(list_files) and callable(delete_files):
+            try:
+                files = list_files(repo_id=repo_id)
+                deletable = [f for f in files if f not in (".gitattributes",)]
+                if deletable:
+                    delete_files(
+                        repo_id=repo_id,
+                        delete_patterns=deletable,
+                        commit_message="Reset smoke test repository",
+                    )
+            except Exception:
+                pass
+
+    create_repo = getattr(api, "create_repo", None)
+    if callable(create_repo):
+        create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+
+
+
 def _payload_bytes(raw: Any, remote_path: str) -> bytes:
     """Normalize a downloader result to bytes."""
     if isinstance(raw, (bytes, bytearray)):
