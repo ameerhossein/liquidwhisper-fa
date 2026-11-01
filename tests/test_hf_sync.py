@@ -404,4 +404,10 @@ def test_resolve_config_honors_cli_opt_out(monkeypatch):
     assert resolve_config(SimpleNamespace(hf_run_repo="none"), environ={}) is None
 
 
+def test_resolve_config_honors_no_hf_sync(monkeypatch):
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "alice")
+    assert resolve_config(SimpleNamespace(no_hf_sync=True, hf_run_repo=None), environ={}) is None
+    assert resolve_config(SimpleNamespace(no_hf_sync=True, hf_run_repo="my/repo"), environ={}) is None
+
+
 

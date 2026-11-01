@@ -170,3 +170,37 @@ def test_merge_upload_is_skipped_without_run_dir_or_repo(tmp_path, monkeypatch):
     merge_lora._upload_merged_to_hf(_args(tmp_path, repo=""))
 
     assert created == []
+
+
+def test_merge_upload_auto_resolves_default_repo_when_authenticated(tmp_path, monkeypatch):
+    merge_lora = _merge_lora()
+    from src import hf_sync
+
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr(hf_sync, "get_authenticated_user", lambda api=None: "alice")
+    _RecordingMirror.instances.clear()
+    monkeypatch.setattr(hf_sync, "HFRunMirror", _RecordingMirror)
+
+    args = _args(tmp_path, repo=None)
+    merge_lora._upload_merged_to_hf(args)
+
+    assert len(_RecordingMirror.instances) == 1
+    assert _RecordingMirror.instances[0].config.repo_id == "alice/liquidwhisper-neyshekar"
+
+
+def test_merge_upload_honors_opt_out(tmp_path, monkeypatch):
+    merge_lora = _merge_lora()
+    from src import hf_sync
+
+    monkeypatch.setattr(hf_sync, "get_authenticated_user", lambda api=None: "alice")
+    created = []
+    monkeypatch.setattr(hf_sync, "HFRunMirror", lambda *args, **kwargs: created.append(1))
+
+    args = _args(tmp_path, repo="off")
+    merge_lora._upload_merged_to_hf(args)
+
+    args_no_sync = _args(tmp_path, repo="alice/liquidwhisper-neyshekar")
+    args_no_sync.no_hf_sync = True
+    merge_lora._upload_merged_to_hf(args_no_sync)
+
+    assert created == []

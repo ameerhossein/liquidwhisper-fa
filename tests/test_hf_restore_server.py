@@ -56,6 +56,7 @@ def test_hf_config_returns_default_repo_when_authenticated(client, monkeypatch):
     monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
     monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
     data = client.get("/api/hf/config").json()
+    assert data["enabled"] is True
     assert data["repo_id"] == "carol/liquidwhisper-neyshekar"
 
 

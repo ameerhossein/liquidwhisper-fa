@@ -2723,10 +2723,15 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
     hf_repo_val = config.get("hf_run_repo")
     if hf_repo_val is not None:
         hf_repo_str = str(hf_repo_val).strip()
-        if hf_repo_str.lower() in hf_sync.DISABLE_HF_VALUES:
+        if not hf_repo_str:
+            resolved_hf_repo = hf_sync.resolve_default_repo()
+        elif hf_repo_str.lower() in hf_sync.DISABLE_HF_VALUES:
             resolved_hf_repo = None
         else:
-            hf_sync.validate_repo_id(hf_repo_str)
+            try:
+                hf_sync.validate_repo_id(hf_repo_str)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
             resolved_hf_repo = hf_repo_str
     else:
         resolved_hf_repo = hf_sync.resolve_default_repo()

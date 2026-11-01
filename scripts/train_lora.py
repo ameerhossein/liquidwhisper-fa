@@ -110,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Hugging Face run mirror (off unless a repo id is configured).
     parser.add_argument("--hf_run_repo", "--hf-run-repo", type=str, default=None, help="Hugging Face repo id (<owner>/<name>) used to mirror this run. Env ASR_HF_RUN_REPO also works; unset disables mirroring.")
+    parser.add_argument("--no_hf_sync", "--no-hf-sync", action="store_true", help="Disable Hugging Face mirroring completely even if authenticated or ASR_HF_RUN_REPO is set.")
     parser.add_argument("--hf_private", "--hf-private", action=argparse.BooleanOptionalAction, default=True, help="Create the mirror repo private (default).")
     parser.add_argument("--hf_adapter_snapshot_steps", "--hf-adapter-snapshot-steps", type=int, default=250, help="Upload an adapter-only snapshot every N steps; 0 disables snapshots.")
     parser.add_argument("--hf_auto_resume", "--hf-auto-resume", action=argparse.BooleanOptionalAction, default=True, help="Pull a newer remote checkpoint before resuming (ignored with --fresh_start).")

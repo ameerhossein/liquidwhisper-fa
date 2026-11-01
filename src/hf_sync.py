@@ -188,6 +188,9 @@ def resolve_config(
     """
     env = os.environ if environ is None else environ
 
+    if args is not None and getattr(args, "no_hf_sync", False):
+        return None
+
     raw_repo = getattr(args, "hf_run_repo", None) if args is not None else None
     repo_id = str(raw_repo).strip() if raw_repo is not None else ""
     if repo_id:

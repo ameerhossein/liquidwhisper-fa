@@ -1909,6 +1909,31 @@ def test_start_run_passes_default_hf_repo_when_authenticated(client, monkeypatch
     assert _flag_value(cmd, "--hf_run_repo") == "carol/liquidwhisper-neyshekar"
 
 
+def test_start_run_handles_empty_hf_run_repo_gracefully(client, monkeypatch):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
+    start = client.post("/api/train/start", json={"hf_run_repo": ""}).json()
+    assert start["status"] == "started"
+    cmd = client.launched[-1]
+    assert _flag_value(cmd, "--hf_run_repo") == "carol/liquidwhisper-neyshekar"
+
+
+@pytest.mark.parametrize("opt_out", ["off", "none", "false", "0"])
+def test_start_run_respects_opt_out_hf_run_repo(client, monkeypatch, opt_out):
+    monkeypatch.delenv("ASR_HF_RUN_REPO", raising=False)
+    monkeypatch.setattr("src.hf_sync.get_authenticated_user", lambda api=None: "carol")
+    start = client.post("/api/train/start", json={"hf_run_repo": opt_out}).json()
+    assert start["status"] == "started"
+    cmd = client.launched[-1]
+    assert "--hf_run_repo" not in cmd
+
+
+def test_start_run_rejects_invalid_hf_run_repo_with_400(client):
+    res = client.post("/api/train/start", json={"hf_run_repo": "invalidrepo"})
+    assert res.status_code == 400
+    assert "invalid Hugging Face repo id" in res.text
+
+
 def test_merge_command_prefers_recorded_hf_repo(client, monkeypatch):
     monkeypatch.setenv("ASR_HF_RUN_REPO", "me/env")
     run = _create_run(

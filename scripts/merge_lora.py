@@ -39,8 +39,14 @@ def parse_args():
     parser.add_argument(
         "--hf_run_repo",
         type=str,
-        default=os.environ.get("ASR_HF_RUN_REPO", ""),
-        help="Hugging Face repo id for the run mirror (default: ASR_HF_RUN_REPO)",
+        default=None,
+        help="Hugging Face repo id for the run mirror (default: auto-resolved or ASR_HF_RUN_REPO)",
+    )
+    parser.add_argument(
+        "--no_hf_sync",
+        "--no-hf-sync",
+        action="store_true",
+        help="Disable Hugging Face mirroring completely even if authenticated or ASR_HF_RUN_REPO is set.",
     )
     return parser.parse_args()
 
@@ -53,17 +59,20 @@ def _upload_merged_to_hf(args) -> None:
     merged model remains usable even when Hugging Face is unavailable.
     """
     run_dir = str(getattr(args, "run_dir", None) or "").strip()
-    repo_id = str(getattr(args, "hf_run_repo", None) or "").strip()
-    if not run_dir or not repo_id:
+    if not run_dir:
         return
 
     mirror = None
     try:
         from src import hf_sync
 
+        config = hf_sync.resolve_config(args)
+        if config is None:
+            return
+
         run_path = Path(run_dir).expanduser().resolve()
         mirror = hf_sync.HFRunMirror(
-            hf_sync.HFSyncConfig(repo_id=repo_id),
+            config,
             run_id=run_path.name,
             run_dir=run_path,
             output_dir=run_path / "output",
