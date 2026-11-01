@@ -334,7 +334,7 @@ def run_domain_adaptation(
         cmd.append("--fresh_start")
 
     for k, v in extra_kwargs.items():
-        flag = f"--{k.replace('_', '-')}"
+        flag = f"--{k}"
         if v is True:
             cmd.append(flag)
         elif v is False or v is None:
@@ -343,14 +343,18 @@ def run_domain_adaptation(
             cmd.extend([flag, str(v)])
 
     logger.info("Starting domain adaptation LoRA fine-tuning...")
-    return _run_training_subprocess(cmd)
+    return _run_training_subprocess(cmd, cwd=str(BASE_DIR))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entrypoint."""
     args = parse_args(argv)
-    validate_inputs(base_model=args.base_model, custom_data_path=args.custom_data_path)
-    return run_domain_adaptation(args)
+    try:
+        validate_inputs(base_model=args.base_model, custom_data_path=args.custom_data_path)
+        return run_domain_adaptation(args)
+    except ValueError as e:
+        logger.error("Configuration error: %s", e)
+        return 1
 
 
 if __name__ == "__main__":
