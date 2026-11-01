@@ -8,17 +8,18 @@ Optimized for **NVIDIA L40S (48 GB VRAM)** using unquantized **Bfloat16 LoRA (PE
 
 ## Table of Contents
 1. [⚡ Quickstart: Local UI Demo (No GPU Needed)](#-quickstart-local-ui-demo-no-gpu-needed)
-2. [Persistent Runs & Cockpit Ledger](#persistent-runs--cockpit-ledger)
-3. [Durable HF Run Mirror](#durable-hf-run-mirror)
-4. [Why This Architecture?](#why-this-architecture)
-5. [Project Structure](#project-structure)
-6. [Transferring to the GPU Server](#transferring-to-the-gpu-server)
-7. [Environment Setup on GPU Server](#environment-setup-on-gpu-server)
-8. [Step 1: Baseline Benchmarking](#step-1-baseline-benchmarking)
-9. [Step 2: Training on NVIDIA L40S](#step-2-training-on-nvidia-l40s)
-10. [Step 3: Post-Training Evaluation & Diagnostics](#step-3-post-training-evaluation--diagnostics)
-11. [Step 4: Merging Adapter Weights for Deployment](#step-4-merging-adapter-weights-for-deployment)
-12. [Step 5: Transcribing Custom Audio (CLI)](#step-5-transcribing-custom-audio-cli)
+2. [🚀 Automated RunPod L40S Launcher](#-automated-runpod-l40s-launcher)
+3. [Persistent Runs & Cockpit Ledger](#persistent-runs--cockpit-ledger)
+4. [Durable HF Run Mirror](#durable-hf-run-mirror)
+5. [Why This Architecture?](#why-this-architecture)
+6. [Project Structure](#project-structure)
+7. [Transferring to the GPU Server (Manual)](#transferring-to-the-gpu-server-manual)
+8. [Environment Setup on GPU Server](#environment-setup-on-gpu-server)
+9. [Step 1: Baseline Benchmarking](#step-1-baseline-benchmarking)
+10. [Step 2: Training on NVIDIA L40S](#step-2-training-on-nvidia-l40s)
+11. [Step 3: Post-Training Evaluation & Diagnostics](#step-3-post-training-evaluation--diagnostics)
+12. [Step 4: Merging Adapter Weights for Deployment](#step-4-merging-adapter-weights-for-deployment)
+13. [Step 5: Transcribing Custom Audio (CLI)](#step-5-transcribing-custom-audio-cli)
 
 ---
 
@@ -31,6 +32,21 @@ You can launch and explore the full Web Cockpit right now on your local machine 
 ```
 
 Then open `http://127.0.0.1:7860` in your browser. You can click **Launch Run** to simulate active Persian ASR training, watch the live loss trajectory, view simulated epoch benchmarks updating in real time, and inspect the canary Persian sentences. The demo's baseline values are simulated only (`DEMO_SIMULATED_BASELINES`); training and the server never read them.
+
+---
+
+## 🚀 Automated RunPod L40S Launcher
+
+When GPU capacity on RunPod is scarce, run the watcher script to continuously poll for an **NVIDIA L40S**, auto-deploy the pod with required storage (300 GB container disk + 200 GB persistent volume), clone this repo, install dependencies, start the Web Cockpit and browser web terminal, and notify you:
+
+```bash
+export RUNPOD_API_KEY=your_key
+./runpod_watch.sh
+```
+Check availability once:
+```bash
+./runpod_watch.sh --check-only
+```
 
 ---
 

@@ -22,7 +22,48 @@ The demo baseline values, including phone WER, are simulated only (`DEMO_SIMULAT
 
 ---
 
-## 1. Transfer Project to the GPU Server
+## 🚀 Automated RunPod L40S Watcher & Launcher (Recommended)
+
+When GPU capacity on RunPod is constrained, you don't have to manually refresh the console. Run the automated watcher script on your local machine:
+
+```bash
+# Set your RunPod API key (or add RUNPOD_API_KEY to your local .env)
+export RUNPOD_API_KEY=your_runpod_api_key
+
+# Launch the watcher
+./runpod_watch.sh
+```
+
+**What this does automatically:**
+1. **Polls RunPod Stock:** Monitors capacity across all RunPod datacenters for an **NVIDIA L40S (48 GB VRAM)**.
+2. **Auto-Provisions on Availability:** Deploys an on-demand pod with:
+   - **300 GB** container ephemeral disk (for the ~170 GB paired training Arrow cache and raw audio buffers).
+   - **200 GB** persistent volume at `/workspace` (for `.venv`, repository, and model checkpoints).
+   - Exposed ports: `7860/http` (Web Cockpit), `8080/http` (Browser Web Terminal), `8888/http` (JupyterLab), `22/tcp` (SSH).
+3. **Pulls Private GitHub Repo:** Automatically uses your local `gh auth token` (or `GITHUB_TOKEN`) to clone the private repository into `/workspace/stt`.
+4. **Bootstraps Environment & Web Terminal:** Runs `ttyd` web terminal on port 8080 and executes `./setup_server.sh` and `./runpod_web.sh -d` (detached background server).
+5. **Notifies You Immediately:**
+   - Desktop popup notification (`notify-send`)
+   - Terminal audio chime (`\a` / sound player)
+   - Prints direct URLs:
+     - **Web Cockpit:** `https://<pod-id>-7860.proxy.runpod.net`
+     - **Web Terminal:** `https://<pod-id>-8080.proxy.runpod.net`
+     - **RunPod Console:** `https://console.runpod.io/pod/<pod-id>`
+     - **SSH Command:** `ssh root@<ip> -p <port>`
+
+**Useful Options:**
+```bash
+./runpod_watch.sh --check-only                # Quick check if L40S is currently in stock
+./runpod_watch.sh --dry-run                   # Verify credentials and preview deployment parameters
+./runpod_watch.sh --interval 30               # Change polling interval (default: 25s)
+./runpod_watch.sh --container-disk 350        # Override ephemeral disk (default: 300 GB)
+./runpod_watch.sh --volume-size 250           # Override persistent volume (default: 200 GB)
+./runpod_watch.sh --cloud-type COMMUNITY      # Target Community Cloud instead of SECURE (default: SECURE)
+```
+
+---
+
+## 1. Transfer Project to the GPU Server (Manual Method)
 
 From your local machine terminal, copy the project directory to your remote GPU server:
 

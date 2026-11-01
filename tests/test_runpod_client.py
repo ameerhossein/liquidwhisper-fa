@@ -32,6 +32,15 @@ def test_resolve_github_token_gh_cli(monkeypatch):
         assert resolve_github_token() == "gho_from_cli"
 
 
+def test_resolve_github_token_missing(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        with pytest.raises(RuntimeError, match="GitHub token not found"):
+            resolve_github_token()
+
+
 def test_resolve_ssh_public_key(tmp_path):
     pub_file = tmp_path / "id_ed25519.pub"
     pub_file.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@test")
