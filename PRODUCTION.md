@@ -114,17 +114,27 @@ process instead of calling `prepare_paired_dataset` inline:
 export ASR_PREP_HF_REPO=<user>/liquidwhisper-neyshekar-prep
 # If unset, the helper derives <hf-user>/liquidwhisper-neyshekar-prep when
 # authenticated.
+# The assembled cache is ~168GB, above the free 100GB private allowance:
+export ASR_PREP_HF_PUBLIC=1
 
 python scripts/prepare_paired_cache.py all \
   --prep-cache-dir /root/prep_cache \
   --num-proc 8
 ```
 
-The default `--clean-strategy auto` first tries to drop page cache locally.
-If that is unavailable or usage is still too high before the phone half, it
-offloads the clean half to `ASR_PREP_HF_REPO/clean`, deletes the local copy,
-runs phone, downloads clean back, and assembles. When the local drop works,
-no HF clean round trip is performed. Force either path with
+Public is explicit: `ASR_PREP_HF_PUBLIC=1` (or `--public-repo`) creates the
+dataset repo as public. The default stays private. An existing repo's
+visibility is never changed; the helper prints the actual value and warns on a
+mismatch. A private repo is refused before the first upload when
+`2.1 x clean size` exceeds the limit (`ASR_PREP_HF_PRIVATE_LIMIT_GB`, default
+100).
+
+The default `--clean-strategy auto` first tries to drop page cache globally.
+Container images normally deny that, so it then evicts just the clean shard
+files with `posix_fadvise(DONTNEED)` — no root needed. Only when usage is still
+above `--max-pre-phone-gb` does it offload `clean/` to HF, delete the local
+copy, run phone, download clean back, and assemble. When eviction works, no HF
+clean round trip happens at all. Force either path with
 `--clean-strategy drop-caches` or `--clean-strategy offload-hf`.
 
 `all` runs `clean` and `phone` as separate subprocesses, then validates that
@@ -132,8 +142,11 @@ both halves have identical row counts, feature schemas, labels, and
 `is_informal` flags before publishing `<prep-cache>/train`. The final cache
 is the exact `shards_v1` slot consumed by `train_lora.py`. It is uploaded to
 `ASR_PREP_HF_REPO/train` by default; use `--no-upload-final` to keep it local.
-The phases are also exposed separately as `clean`, `phone`, and `assemble`
-for manual recovery.
+When the clean half was offloaded, `clean/` is deleted from the repo after
+assembly; `--keep-hf-clean` retains it. Re-running prep uploads the same paths
+as new LFS objects, so old versions keep counting against storage until
+`super_squash_history` or a fresh repo. The phases are also exposed separately
+as `clean`, `phone`, and `assemble` for manual recovery.
 
 At training time, set both local and HF paths so a missing local `train/`
 cache is fetched once before the normal cache load:
