@@ -305,11 +305,71 @@ def _auto_hf_repo() -> Optional[str]:
     return f"{user}/{DEFAULT_PREP_REPO_NAME}" if user else None
 
 
-def upload_stage(repo_id: str, stage: Path, path_in_repo: str) -> None:
+FREE_PRIVATE_LIMIT_GB = 100.0
+
+
+def _repo_public(ns: argparse.Namespace) -> bool:
+    if getattr(ns, "public_repo", False):
+        return True
+    value = (os.environ.get("ASR_PREP_HF_PUBLIC", "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _private_limit_bytes() -> float:
+    raw = (os.environ.get("ASR_PREP_HF_PRIVATE_LIMIT_GB", "") or "").strip()
+    try:
+        return (float(raw) if raw else FREE_PRIVATE_LIMIT_GB) * 1e9
+    except ValueError:
+        return FREE_PRIVATE_LIMIT_GB * 1e9
+
+
+def _ensure_repo(repo_id: str, public: bool) -> bool:
+    """Create the dataset repo when missing; return its actual ``is_private``."""
     api = _hf_api()
-    api.create_repo(repo_id, repo_type="dataset", private=True, exist_ok=True)
+    try:
+        info = api.repo_info(repo_id, repo_type="dataset")
+    except Exception:
+        info = None
+    if info is None:
+        api.create_repo(
+            repo_id, repo_type="dataset", private=not public, exist_ok=True
+        )
+        print(
+            f"[hf] created {'public' if public else 'private'} dataset repo {repo_id}",
+            flush=True,
+        )
+        return not public
+    is_private = bool(getattr(info, "private", True))
+    if public and is_private:
+        print(
+            f"[hf] WARNING: {repo_id} is private; visibility is not changed "
+            "automatically",
+            flush=True,
+        )
+    elif not public and not is_private:
+        print(f"[hf] WARNING: {repo_id} is public; uploading publicly", flush=True)
+    return is_private
+
+
+def _assert_private_fits(repo_id: str, is_private: bool, stage_bytes: int) -> None:
+    if not is_private:
+        return
+    limit = _private_limit_bytes()
+    if stage_bytes > limit:
+        raise RuntimeError(
+            f"private HF repo {repo_id} cannot hold {stage_bytes / 1e9:.0f}G "
+            f"(free private limit {limit / 1e9:.0f}G); set "
+            "ASR_PREP_HF_PUBLIC=1, upgrade to PRO, or pass --no-upload-final"
+        )
+
+
+def upload_stage(
+    repo_id: str, stage: Path, path_in_repo: str, *, public: bool = False
+) -> None:
+    is_private = _ensure_repo(repo_id, public)
+    _assert_private_fits(repo_id, is_private, prep_cache.dir_size(stage))
     print(f"[hf] uploading {stage} -> {repo_id}/{path_in_repo}", flush=True)
-    api.upload_folder(
+    _hf_api().upload_folder(
         repo_id=repo_id,
         repo_type="dataset",
         folder_path=str(stage),
@@ -419,9 +479,22 @@ def _offload_clean(ns: argparse.Namespace, clean_stage: Path) -> None:
             "local page-cache eviction is not available and no HF repo is "
             "configured; pass --offload-clean-to-hf or --hf-repo"
         )
-    upload_stage(repo, clean_stage, clean_stage.name)
+    upload_stage(repo, clean_stage, clean_stage.name, public=_repo_public(ns))
     shutil.rmtree(clean_stage)
     print("[all] deleted local clean stage after upload", flush=True)
+
+
+def _guard_projected_train(ns: argparse.Namespace, clean_stage: Path) -> None:
+    if getattr(ns, "no_upload_final", False):
+        return
+    repo = _final_hf_repo(ns)
+    if not repo:
+        return
+    is_private = _ensure_repo(repo, _repo_public(ns))
+    if not is_private:
+        return
+    projected = 2.1 * prep_cache.dir_size(clean_stage)
+    _assert_private_fits(repo, is_private, int(projected))
 
 
 def _upload_final(ns: argparse.Namespace, train_dir: Path) -> None:
@@ -436,7 +509,7 @@ def _upload_final(ns: argparse.Namespace, train_dir: Path) -> None:
             flush=True,
         )
         return
-    upload_stage(repo, train_dir, train_dir.name)
+    upload_stage(repo, train_dir, train_dir.name, public=_repo_public(ns))
 
 
 def run_all(ns: argparse.Namespace) -> int:
@@ -448,6 +521,7 @@ def run_all(ns: argparse.Namespace) -> int:
     _run_phase(ns, "clean")
     usage = _cgroup_usage_gb()
     print(f"[all] clean done; cgroup usage={usage if usage is None else f'{usage:.1f}G'}", flush=True)
+    _guard_projected_train(ns, clean_stage)
 
     offloaded = False
     strategy = ns.clean_strategy
@@ -519,6 +593,11 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-proc", type=int, default=8)
     parser.add_argument("--telephony-profiles", default="customer")
     parser.add_argument("--telephony-seed", type=int, default=42)
+    parser.add_argument(
+        "--public-repo",
+        action="store_true",
+        help="Create the HF dataset repo as public (env ASR_PREP_HF_PUBLIC=1)",
+    )
     parser.add_argument(
         "--telephony-use-ffmpeg",
         action=argparse.BooleanOptionalAction,
