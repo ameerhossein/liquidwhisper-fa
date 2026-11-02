@@ -9,6 +9,7 @@ Supports:
 """
 
 import copy
+import gc
 import os
 import random
 from typing import Optional, Dict, Any, List, Sequence
@@ -164,6 +165,50 @@ def _set_torch_threads(n: int) -> Optional[int]:
         return prev
     except Exception:
         return None
+
+
+def _dataset_cache_paths(dataset: Any) -> List[str]:
+    """Return the Arrow cache files backing ``dataset`` (in row order)."""
+    paths: List[str] = []
+    for entry in getattr(dataset, "cache_files", None) or []:
+        filename = entry.get("filename") if isinstance(entry, dict) else entry
+        if filename:
+            paths.append(str(filename))
+    return paths
+
+
+def _evict_file_cache(paths: Sequence[str]) -> None:
+    """Ask the kernel to drop clean page cache for ``paths`` (best effort).
+
+    Paired prep writes ~85 GB for the clean half and another ~85 GB for the
+    phone half. On a 188 GB cgroup the clean shards otherwise stay charged as
+    page cache while the phone map runs. ``posix_fadvise`` is a no-op on
+    filesystems that do not support it; failures are ignored because the kernel
+    can still reclaim clean pages.
+    """
+    advise = getattr(os, "posix_fadvise", None)
+    if advise is None:
+        return
+    flags = getattr(os, "POSIX_FADV_DONTNEED", 4)
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            advise(fd, 0, 0, flags)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _load_cached_dataset(paths: Sequence[str]) -> Any:
+    """Load one map-style dataset from its Arrow cache shard(s)."""
+    parts = [Dataset.from_file(str(path)) for path in paths]
+    if len(parts) == 1:
+        return parts[0]
+    return concatenate_datasets(parts)
 
 
 def _check_audio_backend() -> None:
@@ -538,10 +583,26 @@ class PersianASRDataPipeline:
                 filtered, remove_columns, effective_proc, filter_durations=False,
                 cache_file_name=clean_cache_file,
             )
+            clean_features = clean.features
+            clean_paths = _dataset_cache_paths(clean) if clean_cache_file else []
+            if clean_paths:
+                # Release the clean half's memory maps before the phone map.
+                # Otherwise its ~85 GB of Arrow pages stay charged to the
+                # cgroup while the phone half writes another ~85 GB, which
+                # kills paired prep on a 188 GB pod near the end of the phone
+                # pass. Reload it from disk after the phone pass.
+                del clean
+                gc.collect()
+                _evict_file_cache(clean_paths)
+
             phone = phone_pipe._prepare_split(
                 filtered, remove_columns, effective_proc, filter_durations=False,
                 cache_file_name=phone_cache_file,
             )
+            if clean_paths:
+                clean = _load_cached_dataset(clean_paths)
+                if clean.features != clean_features:
+                    raise ValueError("clean cache reload changed feature schema")
             if clean.features != phone.features:
                 raise ValueError("clean and phone feature schemas differ")
             return concatenate_datasets([clean, phone])

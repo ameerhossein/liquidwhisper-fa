@@ -104,6 +104,50 @@ and `meta.json` format replace them on the first run. To keep both paired and
 disjoint train caches, use a different `--prep_cache_dir` (or
 `ASR_PREP_CACHE_DIR`) per mode; only one train slot exists per directory.
 
+### Split paired prep on a memory-limited pod
+
+Paired prep holds two ~85 GB Arrow halves. On a pod whose cgroup cannot keep
+both page caches plus the map workers resident, prepare each half in its own
+process instead of calling `prepare_paired_dataset` inline:
+
+```bash
+export ASR_PREP_HF_REPO=<user>/liquidwhisper-neyshekar-prep
+# If unset, the helper derives <hf-user>/liquidwhisper-neyshekar-prep when
+# authenticated.
+
+python scripts/prepare_paired_cache.py all \
+  --prep-cache-dir /root/prep_cache \
+  --num-proc 8
+```
+
+The default `--clean-strategy auto` first tries to drop page cache locally.
+If that is unavailable or usage is still too high before the phone half, it
+offloads the clean half to `ASR_PREP_HF_REPO/clean`, deletes the local copy,
+runs phone, downloads clean back, and assembles. When the local drop works,
+no HF clean round trip is performed. Force either path with
+`--clean-strategy drop-caches` or `--clean-strategy offload-hf`.
+
+`all` runs `clean` and `phone` as separate subprocesses, then validates that
+both halves have identical row counts, feature schemas, labels, and
+`is_informal` flags before publishing `<prep-cache>/train`. The final cache
+is the exact `shards_v1` slot consumed by `train_lora.py`. It is uploaded to
+`ASR_PREP_HF_REPO/train` by default; use `--no-upload-final` to keep it local.
+The phases are also exposed separately as `clean`, `phone`, and `assemble`
+for manual recovery.
+
+At training time, set both local and HF paths so a missing local `train/`
+cache is fetched once before the normal cache load:
+
+```bash
+export ASR_PREP_CACHE_DIR=/root/prep_cache
+export ASR_PREP_HF_REPO=<user>/liquidwhisper-neyshekar-prep
+
+python scripts/train_lora.py ... --prep_cache_dir /root/prep_cache
+```
+
+`ASR_PREP_HF_REPO` is separate from `ASR_HF_RUN_REPO`: the former is the
+prepared-feature cache, the latter mirrors run checkpoints and ledger state.
+
 Persistent merge:
 
 ```bash

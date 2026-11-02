@@ -1442,3 +1442,53 @@ def test_whisper_seq2seq_trainer_prediction_step_handles_dtype_mismatch(tmp_path
     loss, preds, labels = trainer.prediction_step(model, batch, prediction_loss_only=False)
     assert preds is not None
 
+
+
+def test_ensure_prep_cache_from_hf_skips_when_local_meta_exists(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    train = tmp_path / "prep" / "train"
+    train.mkdir(parents=True)
+    (train / "meta.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ASR_PREP_HF_REPO", "me/prep")
+    called = {"count": 0}
+
+    def fail(**kwargs):
+        called["count"] += 1
+        raise AssertionError("should not download")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fail)
+    train_lora._ensure_prep_cache_from_hf(str(tmp_path / "prep"))
+    assert called["count"] == 0
+
+
+def test_ensure_prep_cache_from_hf_downloads_train_only(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    prep = tmp_path / "prep"
+    monkeypatch.setenv("ASR_PREP_HF_REPO", "me/prep")
+    monkeypatch.setenv("HF_TOKEN", "token")
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        train = Path(kwargs["local_dir"]) / "train"
+        train.mkdir(parents=True)
+        (train / "meta.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_download)
+    train_lora._ensure_prep_cache_from_hf(str(prep))
+
+    assert calls[0]["repo_id"] == "me/prep"
+    assert calls[0]["repo_type"] == "dataset"
+    assert calls[0]["allow_patterns"] == ["train/*"]
+    assert calls[0]["local_dir"] == str(prep)
+    assert calls[0]["token"] == "token"
+
+
+def test_ensure_prep_cache_from_hf_disabled_by_off(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_PREP_HF_REPO", "off")
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("downloaded")),
+    )
+    train_lora._ensure_prep_cache_from_hf(str(tmp_path / "prep"))

@@ -491,6 +491,48 @@ def _json_safe(value):
     return str(value)
 
 
+def _prep_hf_repo() -> str:
+    value = (os.environ.get("ASR_PREP_HF_REPO", "") or "").strip()
+    if value.lower() in ("off", "none", "false", "0"):
+        return ""
+    return value
+
+
+def _ensure_prep_cache_from_hf(prep_cache_dir: str) -> None:
+    """Download train/ from ASR_PREP_HF_REPO when it is not local yet.
+
+    The trainer never reads the prep cache directly from HF; this is a one-time
+    fetch into the local ``--prep_cache_dir`` before the normal cache load.
+    """
+    repo = _prep_hf_repo()
+    if not repo:
+        return
+    prep_cache_dir = Path(prep_cache_dir)
+    train_meta = prep_cache_dir / "train" / "meta.json"
+    if train_meta.is_file():
+        return
+    from huggingface_hub import snapshot_download
+
+    prep_cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f" Prep cache: downloading train/ from HF {repo}...", flush=True)
+    snapshot_download(
+        repo_id=repo,
+        repo_type="dataset",
+        allow_patterns=["train/*"],
+        local_dir=str(prep_cache_dir),
+        token=(
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or None
+        ),
+    )
+    if not train_meta.is_file():
+        raise RuntimeError(
+            f"HF prep repo {repo} has no train/meta.json after download"
+        )
+    print(f" Prep cache: downloaded train/ from {repo}", flush=True)
+
+
 def _copy_preflight_to_run(run_dir: Path, cache_dir: Path) -> Path:
     """Copy the shared preflight cache into the run for provenance."""
     return run_state.write_preflight_copy(
@@ -1813,10 +1855,17 @@ def _run_training_stages(args, run_dir, mirror):
         eval_cache = Path(prep_cache_dir) / "validation"
         load_cache = reuse_prep and not overwrite_prep
         if load_cache:
+            _ensure_prep_cache_from_hf(prep_cache_dir)
             train_dataset = prep_cache.load_prep_cache(train_cache, train_fp)
             eval_dataset = prep_cache.load_prep_cache(eval_cache, eval_fp)
         need_train = train_dataset is None
         need_eval = eval_dataset is None
+        if load_cache and need_train and _prep_hf_repo():
+            raise RuntimeError(
+                "HF prep cache is available but does not match this run's "
+                f"train fingerprint; refusing to re-prep in a memory-limited run "
+                f"({train_cache}). Upload a cache made with the same settings."
+            )
 
         if need_train or need_eval or args.run_epoch_benchmark:
             raw_train = train_pipeline.load_raw_dataset(split="train", max_samples=args.max_train_samples) if need_train else None

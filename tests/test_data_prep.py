@@ -6,6 +6,7 @@ Run: uv run --with numpy --with scipy --with soundfile --with "datasets>=2.19,<4
 """
 
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -239,3 +240,40 @@ def test_prepare_paired_dataset_writes_clean_and_phone_shards(tmp_path):
     assert any(n.startswith("clean") for n in names)
     assert any(n.startswith("phone") for n in names)
     assert len(out) == 8
+
+
+def test_prepare_paired_dataset_releases_clean_before_phone(monkeypatch, tmp_path):
+    """The clean half must not stay memory-mapped while the phone half runs.
+
+    Keeping the clean Dataset alive pins its Arrow pages in the cgroup, so a
+    paired prep on a 188 GB pod dies partway through the phone map.
+    """
+    pipe = _pipeline(prob=0.5, num_proc=1)
+    clean_ref = {"ref": None}
+    orig_prepare = pipe._prepare_split
+
+    def spy(dataset, remove_columns, effective_proc, filter_durations=True,
+            cache_file_name=None):
+        out = orig_prepare(
+            dataset,
+            remove_columns,
+            effective_proc,
+            filter_durations=filter_durations,
+            cache_file_name=cache_file_name,
+        )
+        name = Path(cache_file_name).name if cache_file_name else ""
+        if name.startswith("clean"):
+            clean_ref["ref"] = weakref.ref(out)
+        elif name.startswith("phone"):
+            assert clean_ref["ref"] is not None
+            assert clean_ref["ref"]() is None, (
+                "clean Dataset was still alive during the phone map"
+            )
+        return out
+
+    monkeypatch.setattr(pipe, "_prepare_split", spy)
+    out = pipe.prepare_paired_dataset(
+        _pairing_dataset(4), cache_dir=str(tmp_path / "stage")
+    )
+    assert len(out) == 8
+    assert out["labels"][:4] == out["labels"][4:]
