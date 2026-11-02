@@ -325,20 +325,24 @@ def _private_limit_bytes() -> float:
 
 def _ensure_repo(repo_id: str, public: bool) -> bool:
     """Create the dataset repo when missing; return its actual ``is_private``."""
+    from huggingface_hub.utils import RepositoryNotFoundError
+
     api = _hf_api()
     try:
         info = api.repo_info(repo_id, repo_type="dataset")
-    except Exception:
+    except RepositoryNotFoundError:
         info = None
     if info is None:
         api.create_repo(
             repo_id, repo_type="dataset", private=not public, exist_ok=True
         )
+        info = api.repo_info(repo_id, repo_type="dataset")
+        is_private = bool(getattr(info, "private", True))
         print(
-            f"[hf] created {'public' if public else 'private'} dataset repo {repo_id}",
+            f"[hf] created {'private' if is_private else 'public'} dataset repo {repo_id}",
             flush=True,
         )
-        return not public
+        return is_private
     is_private = bool(getattr(info, "private", True))
     if public and is_private:
         print(
@@ -349,6 +353,20 @@ def _ensure_repo(repo_id: str, public: bool) -> bool:
     elif not public and not is_private:
         print(f"[hf] WARNING: {repo_id} is public; uploading publicly", flush=True)
     return is_private
+
+
+def _repo_storage_bytes(repo_id: str) -> int:
+    """Best-effort sum of files already in the repo (0 when unavailable)."""
+    try:
+        info = _hf_api().repo_info(
+            repo_id, repo_type="dataset", files_metadata=True
+        )
+    except Exception:
+        return 0
+    total = 0
+    for sibling in getattr(info, "siblings", None) or []:
+        total += int(getattr(sibling, "size", 0) or 0)
+    return total
 
 
 def _assert_private_fits(repo_id: str, is_private: bool, stage_bytes: int) -> None:
@@ -478,21 +496,54 @@ def _run_phase(ns: argparse.Namespace, phase: str) -> None:
     subprocess.run(_phase_command(ns, phase), check=True)
 
 
+_HF_DISABLED = ("off", "none", "false", "0")
+
+
+def _repo_value(value: Optional[str]) -> Optional[str]:
+    """Normalize a repo argument; treat disabled sentinels as unset."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _HF_DISABLED:
+        return None
+    return text
+
+
 def _final_hf_repo(ns: argparse.Namespace) -> Optional[str]:
     return (
-        ns.hf_train_repo
-        or ns.hf_repo
-        or getattr(ns, "offload_clean_to_hf", None)
+        _repo_value(ns.hf_train_repo)
+        or _repo_value(ns.hf_repo)
+        or _repo_value(getattr(ns, "offload_clean_to_hf", None))
         or _auto_hf_repo()
     )
 
 
 def _clean_hf_repo(ns: argparse.Namespace) -> Optional[str]:
     return (
-        getattr(ns, "offload_clean_to_hf", None)
-        or ns.hf_repo
-        or ns.hf_train_repo
+        _repo_value(getattr(ns, "offload_clean_to_hf", None))
+        or _repo_value(ns.hf_repo)
+        or _repo_value(ns.hf_train_repo)
         or _auto_hf_repo()
+    )
+
+
+def _guard_projected_train(ns: argparse.Namespace, clean_stage: Path) -> None:
+    if getattr(ns, "no_upload_final", False):
+        return
+    repo = _final_hf_repo(ns)
+    if not repo:
+        return
+    is_private = _ensure_repo(repo, _repo_public(ns))
+    if not is_private:
+        return
+    clean_bytes = prep_cache.dir_size(clean_stage)
+    strategy = getattr(ns, "clean_strategy", "auto")
+    may_offload = (
+        strategy in ("auto", "offload-hf") and _clean_hf_repo(ns) == repo
+    )
+    projected = (3.1 if may_offload else 2.1) * clean_bytes
+    _assert_private_fits(
+        repo, is_private, int(projected) + _repo_storage_bytes(repo)
     )
 
 
@@ -506,19 +557,6 @@ def _offload_clean(ns: argparse.Namespace, clean_stage: Path) -> None:
     upload_stage(repo, clean_stage, clean_stage.name, public=_repo_public(ns))
     shutil.rmtree(clean_stage)
     print("[all] deleted local clean stage after upload", flush=True)
-
-
-def _guard_projected_train(ns: argparse.Namespace, clean_stage: Path) -> None:
-    if getattr(ns, "no_upload_final", False):
-        return
-    repo = _final_hf_repo(ns)
-    if not repo:
-        return
-    is_private = _ensure_repo(repo, _repo_public(ns))
-    if not is_private:
-        return
-    projected = 2.1 * prep_cache.dir_size(clean_stage)
-    _assert_private_fits(repo, is_private, int(projected))
 
 
 def _upload_final(ns: argparse.Namespace, train_dir: Path) -> None:

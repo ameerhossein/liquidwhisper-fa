@@ -125,9 +125,11 @@ python scripts/prepare_paired_cache.py all \
 Public is explicit: `ASR_PREP_HF_PUBLIC=1` (or `--public-repo`) creates the
 dataset repo as public. The default stays private. An existing repo's
 visibility is never changed; the helper prints the actual value and warns on a
-mismatch. A private repo is refused before the first upload when
-`2.1 x clean size` exceeds the limit (`ASR_PREP_HF_PRIVATE_LIMIT_GB`, default
-100).
+mismatch. A private repo is refused before the first upload when the projected
+total exceeds the limit (`ASR_PREP_HF_PRIVATE_LIMIT_GB`, default 100): that is
+`3.1 x clean size` when `clean/` goes to the same repo (clean plus assembled
+cache), `2.1 x clean size` when clean stays local, plus anything already in the
+repo.
 
 The default `--clean-strategy auto` first tries to drop page cache globally.
 Container images normally deny that, so it then evicts just the clean shard
@@ -143,7 +145,7 @@ both halves have identical row counts, feature schemas, labels, and
 is the exact `shards_v1` slot consumed by `train_lora.py`. It is uploaded to
 `ASR_PREP_HF_REPO/train` by default; use `--no-upload-final` to keep it local.
 When the clean half was offloaded, `clean/` is deleted from the repo after
-assembly; `--keep-hf-clean` retains it. Re-running prep uploads the same paths
+the final upload succeeds; `--keep-hf-clean` retains it. Re-running prep uploads the same paths
 as new LFS objects, so old versions keep counting against storage until
 `super_squash_history` or a fresh repo. The phases are also exposed separately
 as `clean`, `phone`, and `assemble` for manual recovery.

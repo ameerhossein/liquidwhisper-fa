@@ -160,11 +160,16 @@ def _all_ns(tmp_path, **overrides):
 
 
 def test_ensure_repo_creates_public_when_requested(monkeypatch):
-    calls = {}
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    calls = {"repo_info": 0}
 
     class _Api:
         def repo_info(self, *a, **k):
-            raise RuntimeError("not found")
+            calls["repo_info"] += 1
+            if calls["repo_info"] == 1:
+                raise RepositoryNotFoundError("not found")
+            return type("Info", (), {"private": False})()
 
         def create_repo(self, repo_id, **kw):
             calls.update(kw, repo_id=repo_id)
@@ -173,6 +178,42 @@ def test_ensure_repo_creates_public_when_requested(monkeypatch):
     assert ppc._ensure_repo("me/prep", public=True) is False
     assert calls["private"] is False
     assert calls["repo_type"] == "dataset"
+    assert calls["repo_info"] == 2
+
+
+def test_ensure_repo_propagates_non_404_errors(monkeypatch):
+    calls = {"created": False}
+
+    class _Api:
+        def repo_info(self, *a, **k):
+            raise OSError("network down")
+
+        def create_repo(self, *a, **k):
+            calls["created"] = True
+
+    monkeypatch.setattr(ppc, "_hf_api", lambda: _Api())
+    with pytest.raises(OSError, match="network"):
+        ppc._ensure_repo("me/prep", public=True)
+    assert calls["created"] is False
+
+
+def test_ensure_repo_rereads_visibility_after_create(monkeypatch):
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    calls = {"repo_info": 0}
+
+    class _Api:
+        def repo_info(self, *a, **k):
+            calls["repo_info"] += 1
+            if calls["repo_info"] == 1:
+                raise RepositoryNotFoundError("not found")
+            return type("Info", (), {"private": True})()
+
+        def create_repo(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(ppc, "_hf_api", lambda: _Api())
+    assert ppc._ensure_repo("me/prep", public=True) is True
 
 
 def test_ensure_repo_never_flips_existing_private_repo(monkeypatch):
@@ -324,3 +365,150 @@ def test_delete_failure_does_not_fail_the_run(tmp_path, monkeypatch):
         lambda repo, path: (_ for _ in ()).throw(RuntimeError("403")),
     )
     assert ppc.run_all(_all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep")) == 0
+
+
+def test_repo_public_prefers_flag_then_env(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("ASR_PREP_HF_PUBLIC", raising=False)
+    assert ppc._repo_public(SimpleNamespace(public_repo=True)) is True
+    assert ppc._repo_public(SimpleNamespace(public_repo=False)) is False
+    monkeypatch.setenv("ASR_PREP_HF_PUBLIC", "1")
+    assert ppc._repo_public(SimpleNamespace(public_repo=False)) is True
+
+
+def test_guard_projected_train_counts_offloaded_clean(monkeypatch):
+    monkeypatch.setattr(ppc, "_ensure_repo", lambda repo, public: True)
+    monkeypatch.setattr(ppc, "_repo_storage_bytes", lambda repo: 0)
+    monkeypatch.setattr(ppc.prep_cache, "dir_size", lambda path: 40 * 10**9)
+
+    ns = _all_ns("/tmp", no_upload_final=False, hf_repo="me/prep",
+                 clean_strategy="auto")
+    with pytest.raises(RuntimeError, match="private"):
+        ppc._guard_projected_train(ns, "/tmp/clean")
+
+
+def test_guard_projected_train_keeps_two_x_when_clean_stays_local(monkeypatch):
+    monkeypatch.setattr(ppc, "_ensure_repo", lambda repo, public: True)
+    monkeypatch.setattr(ppc, "_repo_storage_bytes", lambda repo: 0)
+    monkeypatch.setattr(ppc.prep_cache, "dir_size", lambda path: 40 * 10**9)
+
+    ns = _all_ns("/tmp", no_upload_final=False, hf_repo="me/prep",
+                 clean_strategy="keep")
+    ppc._guard_projected_train(ns, "/tmp/clean")
+
+
+def test_guard_projected_train_counts_existing_repo_bytes(monkeypatch):
+    monkeypatch.setattr(ppc, "_ensure_repo", lambda repo, public: True)
+    monkeypatch.setattr(ppc, "_repo_storage_bytes", lambda repo: 50 * 10**9)
+    monkeypatch.setattr(ppc.prep_cache, "dir_size", lambda path: 40 * 10**9)
+
+    ns = _all_ns("/tmp", no_upload_final=False, hf_repo="me/prep",
+                 clean_strategy="keep")
+    with pytest.raises(RuntimeError, match="private"):
+        ppc._guard_projected_train(ns, "/tmp/clean")
+
+
+def test_hf_off_sentinel_is_not_a_repo(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ppc, "_auto_hf_repo", lambda: None)
+    ns = SimpleNamespace(
+        hf_train_repo=None, hf_repo="off", offload_clean_to_hf=None
+    )
+    assert ppc._final_hf_repo(ns) is None
+    assert ppc._clean_hf_repo(ns) is None
+
+
+def test_upload_stage_enforces_private_quota(monkeypatch):
+    uploaded = {"called": False}
+
+    class _Api:
+        def upload_folder(self, *a, **k):
+            uploaded["called"] = True
+
+    monkeypatch.setattr(ppc, "_hf_api", lambda: _Api())
+    monkeypatch.setattr(ppc, "_ensure_repo", lambda repo, public: True)
+    monkeypatch.setattr(ppc.prep_cache, "dir_size", lambda path: 200 * 10**9)
+
+    with pytest.raises(RuntimeError, match="private"):
+        ppc.upload_stage("me/prep", Path("/tmp/train"), "train")
+    assert uploaded["called"] is False
+
+
+def test_delete_stage_passes_dataset_folder(monkeypatch):
+    calls = {}
+
+    class _Api:
+        def delete_folder(self, repo_id, **kw):
+            calls.update(kw, repo_id=repo_id)
+
+    monkeypatch.setattr(ppc, "_hf_api", lambda: _Api())
+    ppc.delete_stage("me/prep", "clean")
+
+    assert calls["repo_id"] == "me/prep"
+    assert calls["path_in_repo"] == "clean"
+    assert calls["repo_type"] == "dataset"
+
+
+def test_run_all_invokes_projection_guard(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: None)
+    monkeypatch.setattr(
+        ppc, "_guard_projected_train",
+        lambda ns, stage: called.append(stage),
+    )
+    monkeypatch.setattr(ppc, "_drop_caches", lambda: None)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+
+    ppc.run_all(_all_ns(tmp_path, clean_strategy="keep"))
+
+    assert called == [tmp_path / "clean"]
+
+
+def test_run_all_uploads_before_deleting_remote_clean(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: None)
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: "me/prep")
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+    monkeypatch.setattr(ppc, "_upload_final", lambda ns, train: events.append("upload"))
+    monkeypatch.setattr(ppc, "delete_stage", lambda repo, path: events.append("delete"))
+
+    ppc.run_all(
+        _all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep",
+                no_upload_final=False)
+    )
+
+    assert events == ["upload", "delete"]
+
+
+def test_failed_final_upload_keeps_remote_clean(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: None)
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: "me/prep")
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ppc, "_upload_final",
+        lambda ns, train: (_ for _ in ()).throw(RuntimeError("quota")),
+    )
+    monkeypatch.setattr(ppc, "delete_stage", lambda repo, path: events.append("delete"))
+
+    with pytest.raises(RuntimeError, match="quota"):
+        ppc.run_all(
+            _all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep",
+                    no_upload_final=False)
+        )
+
+    assert "delete" not in events
