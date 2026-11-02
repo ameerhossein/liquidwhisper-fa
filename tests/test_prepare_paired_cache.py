@@ -266,7 +266,61 @@ def test_auto_offloads_when_memory_stays_high_after_fadvise(tmp_path, monkeypatc
     monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
     monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
     monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+    monkeypatch.setattr(ppc, "delete_stage", lambda repo, path: None)
 
     ppc.run_all(_all_ns(tmp_path))
 
     assert "offload" in events
+
+
+def test_run_all_deletes_remote_clean_after_assembling(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: events.append(phase))
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_drop_caches", lambda: events.append("drop"))
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: events.append("offload"))
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: events.append("download"))
+    monkeypatch.setattr(ppc, "delete_stage", lambda repo, path: events.append(f"delete:{path}"))
+
+    ppc.run_all(_all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep"))
+
+    assert events[-1] == "delete:clean"
+
+
+def test_run_all_keeps_remote_clean_with_flag(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: None)
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: "me/prep")
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+    monkeypatch.setattr(ppc, "delete_stage", lambda repo, path: events.append("delete"))
+
+    ppc.run_all(
+        _all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep",
+                keep_hf_clean=True)
+    )
+
+    assert "delete" not in events
+
+
+def test_delete_failure_does_not_fail_the_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: None)
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: "me/prep")
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 10.0)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ppc, "delete_stage",
+        lambda repo, path: (_ for _ in ()).throw(RuntimeError("403")),
+    )
+    assert ppc.run_all(_all_ns(tmp_path, clean_strategy="offload-hf", hf_repo="me/prep")) == 0

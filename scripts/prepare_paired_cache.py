@@ -408,6 +408,17 @@ def _evict_stage_files(stage: Path) -> int:
     return advised
 
 
+def delete_stage(repo_id: str, path_in_repo: str) -> None:
+    print(f"[hf] deleting {repo_id}/{path_in_repo}", flush=True)
+    _hf_api().delete_folder(
+        repo_id,
+        path_in_repo=path_in_repo,
+        repo_type="dataset",
+        commit_message=f"Remove paired prep {path_in_repo}",
+    )
+    print("[hf] delete complete", flush=True)
+
+
 def _drop_caches() -> None:
     subprocess.run(["sync"], check=False)
     try:
@@ -597,6 +608,13 @@ def run_all(ns: argparse.Namespace) -> int:
     )
     print(f"[all] published {train_dir} rows={meta['total_rows']}", flush=True)
     _upload_final(ns, train_dir)
+    if offloaded and not ns.keep_hf_clean:
+        repo = _clean_hf_repo(ns)
+        if repo:
+            try:
+                delete_stage(repo, clean_stage.name)
+            except Exception as exc:
+                print(f"[hf] WARNING: could not delete remote clean: {exc}", flush=True)
     return 0
 
 
@@ -682,6 +700,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --clean-strategy auto, offload if usage is still above this",
     )
     allp.add_argument("--no-clean-up", action="store_true")
+    allp.add_argument(
+        "--keep-hf-clean",
+        action="store_true",
+        help="Keep the uploaded clean/ half in the HF repo after assembly",
+    )
     return parser
 
 
