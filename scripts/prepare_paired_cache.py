@@ -395,6 +395,19 @@ def download_stage(repo_id: str, stage: Path, path_in_repo: str) -> None:
     print("[hf] download complete", flush=True)
 
 
+def _evict_stage_files(stage: Path) -> int:
+    """Advise the kernel to drop cached pages for a stage's Arrow files."""
+    advised = 0
+    for path in sorted(Path(stage).rglob("*.arrow")):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            advised += os.fstat(fd).st_size
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    return advised
+
+
 def _drop_caches() -> None:
     subprocess.run(["sync"], check=False)
     try:
@@ -526,21 +539,27 @@ def run_all(ns: argparse.Namespace) -> int:
     offloaded = False
     strategy = ns.clean_strategy
     if strategy == "auto":
-        dropped = False
+        evicted = False
         try:
             _drop_caches()
-            dropped = True
+            evicted = True
             print("[all] dropped local page cache", flush=True)
         except RuntimeError as exc:
-            print(f"[all] local page-cache drop unavailable: {exc}", flush=True)
+            print(f"[all] global page-cache drop unavailable: {exc}", flush=True)
+        if not evicted:
+            try:
+                advised = _evict_stage_files(clean_stage)
+                evicted = True
+                print(
+                    f"[all] evicted {advised / 1e9:.1f}G of clean shard page cache",
+                    flush=True,
+                )
+            except OSError as exc:
+                print(f"[all] per-file eviction unavailable: {exc}", flush=True)
         usage = _cgroup_usage_gb()
         too_full = usage is not None and usage > ns.max_pre_phone_gb
-        if (not dropped) or too_full:
-            print(
-                "[all] local clean cache is not usable for the phone phase; "
-                "offloading to HF",
-                flush=True,
-            )
+        if (not evicted) or too_full:
+            print("[all] clean cache still resident; offloading to HF", flush=True)
             _offload_clean(ns, clean_stage)
             offloaded = True
         else:

@@ -210,3 +210,63 @@ def test_private_limit_falls_back_on_garbage(monkeypatch):
 
     monkeypatch.setenv("ASR_PREP_HF_PRIVATE_LIMIT_GB", "2048")
     assert ppc._private_limit_bytes() == 2048.0 * 1e9
+
+
+def test_evict_stage_files_advises_every_arrow(tmp_path, monkeypatch):
+    (tmp_path / "a.arrow").write_bytes(b"x" * 10)
+    (tmp_path / "b.arrow").write_bytes(b"y" * 20)
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(
+        ppc.os,
+        "posix_fadvise",
+        lambda fd, off, length, advice: seen.append(advice),
+    )
+    assert ppc._evict_stage_files(tmp_path) == 30
+    assert seen == [ppc.os.POSIX_FADV_DONTNEED, ppc.os.POSIX_FADV_DONTNEED]
+    assert ppc._evict_stage_files(tmp_path / "empty") == 0
+
+
+def test_auto_keeps_clean_when_fadvise_frees_memory(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: events.append(phase))
+    monkeypatch.setattr(
+        ppc, "_drop_caches",
+        lambda: (_ for _ in ()).throw(RuntimeError("denied")),
+    )
+    monkeypatch.setattr(
+        ppc, "_evict_stage_files",
+        lambda stage: events.append("fadvise") or 84_000_000_000,
+    )
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 20.0)
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: events.append("offload"))
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: None)
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+
+    ppc.run_all(_all_ns(tmp_path))
+
+    assert "fadvise" in events
+    assert "offload" not in events
+
+
+def test_auto_offloads_when_memory_stays_high_after_fadvise(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(ppc, "_run_phase", lambda ns, phase: events.append(phase))
+    monkeypatch.setattr(
+        ppc, "_drop_caches",
+        lambda: (_ for _ in ()).throw(RuntimeError("denied")),
+    )
+    monkeypatch.setattr(ppc, "_evict_stage_files", lambda stage: 1)
+    monkeypatch.setattr(ppc, "_cgroup_usage_gb", lambda: 150.0)
+    monkeypatch.setattr(ppc, "_offload_clean", lambda ns, stage: events.append("offload"))
+    monkeypatch.setattr(ppc, "_clean_hf_repo", lambda ns: "me/prep")
+    monkeypatch.setattr(ppc, "assemble_stages", lambda *a, **k: {"total_rows": 4})
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda ns: {})
+    monkeypatch.setattr(ppc, "_guard_projected_train", lambda ns, stage: None)
+    monkeypatch.setattr(ppc, "download_stage", lambda *a, **k: None)
+
+    ppc.run_all(_all_ns(tmp_path))
+
+    assert "offload" in events
