@@ -455,3 +455,13 @@ python scripts/transcribe.py \
     --output_file results/my_transcriptions.json \
     --normalize
 ```
+
+### Voice inference UI
+
+Run the standalone microphone transcription UI from the repository root:
+
+```bash
+.venv/bin/python -m uvicorn inference_ui.app:app --host 127.0.0.1 --port 7861
+```
+
+Open <http://127.0.0.1:7861>, enter a Hugging Face model repository (`owner/name`), and select a discovered checkpoint, adapter, or merged model. Use **Switch model** to load another artifact from the same repository, or **Change repository** to explore another one. Private repositories and private adapter base models require `HF_TOKEN` (or `hf auth login`). Models download on first use; CUDA is used when available. Recordings are limited to 30 seconds. Browser microphone access requires localhost or HTTPS.
