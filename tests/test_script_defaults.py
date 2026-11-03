@@ -251,12 +251,15 @@ def test_prep_fingerprint_includes_mode(monkeypatch):
     assert paired["telephony_mode"] == "paired"
     assert paired["telephony_prob"] is None
     assert paired != disjoint and disjoint != clean and paired != clean
+    assert paired["informal_source"] == "MahtaFetrat/GPTInformal-Persian"
+    assert paired["informal_mix_version"] == "gptinformal_v1"
 
     args.telephony_mode = "paired"
     validation_a = _prep_fingerprint(args, "validation", None, "clean", 0.0)
     args.telephony_mode = "disjoint"
     validation_b = _prep_fingerprint(args, "validation", None, "clean", 0.0)
     assert validation_a == validation_b
+    assert "informal_source" not in validation_a
 
 
 def test_paired_fingerprint_ignores_telephony_prob(monkeypatch):

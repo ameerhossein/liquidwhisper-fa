@@ -40,6 +40,9 @@ except ImportError:
     _DATASETS_AVAILABLE = False
 from src.normalizer import PersianTextNormalizer
 
+INFORMAL_DATASET = "MahtaFetrat/GPTInformal-Persian"
+INFORMAL_MIX_VERSION = "gptinformal_v1"
+
 try:
     from src.telephone import DEFAULT_PROFILES as _DEFAULT_TELEPHONY_PROFILES
     from src.telephone import apply_random_telephone
@@ -376,6 +379,14 @@ class PersianASRDataPipeline:
                 print(f"Error loading {self.dataset_name}: {e}. Retrying with trust_remote_code=True...")
                 ds = load_dataset(self.dataset_name, split=split, trust_remote_code=True, **_ld_kwargs)
 
+        # Supplement only the standard training corpus. Local/domain datasets
+        # and evaluation retain their original membership.
+        if self.dataset_name == "shekar-ai/Neyshekar":
+            if isinstance(ds, (DatasetDict, dict)) and "train" in ds:
+                ds["train"] = self._add_informal_training_data(ds["train"], _cache_dir, ds)
+            elif split == "train":
+                ds = self._add_informal_training_data(ds, _cache_dir)
+
         if max_samples and max_samples > 0:
             if isinstance(ds, (DatasetDict, dict)):
                 for s in ds:
@@ -392,6 +403,59 @@ class PersianASRDataPipeline:
             ds = ds.cast_column("audio", Audio(sampling_rate=16000))
 
         return ds
+
+    def _add_informal_training_data(self, train, cache_dir, splits=None):
+        """Append human-recorded informal speech, excluding repeated/held-out text."""
+        import numpy as np
+        from datasets import Features, Value
+
+        kwargs = {"cache_dir": cache_dir} if cache_dir else {}
+        normalize = lambda text: self.normalizer.normalize(text or "", zwnj_mode="remove")
+        excluded = {normalize(text) for text in train["text"]}
+        for name in ("validation", "test"):
+            held_out = splits[name] if splits is not None and name in splits else load_dataset(
+                self.dataset_name, split=name, **kwargs
+            )
+            excluded.update(normalize(text) for text in held_out["text"])
+
+        # Project both sources onto the schema consumed by prepare_sample.
+        flag = next((c for c in ("informal", "is_informal") if c in train.column_names), None)
+        flags = [bool(v) for v in train[flag]] if flag else [
+            self.normalizer.is_colloquial(text) for text in train["text"]
+        ]
+        train = train.select_columns(["audio", "text"]).add_column("is_informal", flags)
+        features = Features({"audio": Audio(sampling_rate=16000), "text": Value("string"),
+                             "is_informal": Value("bool")})
+        train = train.cast(features)
+        informal = load_dataset(INFORMAL_DATASET, split="train", **kwargs)
+
+        def keep(row):
+            text = normalize(row["transcript"])
+            rate = float(row["samplerate"] or 0)
+            audio = np.asarray(row["audio"])
+            if (not text or text in excluded or not np.isfinite(rate) or rate <= 0
+                    or audio.ndim != 1 or not np.isfinite(audio).all()):
+                return False
+            duration = len(audio) / rate
+            if not self.min_duration_seconds <= duration <= self.max_duration_seconds:
+                return False
+            excluded.add(text)
+            return True
+
+        informal = informal.filter(keep, desc="Filtering GPTInformal Persian", load_from_cache_file=False)
+        if not len(informal):
+            print(f"No eligible informal training clips from {INFORMAL_DATASET}")
+            return train.shuffle(seed=42)
+        informal = informal.map(
+            lambda row: {"audio": {"array": np.asarray(row["audio"], dtype=np.float32),
+                                    "sampling_rate": int(row["samplerate"])},
+                         "text": row["transcript"], "is_informal": True},
+            remove_columns=informal.column_names, features=features,
+            desc="Adapting GPTInformal Persian",
+        )
+        print(f"Adding {len(informal)} informal training clips from {INFORMAL_DATASET}")
+        # Mix before max_samples so bounded runs can also use the new source.
+        return concatenate_datasets([train, informal]).shuffle(seed=42)
 
     def _telephone_rng(self, index: Optional[int]) -> random.Random:
         """Augmentation RNG for one row. Seeded per row index so every shard and

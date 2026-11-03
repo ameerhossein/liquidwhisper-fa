@@ -476,6 +476,11 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, teleph
     }
     if prefix_ids is None:
         fingerprint["label_language"] = "fa"
+    if split == "train" and fingerprint["dataset_name"] == "shekar-ai/Neyshekar":
+        from src.data import INFORMAL_DATASET, INFORMAL_MIX_VERSION
+
+        fingerprint["informal_source"] = INFORMAL_DATASET
+        fingerprint["informal_mix_version"] = INFORMAL_MIX_VERSION
     return fingerprint
 
 

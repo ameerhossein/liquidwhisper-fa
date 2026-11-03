@@ -96,6 +96,8 @@ def test_build_fingerprint_matches_paired_training_contract(monkeypatch):
     assert ppc.build_fingerprint(ns) == {
         "dataset_name": "shekar-ai/Neyshekar",
         "base_model": "BuzzASR/persian",
+        "informal_source": "MahtaFetrat/GPTInformal-Persian",
+        "informal_mix_version": "gptinformal_v1",
         "split": "train",
         "max_samples": None,
         "telephony_mode": "paired",

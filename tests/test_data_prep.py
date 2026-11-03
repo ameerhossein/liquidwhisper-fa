@@ -59,6 +59,57 @@ def _clip(dur=1.0, sr=16000):
     return {"array": (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32).tolist(), "sampling_rate": sr}
 
 
+def test_informal_supplement_filters_and_adapts_audio(monkeypatch, tmp_path):
+    from datasets import Dataset, Audio
+    import src.data as data
+
+    def base(text, informal=False):
+        return Dataset.from_dict({"audio": [_clip()], "text": [text],
+                                  "informal": [informal]}).cast_column("audio", Audio(sampling_rate=16000))
+
+    train = base("رسمی")
+    validation = base("آزمون")
+    test = base("تست")
+    texts = ["میخوام برم", "میخوام برم", "آزمون", "تست", "رسمی", "", "کوتاه", "طولانی", "خراب"]
+    waves = [[0.1] * 44100 for _ in texts]
+    waves[6] = []
+    waves[7] = [0.1] * (44100 * 31)
+    waves[8] = [float("nan")] * 44100
+    supplement = Dataset.from_dict({"audio": waves, "transcript": texts,
+                                    "samplerate": [44100] * len(texts)})
+    calls = []
+
+    def load(name, split=None, **kwargs):
+        calls.append((name, split))
+        if name == data.INFORMAL_DATASET:
+            return supplement
+        return {"train": train, "validation": validation, "test": test}[split]
+
+    monkeypatch.setattr(data, "load_dataset", load)
+    monkeypatch.setattr("src.cache.default_datasets_cache_dir", lambda: str(tmp_path))
+    pipe = _pipeline(prob=0)
+    result = pipe.load_raw_dataset(split="train")
+    assert len(result) == 2
+    assert set(result["text"]) == {"رسمی", "میخوام برم"}
+    row = next(row for row in result if row["text"] == "میخوام برم")
+    assert row["is_informal"] is True
+    assert row["audio"]["sampling_rate"] == 16000
+    assert len(row["audio"]["array"]) == 16000
+    assert result["is_informal"][result["text"].index("رسمی")] is False
+    assert (data.INFORMAL_DATASET, "train") in calls
+
+    calls.clear()
+    held_out = pipe.load_raw_dataset(split="validation")
+    assert held_out["text"] == ["آزمون"]
+    assert calls == [("shekar-ai/Neyshekar", "validation")]
+
+    # A fully rejected supplement must retain a valid training schema.
+    supplement = supplement.select([2, 3, 4])
+    result = pipe.load_raw_dataset(split="train")
+    assert result["text"] == ["رسمی"]
+    assert result["is_informal"] == [False]
+
+
 def test_augmentation_depends_only_on_seed_and_row_index():
     row = {"audio": _clip(), "text": "سلام"}
     pipe = _pipeline()
