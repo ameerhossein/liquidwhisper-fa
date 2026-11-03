@@ -19,6 +19,7 @@ from transformers import TrainerCallback, TrainerControl, TrainerState, Training
 
 from src.preflight import compute_deltas
 from src import run_state
+from src.generation import persian_generation_kwargs
 
 
 DEFAULT_TELEPHONY_PROFILES = ["customer"]
@@ -421,9 +422,8 @@ class WebTelemetryCallback(TrainerCallback):
             try:
                 from src.telephone import degrade_for_eval_profiled as _degrade
                 degrade_fn = _degrade
-            except ImportError:
-                print("[TelemetryCallback] src.telephone missing; phone pass uses clean audio.")
-                degrade_fn = None
+            except ImportError as exc:
+                raise RuntimeError("Phone benchmark requires telephone augmentation") from exc
         predictions: list = []
         profiles_used: list = []
         for i in range(0, total_test, batch_size):
@@ -441,7 +441,9 @@ class WebTelemetryCallback(TrainerCallback):
                             use_ffmpeg=self.telephony_use_ffmpeg,
                         )
                     except Exception as e:
-                        print(f"[TelemetryCallback] phone degrade failed (idx={i + j}): {e}")
+                        raise RuntimeError(f"Phone degradation failed for sample {i + j}: {e}") from e
+                    if not used_profile:
+                        raise RuntimeError(f"Phone degradation returned no profile for sample {i + j}")
                 profiles_used.append(used_profile)
                 waveforms.append(wav)
 
@@ -453,10 +455,10 @@ class WebTelemetryCallback(TrainerCallback):
 
             if use_amp:
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
             else:
                 with torch.inference_mode():
-                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
 
             batch_preds = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
             predictions.extend(batch_preds)
@@ -571,7 +573,7 @@ class WebTelemetryCallback(TrainerCallback):
                             per_profile, weights
                         )
                 except Exception as e:
-                    print(f"[TelemetryCallback] Phone benchmark failed ({e}); keeping clean only.")
+                    raise RuntimeError(f"Phone benchmark failed: {e}") from e
 
             # Evaluate Canary Sentences (if provided)
             canary_evals = []
@@ -584,10 +586,10 @@ class WebTelemetryCallback(TrainerCallback):
                     ).input_features.to(device)
                     if use_amp:
                         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225)
+                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225, **persian_generation_kwargs(model))
                     else:
                         with torch.inference_mode():
-                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225)
+                            c_pred_ids = model.generate(input_features=c_feats, max_new_tokens=225, **persian_generation_kwargs(model))
                     c_pred = self.processor.batch_decode(c_pred_ids, skip_special_tokens=True)[0]
                     canary_evals.append({
                         "label": canary.get("label", "Canary"),

@@ -822,6 +822,9 @@ class _FakeEvalModel:
 
 
 class _FakeEvalMetrics:
+    def format_results_table(self, name, results):
+        return name
+
     def evaluate_predictions(self, references, predictions, is_informal_flags):
         return {
             "total_samples": len(references),
@@ -1444,11 +1447,21 @@ def test_whisper_seq2seq_trainer_prediction_step_handles_dtype_mismatch(tmp_path
 
 
 
-def test_ensure_prep_cache_from_hf_skips_when_local_meta_exists(tmp_path, monkeypatch):
+def _write_prep_slot(prep):
+    from datasets import Dataset
+    from src import prep_cache
+
+    staging = prep / "train.staging-test"
+    staging.mkdir(parents=True)
+    ds = Dataset.from_dict({"x": [1, 2]}).map(
+        lambda row: row, cache_file_name=str(staging / "data.arrow"),
+    )
+    prep_cache.publish_dataset(ds, staging, prep / "train", {"test": True})
+
+
+def test_ensure_prep_cache_from_hf_skips_when_local_cache_is_complete(tmp_path, monkeypatch):
     train_lora = _train_lora()
-    train = tmp_path / "prep" / "train"
-    train.mkdir(parents=True)
-    (train / "meta.json").write_text("{}", encoding="utf-8")
+    _write_prep_slot(tmp_path / "prep")
     monkeypatch.setenv("ASR_PREP_HF_REPO", "me/prep")
     called = {"count": 0}
 
@@ -1470,9 +1483,7 @@ def test_ensure_prep_cache_from_hf_downloads_train_only(tmp_path, monkeypatch):
 
     def fake_download(**kwargs):
         calls.append(kwargs)
-        train = Path(kwargs["local_dir"]) / "train"
-        train.mkdir(parents=True)
-        (train / "meta.json").write_text("{}", encoding="utf-8")
+        _write_prep_slot(Path(kwargs["local_dir"]))
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", fake_download)
     train_lora._ensure_prep_cache_from_hf(str(prep))
@@ -1492,3 +1503,85 @@ def test_ensure_prep_cache_from_hf_disabled_by_off(tmp_path, monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("downloaded")),
     )
     train_lora._ensure_prep_cache_from_hf(str(tmp_path / "prep"))
+
+
+@pytest.mark.parametrize("damage", ["missing", "truncated", "metadata-only"])
+def test_ensure_prep_cache_from_hf_repairs_interrupted_download(tmp_path, monkeypatch, damage):
+    import shutil
+    train_lora = _train_lora()
+    prep = tmp_path / "prep"
+    remote = tmp_path / "remote"
+    _write_prep_slot(remote)
+    shutil.copytree(remote, prep)
+    shard = next((prep / "train").glob("*.arrow"))
+    if damage in ("missing", "metadata-only"):
+        shard.unlink()
+    else:
+        shard.write_bytes(shard.read_bytes()[:10])
+    monkeypatch.setenv("ASR_PREP_HF_REPO", "me/prep")
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        shutil.copytree(remote / "train", Path(kwargs["local_dir"]) / "train", dirs_exist_ok=True)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    train_lora._ensure_prep_cache_from_hf(str(prep))
+    assert len(calls) == 1
+    assert train_lora.prep_cache.load_prep_cache(prep / "train", {"test": True}) is not None
+    train_lora._ensure_prep_cache_from_hf(str(prep))
+    assert len(calls) == 1
+
+
+def test_ensure_prep_cache_from_hf_rejects_incomplete_remote(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    monkeypatch.setenv("ASR_PREP_HF_REPO", "me/prep")
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda **kw: None)
+    with pytest.raises(RuntimeError, match="incomplete or invalid"):
+        train_lora._ensure_prep_cache_from_hf(str(tmp_path))
+
+
+def test_explicit_resume_requires_existing_complete_checkpoint(tmp_path):
+    train_lora = _train_lora()
+    args = SimpleNamespace(output_dir=str(tmp_path), fresh_start=False, auto_resume=True,
+                           resume_from_checkpoint=str(tmp_path / "missing"))
+    with pytest.raises(FileNotFoundError, match="Explicit resume checkpoint not found"):
+        train_lora._resolve_resume_checkpoint(args)
+    args.resume_from_checkpoint = "last"
+    with pytest.raises(FileNotFoundError, match="Explicit resume requested"):
+        train_lora._resolve_resume_checkpoint(args)
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    args.resume_from_checkpoint = str(checkpoint)
+    with pytest.raises(ValueError, match="incomplete"):
+        train_lora._resolve_resume_checkpoint(args)
+    (checkpoint / "trainer_state.json").write_text('{}')
+    args.resume_from_checkpoint = "last"
+    with pytest.raises(ValueError, match="incomplete"):
+        train_lora._resolve_resume_checkpoint(args)
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    assert train_lora._resolve_resume_checkpoint(args) == str(checkpoint)
+    args.resume_from_checkpoint = None
+    assert train_lora._resolve_resume_checkpoint(args) == str(checkpoint)
+    args.fresh_start = True
+    assert train_lora._resolve_resume_checkpoint(args) is None
+
+
+def test_final_phone_failure_marks_post_eval_failed_and_writes_no_report(tmp_path, monkeypatch):
+    train_lora = _train_lora()
+    run_dir = _run(tmp_path)
+
+    def fail(*a, **kw):
+        raise RuntimeError("codec unavailable")
+
+    monkeypatch.setattr("src.telephone.degrade_for_eval_profiled", fail)
+    with pytest.raises(RuntimeError, match="Final phone evaluation failed: codec unavailable"):
+        train_lora._run_post_eval_stage(
+            run_dir=run_dir, results_dir=run_dir,
+            evaluate=lambda: _exercise_post_training_eval(
+                train_lora, monkeypatch, tmp_path, _FakeEvalModel(), should_stop=lambda: False,
+            ),
+        )
+    assert _stages(run_dir)["post_eval"]["status"] == "failed"
+    assert run_state.load_run(run_dir)["status"] == "failed"
+    assert not (tmp_path / "output" / "final_evaluation_report.json").exists()

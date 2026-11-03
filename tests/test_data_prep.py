@@ -102,6 +102,24 @@ def test_tokenizer_labels_kept_without_label_format():
     assert out["labels"] == [1, 7, 2, 3, 0]
 
 
+def test_tokenizer_fallback_sets_persian_but_native_label_ids_bypass_it():
+    calls = []
+
+    class Tokenizer(_StubTokenizer):
+        def set_prefix_tokens(self, **kwargs):
+            calls.append(kwargs)
+
+    processor = SimpleNamespace(feature_extractor=_StubFeatureExtractor(), tokenizer=Tokenizer())
+    PersianASRDataPipeline(processor=processor, normalizer=_StubNormalizer())
+    assert calls == [{"language": "fa", "task": "transcribe"}]
+    calls.clear()
+    PersianASRDataPipeline(
+        processor=processor, normalizer=_StubNormalizer(),
+        label_prefix_ids=(51908, 51968, 51972), label_eos_id=51865,
+    )
+    assert calls == []
+
+
 def test_prepare_split_matches_across_num_proc():
     datasets = pytest.importorskip("datasets")
     pytest.importorskip("soundfile")

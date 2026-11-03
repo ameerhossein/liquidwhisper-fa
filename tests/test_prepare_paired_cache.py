@@ -11,7 +11,7 @@ from scripts import prepare_paired_cache as ppc
 from src import prep_cache
 
 
-def _stage(path: Path, labels):
+def _stage(path: Path, labels, fingerprint=None, *, variant=None, source="test-source"):
     path.mkdir(parents=True, exist_ok=True)
     ds = Dataset.from_dict(
         {
@@ -23,14 +23,18 @@ def _stage(path: Path, labels):
     ds.save_to_disk(str(path))
     arrow = next(path.glob("*.arrow"))
     loaded = Dataset.from_file(str(arrow))
-    ppc.write_stage_manifest(path, loaded)
+    ppc.write_stage_manifest(
+        path, loaded, variant=variant or path.name,
+        fingerprint=fingerprint if fingerprint is not None else {"x": 1},
+        source_fingerprint=source,
+    )
     return loaded
 
 
 def test_assemble_stages_keeps_clean_then_phone_order(tmp_path):
-    _stage(tmp_path / "clean", [1, 2])
-    _stage(tmp_path / "phone", [1, 2])
     fingerprint = {"dataset_name": "test", "split": "train"}
+    _stage(tmp_path / "clean", [1, 2], fingerprint)
+    _stage(tmp_path / "phone", [1, 2], fingerprint)
 
     meta = ppc.assemble_stages(
         tmp_path / "clean",
@@ -102,6 +106,48 @@ def test_build_fingerprint_matches_paired_training_contract(monkeypatch):
         "telephony_rng": "per_row_index_v1",
         "label_ids": [51908, 51968, 51972, 51865],
     }
+
+
+@pytest.mark.parametrize("changed", ["base_model", "dataset_name", "telephony_seed", "telephony_profiles"])
+def test_assemble_rejects_half_prepared_with_different_settings(tmp_path, changed):
+    fingerprint = {"base_model": "m", "dataset_name": "d", "telephony_seed": 42,
+                   "telephony_profiles": ["customer"]}
+    _stage(tmp_path / "clean", [1, 2], fingerprint)
+    _stage(tmp_path / "phone", [1, 2], {**fingerprint, changed: "different"})
+    with pytest.raises(ValueError, match="preparation fingerprint mismatch"):
+        ppc.assemble_stages(tmp_path / "clean", tmp_path / "phone", tmp_path / "train", fingerprint)
+    assert (tmp_path / "clean" / ppc.MANIFEST).exists()
+    assert (tmp_path / "phone" / ppc.MANIFEST).exists()
+    assert not (tmp_path / "train").exists()
+
+
+def test_assemble_rejects_wrong_variant_and_changed_source(tmp_path):
+    _stage(tmp_path / "clean", [1, 2])
+    _stage(tmp_path / "phone", [1, 2], variant="clean")
+    with pytest.raises(ValueError, match="phone stage has variant"):
+        ppc.assemble_stages(tmp_path / "clean", tmp_path / "phone", tmp_path / "train", {"x": 1})
+
+    import json
+    path = tmp_path / "phone" / ppc.MANIFEST
+    manifest = json.loads(path.read_text())
+    manifest.update(variant="phone", source_fingerprint="different-source")
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="source dataset fingerprints differ"):
+        ppc.assemble_stages(tmp_path / "clean", tmp_path / "phone", tmp_path / "train", {"x": 1})
+
+
+def test_half_rejects_legacy_manifest_and_changed_preparation_code(tmp_path, monkeypatch):
+    import json
+    _stage(tmp_path / "clean", [1, 2])
+    path = tmp_path / "clean" / ppc.MANIFEST
+    manifest = json.loads(path.read_text())
+    path.write_text(json.dumps({**manifest, "format": "prep_half_v1"}))
+    with pytest.raises(ValueError, match="regenerate legacy halves"):
+        ppc.load_stage_manifest(tmp_path / "clean")
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(ppc, "_preparation_hash", lambda: "changed-code")
+    with pytest.raises(ValueError, match="preparation code changed"):
+        ppc.load_stage_manifest(tmp_path / "clean")
 
 
 def test_upload_final_defaults_to_configured_repo(tmp_path, monkeypatch):

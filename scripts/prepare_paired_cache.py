@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -45,7 +46,7 @@ from datasets import Dataset, concatenate_datasets  # noqa: E402
 
 from src import prep_cache  # noqa: E402
 
-STAGE_FORMAT = "prep_half_v1"
+STAGE_FORMAT = "prep_half_v2"
 MANIFEST = "manifest.json"
 DEFAULT_PREP_DIR = (
     (os.environ.get("ASR_PREP_CACHE_DIR", "") or "").strip()
@@ -70,7 +71,19 @@ def _cache_paths(dataset: Any) -> List[Path]:
     return paths
 
 
-def write_stage_manifest(stage: Path, dataset: Any) -> Dict[str, Any]:
+def _preparation_hash() -> str:
+    """Version feature extraction, labels, normalization and augmentation."""
+    digest = hashlib.sha256()
+    for name in ("src/data.py", "src/normalizer.py", "src/telephone.py"):
+        digest.update(name.encode())
+        digest.update((_REPO_ROOT / name).read_bytes())
+    return digest.hexdigest()
+
+
+def write_stage_manifest(
+    stage: Path, dataset: Any, *, variant: str,
+    fingerprint: Dict[str, Any], source_fingerprint: str,
+) -> Dict[str, Any]:
     """Write a manifest for one prepared half, with per-shard row counts."""
     stage = Path(stage).resolve()
     stage.mkdir(parents=True, exist_ok=True)
@@ -90,6 +103,10 @@ def write_stage_manifest(stage: Path, dataset: Any) -> Dict[str, Any]:
         raise ValueError(f"no Arrow cache files were written under {stage}")
     manifest = {
         "format": STAGE_FORMAT,
+        "variant": variant,
+        "fingerprint": fingerprint,
+        "source_fingerprint": source_fingerprint,
+        "preparation_hash": _preparation_hash(),
         "rows": int(len(dataset)),
         "features": dataset.features.to_dict(),
         "shards": shards,
@@ -107,7 +124,18 @@ def load_stage_manifest(stage: Path) -> Dict[str, Any]:
     stage = Path(stage).resolve()
     manifest = json.loads((stage / MANIFEST).read_text(encoding="utf-8"))
     if manifest.get("format") != STAGE_FORMAT:
-        raise ValueError(f"unexpected stage format {manifest.get('format')!r}")
+        raise ValueError(
+            f"unexpected stage format {manifest.get('format')!r}; "
+            "regenerate legacy halves to record preparation provenance"
+        )
+    if manifest.get("variant") not in ("clean", "phone"):
+        raise ValueError("stage has no valid clean/phone variant")
+    if not isinstance(manifest.get("fingerprint"), dict):
+        raise ValueError("stage has no preparation fingerprint; regenerate it")
+    if not manifest.get("source_fingerprint"):
+        raise ValueError("stage has no source dataset fingerprint; regenerate it")
+    if manifest.get("preparation_hash") != _preparation_hash():
+        raise ValueError("stage preparation code changed; regenerate it")
     rows = int(manifest.get("rows", 0))
     if rows <= 0:
         raise ValueError("stage has no rows")
@@ -115,7 +143,10 @@ def load_stage_manifest(stage: Path) -> Dict[str, Any]:
     if not isinstance(shards, list) or not shards:
         raise ValueError("stage has no shards")
     for shard in shards:
-        path = stage / str(shard["file"])
+        name = shard["file"]
+        if not isinstance(name, str) or Path(name).name != name:
+            raise ValueError(f"invalid stage shard filename {name!r}")
+        path = stage / name
         if not path.is_file():
             raise ValueError(f"stage shard missing: {path}")
         if int(path.stat().st_size) != int(shard["bytes"]):
@@ -168,6 +199,13 @@ def assemble_stages(
 
     clean_manifest = load_stage_manifest(clean_stage)
     phone_manifest = load_stage_manifest(phone_stage)
+    for variant, manifest in (("clean", clean_manifest), ("phone", phone_manifest)):
+        if manifest["variant"] != variant:
+            raise ValueError(f"{variant} stage has variant {manifest['variant']!r}")
+        if manifest["fingerprint"] != fingerprint:
+            raise ValueError(f"{variant} stage preparation fingerprint mismatch")
+    if clean_manifest["source_fingerprint"] != phone_manifest["source_fingerprint"]:
+        raise ValueError("clean/phone source dataset fingerprints differ")
     if int(clean_manifest["rows"]) != int(phone_manifest["rows"]):
         raise ValueError(
             "clean/phone row count mismatch: "
@@ -268,7 +306,10 @@ def prepare_half(ns: argparse.Namespace, variant: str) -> int:
     raw = pipeline.load_raw_dataset(split="train", max_samples=ns.max_train_samples)
     print(f"[{variant}] raw rows={len(raw)}; preparing to {stage}", flush=True)
     dataset = pipeline.prepare_dataset_split(raw, cache_dir=str(stage))
-    manifest = write_stage_manifest(stage, dataset)
+    manifest = write_stage_manifest(
+        stage, dataset, variant=variant, fingerprint=build_fingerprint(ns),
+        source_fingerprint=raw._fingerprint,
+    )
     print(f"[{variant}] OK rows={manifest['rows']} shards={len(manifest['shards'])}", flush=True)
     return 0
 

@@ -36,6 +36,7 @@ from src.metrics import (
     weighted_normalized_wer,
 )
 from src.data import PersianASRDataPipeline
+from src.generation import persian_generation_kwargs
 
 
 def parse_args():
@@ -75,9 +76,8 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
         try:
             from src.telephone import degrade_for_eval_profiled as _degrade
             degrade_fn = _degrade
-        except ImportError:
-            print("Warning: src.telephone missing; phone eval falls back to clean.")
-            degrade_fn = None
+        except ImportError as exc:
+            raise RuntimeError("Phone evaluation requires telephone augmentation") from exc
     predictions: List[str] = []
     profiles_used: List[Optional[str]] = []
     total = len(test_ds)
@@ -94,6 +94,8 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
                     profiles=profiles or ["customer"],
                     use_ffmpeg=use_ffmpeg,
                 )
+                if not used_profile:
+                    raise RuntimeError(f"Phone degradation returned no profile for sample {i + j}")
             profiles_used.append(used_profile)
             waveforms.append(wav)
 
@@ -101,10 +103,10 @@ def transcribe_split(model, processor, test_ds, batch_size: int, device: str,
 
         if use_amp:
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
         else:
             with torch.inference_mode():
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
 
         batch_preds = processor.batch_decode(predicted_ids, skip_special_tokens=True)
         predictions.extend(batch_preds)

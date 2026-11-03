@@ -41,6 +41,8 @@ _CODE_HASH_FILES = (
     _REPO_ROOT / "src" / "metrics.py",
     _REPO_ROOT / "src" / "normalizer.py",
     _REPO_ROOT / "src" / "preflight.py",
+    _REPO_ROOT / "src" / "generation.py",
+    _REPO_ROOT / "src" / "telephone.py",
 )
 
 _PREFLIGHT_ROWS: Dict[str, Dict[str, Any]] = {

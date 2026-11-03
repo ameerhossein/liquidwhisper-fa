@@ -28,6 +28,7 @@ except Exception:
     pass
 
 from src.normalizer import PersianTextNormalizer
+from src.generation import persian_generation_kwargs
 
 
 def parse_args():
@@ -119,10 +120,10 @@ def main():
 
         if use_amp:
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
         else:
             with torch.inference_mode():
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
+                predicted_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
 
         transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
 

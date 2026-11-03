@@ -194,9 +194,14 @@ def publish_dataset(
 
 def load_prep_cache(
     cache_dir: Path,
-    fingerprint: Dict[str, Any],
+    fingerprint: Optional[Dict[str, Any]],
 ) -> Optional[Dataset]:
-    """Load a published cache, or return ``None`` on any validation failure."""
+    """Load a published cache, or return ``None`` on any validation failure.
+
+    ``fingerprint=None`` checks integrity without selecting a preparation
+    configuration, for example before deciding whether to resume a download.
+    Training must still load with its expected fingerprint.
+    """
     cache_dir = Path(cache_dir)
     try:
         with (cache_dir / _META_NAME).open("r", encoding="utf-8") as handle:
@@ -206,7 +211,9 @@ def load_prep_cache(
             raise ValueError("meta.json is not an object")
         if meta.get("format") != PREP_CACHE_FORMAT:
             raise ValueError(f"format {meta.get('format')!r} != {PREP_CACHE_FORMAT!r}")
-        if meta.get("fingerprint") != fingerprint:
+        if not isinstance(meta.get("fingerprint"), dict):
+            raise ValueError("fingerprint is not an object")
+        if fingerprint is not None and meta.get("fingerprint") != fingerprint:
             raise ValueError("fingerprint mismatch")
 
         total_rows = int(meta["total_rows"])

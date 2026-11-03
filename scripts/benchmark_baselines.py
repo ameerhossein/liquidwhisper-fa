@@ -36,6 +36,7 @@ except Exception:
 from src.normalizer import PersianTextNormalizer
 from src.metrics import ASRMetricsCalculator
 from src.data import PersianASRDataPipeline
+from src.generation import persian_generation_kwargs
 
 
 def parse_args():
@@ -151,28 +152,16 @@ def transcribe_batch(
     if _should_autocast(device):
         dtype = _resolve_infer_dtype(device)
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-            if "buzzasr" in model_id.lower():
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
-            else:
-                forced_decoder_ids = processor.get_decoder_prompt_ids(language="persian", task="transcribe")
-                predicted_ids = model.generate(
-                    input_features=feats,
-                    forced_decoder_ids=forced_decoder_ids,
-                    max_new_tokens=225,
-                )
+            predicted_ids = model.generate(
+                input_features=feats, max_new_tokens=225,
+                **persian_generation_kwargs(model),
+            )
     else:
         with torch.inference_mode():
-            # Monolingual BuzzASR already bakes Persian prompt into its generation config
-            if "buzzasr" in model_id.lower():
-                predicted_ids = model.generate(input_features=feats, max_new_tokens=225)
-            else:
-                # For standard multilingual Whisper, force Persian transcription
-                forced_decoder_ids = processor.get_decoder_prompt_ids(language="persian", task="transcribe")
-                predicted_ids = model.generate(
-                    input_features=feats,
-                    forced_decoder_ids=forced_decoder_ids,
-                    max_new_tokens=225,
-                )
+            predicted_ids = model.generate(
+                input_features=feats, max_new_tokens=225,
+                **persian_generation_kwargs(model),
+            )
 
     transcriptions = processor.batch_decode(predicted_ids, skip_special_tokens=True)
     return transcriptions

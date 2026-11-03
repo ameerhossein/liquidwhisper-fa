@@ -305,6 +305,10 @@ class PersianASRDataPipeline:
         self.telephony_use_ffmpeg = bool(telephony_use_ffmpeg)
         self.label_prefix_ids = tuple(label_prefix_ids) if label_prefix_ids is not None else None
         self.label_eos_id = label_eos_id
+        if self.label_prefix_ids is None:
+            set_prefix = getattr(getattr(self.processor, "tokenizer", None), "set_prefix_tokens", None)
+            if callable(set_prefix):
+                set_prefix(language="fa", task="transcribe")
         self._tele_base_seed = telephony_seed if telephony_seed is not None else random.SystemRandom().randrange(2 ** 31)
         self._tele_rng = random.Random(self._tele_base_seed)
         self._tele_warned_missing = False

@@ -14,6 +14,7 @@ import argparse
 import json
 import shutil
 import time
+import tempfile
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 
@@ -79,6 +80,7 @@ from src import paths as _managed_paths
 from src import prep_cache
 from src import run_state
 from src import hf_sync
+from src.generation import persian_generation_kwargs
 
 
 def _model_float_dtype(model: torch.nn.Module) -> Optional[torch.dtype]:
@@ -129,6 +131,7 @@ class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
         **gen_kwargs,
     ) -> tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
         if self.args.predict_with_generate:
+            gen_kwargs.update(persian_generation_kwargs(model))
             autocast_ctx = (
                 self.accelerator.autocast()
                 if hasattr(self, "accelerator") and self.accelerator is not None
@@ -457,7 +460,7 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, teleph
     except Exception:
         profiles = []
     prefix_ids, eos_id = _label_format(getattr(args, "base_model", ""))
-    return {
+    fingerprint = {
         "dataset_name": getattr(args, "dataset_name", ""),
         "base_model": getattr(args, "base_model", ""),
         "split": split,
@@ -471,6 +474,9 @@ def _prep_fingerprint(args, split: str, max_samples, telephony_mode: str, teleph
         "telephony_rng": "per_row_index_v1",
         "label_ids": None if prefix_ids is None else [*prefix_ids, eos_id],
     }
+    if prefix_ids is None:
+        fingerprint["label_language"] = "fa"
+    return fingerprint
 
 
 def _resolve_output_dir(raw: str) -> str:
@@ -508,8 +514,8 @@ def _ensure_prep_cache_from_hf(prep_cache_dir: str) -> None:
     if not repo:
         return
     prep_cache_dir = Path(prep_cache_dir)
-    train_meta = prep_cache_dir / "train" / "meta.json"
-    if train_meta.is_file():
+    train_cache = prep_cache_dir / "train"
+    if prep_cache.load_prep_cache(train_cache, None) is not None:
         return
     from huggingface_hub import snapshot_download
 
@@ -526,9 +532,10 @@ def _ensure_prep_cache_from_hf(prep_cache_dir: str) -> None:
             or None
         ),
     )
-    if not train_meta.is_file():
+    if prep_cache.load_prep_cache(train_cache, None) is None:
         raise RuntimeError(
-            f"HF prep repo {repo} has no train/meta.json after download"
+            f"HF prep repo {repo} has an incomplete or invalid train/ cache "
+            "after download; retry to resume missing downloads"
         )
     print(f" Prep cache: downloaded train/ from {repo}", flush=True)
 
@@ -1437,17 +1444,18 @@ def _resolve_resume_checkpoint(args) -> Optional[bool | str]:
         low = str(explicit).strip().lower()
         if low in ("last", "true", "yes", "1", "auto"):
             last = _find_last_checkpoint(args.output_dir)
-            if last:
-                print(f"Resuming from latest checkpoint: {last}")
-                return last
-            print("No checkpoint found in output_dir; starting fresh.")
-            return None
-        p = Path(str(explicit))
-        if p.is_dir():
-            print(f"Resuming from explicit checkpoint: {p}")
-            return str(p)
-        print(f"Warning: --resume_from_checkpoint '{explicit}' not found; starting fresh.")
-        return None
+            if not last:
+                raise FileNotFoundError(
+                    f"Explicit resume requested but no checkpoint exists in {args.output_dir}"
+                )
+            explicit = last
+        p = Path(str(explicit)).expanduser()
+        if not p.is_dir():
+            raise FileNotFoundError(f"Explicit resume checkpoint not found: {p}")
+        if not hf_sync.is_complete_checkpoint(p):
+            raise ValueError(f"Explicit resume checkpoint is incomplete: {p}")
+        print(f"Resuming from explicit checkpoint: {p}")
+        return str(p)
     if bool(getattr(args, "auto_resume", True)):
         last = _find_last_checkpoint(args.output_dir)
         if last:
@@ -1751,6 +1759,41 @@ def _run_training(args, run_dir):
         _finish_hf_mirror(mirror, run_dir)
 
 
+def _save_best_adapter(model, processor, output_dir: str) -> Path:
+    """Publish complete adapter/processor files, preserving a previous save."""
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "best_adapter"
+    staging = Path(tempfile.mkdtemp(prefix=".best_adapter.staging-", dir=root))
+    backup = None
+    published = False
+    try:
+        model.save_pretrained(str(staging))
+        processor.save_pretrained(str(staging))
+        config = getattr(model, "generation_config", None)
+        if config is not None:
+            config.save_pretrained(str(staging))
+        valid, reason = hf_sync.validate_adapter(staging)
+        if not valid:
+            raise RuntimeError(f"Could not save best adapter: {reason}")
+        if target.exists():
+            backup = Path(tempfile.mkdtemp(prefix=".best_adapter.previous-", dir=root))
+            backup.rmdir()
+            os.replace(target, backup)
+        try:
+            os.replace(staging, target)
+        except BaseException:
+            if backup is not None:
+                os.replace(backup, target)
+            raise
+        published = True
+        return target
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if published and backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
+
+
 def _run_training_stages(args, run_dir, mirror):
     # Post-eval-only resume: never repeat dataset prep, preflight, or training,
     # and never replay optimizer steps.
@@ -2031,6 +2074,7 @@ def _run_training_stages(args, run_dir, mirror):
         torch_dtype=dtype,
         low_cpu_mem_usage=True
     )
+    persian_generation_kwargs(model)
 
     # Disable cache when training with gradient checkpointing
     model.config.use_cache = False
@@ -2175,36 +2219,41 @@ def _run_training_stages(args, run_dir, mirror):
         trainer = WhisperSeq2SeqTrainer(**_trainer_common)
 
     # 9. Execute Training (auto-resumable from persistent-volume checkpoints)
-    resume_ckpt = _resolve_resume_checkpoint(args)
-    if resume_ckpt:
-        print(f"\nResuming training from: {resume_ckpt}")
-    else:
-        print("\nStarting training loop (fresh)...")
     _mark_run_stage(run_dir, "training", "running")
     try:
+        resume_ckpt = _resolve_resume_checkpoint(args)
+        if resume_ckpt:
+            print(f"\nResuming training from: {resume_ckpt}")
+        else:
+            print("\nStarting training loop (fresh)...")
         trainer.train(resume_from_checkpoint=resume_ckpt)
     except Exception as exc:
         _mark_run_stage(run_dir, "training", "failed",
                         detail=f"training failed: {exc}")
         _mark_run_status(run_dir, "failed", failed_stage="training",
                          last_error=str(exc))
+        _write_telemetry_status(args.results_dir, "failed", run_dir=run_dir)
         raise
 
     halted = bool(telemetry_cb is not None and getattr(telemetry_cb, "halt_requested", False))
     if halted:
         print("\nTraining halted by user request; skipping post-training evaluation.")
         _halt_run(run_dir, args.results_dir, "training")
-    else:
-        _mark_run_stage(run_dir, "training", "completed", detail=None)
 
     # 10. Save Best Adapter & Processor
-    best_save_path = os.path.join(args.output_dir, "best_adapter")
-    print(f"\nTraining completed! Saving best LoRA adapter to: {best_save_path}")
-    trainer.model.save_pretrained(best_save_path)
-    processor.save_pretrained(best_save_path)
+    print("\nSaving best LoRA adapter and processor...")
+    try:
+        best_save_path = _save_best_adapter(trainer.model, processor, args.output_dir)
+    except Exception as exc:
+        _mark_run_stage(run_dir, "training", "failed", detail=f"adapter save failed: {exc}")
+        _mark_run_status(run_dir, "failed", failed_stage="training", last_error=str(exc))
+        _write_telemetry_status(args.results_dir, "failed", run_dir=run_dir)
+        raise
+    if not halted:
+        _mark_run_stage(run_dir, "training", "completed", detail=None)
     print("Done saving best adapter.")
     if mirror is not None:
-        mirror.enqueue_adapter(best_save_path)
+        mirror.enqueue_adapter(str(best_save_path))
 
     if halted:
         return
@@ -2380,16 +2429,18 @@ def _run_post_training_evaluation(
                         arr, used_profile = degraded
                     else:
                         arr = degraded
+                    if not used_profile:
+                        raise RuntimeError(f"Phone degradation returned no profile for sample {i + j}")
                 profiles_used.append(used_profile)
                 waveforms.append(arr)
 
             feats = processor(waveforms, sampling_rate=16000, return_tensors="pt").input_features.to(device)
             if use_amp:
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype):
-                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
             else:
                 with torch.inference_mode():
-                    pred_ids = model.generate(input_features=feats, max_new_tokens=225)
+                    pred_ids = model.generate(input_features=feats, max_new_tokens=225, **persian_generation_kwargs(model))
 
             preds.extend(processor.batch_decode(pred_ids, skip_special_tokens=True))
         return preds, audio_seconds, profiles_used
@@ -2495,7 +2546,9 @@ def _run_post_training_evaluation(
                 "details": phone_results,
             }
         except Exception as e:
-            print(f"[Final Report] Phone pass failed ({e}); report will be clean-only.")
+            if _is_halt_requested(e):
+                raise
+            raise RuntimeError(f"Final phone evaluation failed: {e}") from e
 
     # A halt can arrive during the phone pass; never write a report after it.
     _check_halt()

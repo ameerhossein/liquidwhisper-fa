@@ -23,6 +23,8 @@ try:
 except Exception:
     pass
 
+from src.generation import persian_generation_kwargs
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Merge LoRA weights with Base Whisper Model")
@@ -118,6 +120,7 @@ def main():
 
     print("Merging weights into base model...")
     merged_model = peft_model.merge_and_unload()
+    persian_generation_kwargs(merged_model)
 
     print(f"Saving merged model to: {args.output_dir}...")
     merged_model.save_pretrained(args.output_dir)

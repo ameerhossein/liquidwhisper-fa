@@ -7,11 +7,13 @@ files during construction and ``_record_epoch_benchmark``.
 
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.trainer_callbacks import WebTelemetryCallback
+import pytest
 
 
 def test_initial_rows_include_preflight_phone_metrics(tmp_path):
@@ -109,3 +111,48 @@ def test_missing_whisper_baseline_is_tolerated(tmp_path):
     row = json.loads((tmp_path / "epoch_benchmarks.json").read_text())[-1]
     assert row["delta_vs_buzzasr"] == -2.2
     assert "delta_vs_whisper" not in row
+
+
+@pytest.mark.parametrize("failure", ["exception", "no-profile"])
+def test_epoch_phone_degradation_never_falls_back_to_clean(tmp_path, monkeypatch, failure):
+    class Rows:
+        def __getitem__(self, index):
+            return {"audio": [{"array": [0.0] * 160}]}
+
+    def degrade(waveform, **kwargs):
+        if failure == "exception":
+            raise RuntimeError("codec unavailable")
+        return waveform, None
+
+    monkeypatch.setattr("src.telephone.degrade_for_eval_profiled", degrade)
+    cb = WebTelemetryCallback(results_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match="Phone degradation"):
+        cb._transcribe_pass(Rows(), None, "cpu", None, False, 1, 1, degrade_phone=True)
+
+
+def test_epoch_phone_pass_failure_propagates_and_restores_training_mode(tmp_path, monkeypatch):
+    class Rows:
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            return iter([{"text": "سلام", "is_informal": False}])
+
+    model = SimpleNamespace(training=True)
+    model.eval = lambda: setattr(model, "training", False)
+    model.train = lambda: setattr(model, "training", True)
+    metrics = SimpleNamespace(evaluate_predictions=lambda **k: {"total_samples": 1})
+    cb = WebTelemetryCallback(
+        results_dir=str(tmp_path), test_dataset=Rows(), processor=object(),
+        metrics_calculator=metrics,
+    )
+
+    def transcribe(*args, degrade_phone=False):
+        if degrade_phone:
+            raise RuntimeError("generation failed")
+        return ["سلام"], [None]
+
+    monkeypatch.setattr(cb, "_transcribe_pass", transcribe)
+    with pytest.raises(RuntimeError, match="Phone benchmark failed: generation failed"):
+        cb._evaluate_benchmark(model, 1)
+    assert model.training is True
