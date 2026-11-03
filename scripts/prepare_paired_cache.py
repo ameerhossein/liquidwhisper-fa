@@ -16,6 +16,15 @@ Separate commands are available for manual recovery:
     python scripts/prepare_paired_cache.py clean ...
     python scripts/prepare_paired_cache.py phone ...
     python scripts/prepare_paired_cache.py assemble ...
+
+Existing halves made with variant-dependent HF source hashes can be recovered:
+
+    python scripts/prepare_paired_cache.py assemble \
+        --prep-cache-dir /root/prep_cache \
+        --allow-source-fingerprint-mismatch --no-clean-up
+
+Use this only for halves from the same source run: labels and informal flags
+are checked in row order, but cannot prove identical source audio.
 """
 
 from __future__ import annotations
@@ -188,6 +197,7 @@ def assemble_stages(
     *,
     force: bool = False,
     clean_up: bool = True,
+    allow_source_fingerprint_mismatch: bool = False,
 ) -> Dict[str, Any]:
     """Validate both halves and publish them as one paired prep-cache slot."""
     clean_stage = Path(clean_stage).resolve()
@@ -205,7 +215,18 @@ def assemble_stages(
         if manifest["fingerprint"] != fingerprint:
             raise ValueError(f"{variant} stage preparation fingerprint mismatch")
     if clean_manifest["source_fingerprint"] != phone_manifest["source_fingerprint"]:
-        raise ValueError("clean/phone source dataset fingerprints differ")
+        if not allow_source_fingerprint_mismatch:
+            raise ValueError(
+                "clean/phone source dataset fingerprints differ; for existing halves "
+                "affected by variant-dependent HF hashes, retry assemble with "
+                "--allow-source-fingerprint-mismatch (row pairing is still checked)"
+            )
+        print(
+            "[assemble] WARNING: accepting different HF source fingerprints; "
+            "checking labels and informal flags in row order. These checks cannot "
+            "prove that the source audio is identical.",
+            flush=True,
+        )
     if int(clean_manifest["rows"]) != int(phone_manifest["rows"]):
         raise ValueError(
             "clean/phone row count mismatch: "
@@ -292,18 +313,20 @@ def prepare_half(ns: argparse.Namespace, variant: str) -> int:
         dataset_name=ns.dataset_name,
         normalizer=normalizer,
         num_proc=ns.num_proc,
-        telephony_prob=0.0 if variant == "clean" else 1.0,
+        # HF hashes the informal filter's closure, including this pipeline.
+        # Keep its state identical while loading either source half.
+        telephony_prob=0.0,
         telephony_profiles=list(ns.telephony_profiles),
         telephony_seed=int(ns.telephony_seed),
         telephony_use_ffmpeg=bool(ns.telephony_use_ffmpeg),
         label_prefix_ids=prefix_ids,
         label_eos_id=eos_id,
     )
-    if variant == "phone":
-        pipeline.strict_telephony = True
-
     print(f"[{variant}] loading {ns.dataset_name} train split", flush=True)
     raw = pipeline.load_raw_dataset(split="train", max_samples=ns.max_train_samples)
+    if variant == "phone":
+        pipeline.telephony_prob = 1.0
+        pipeline.strict_telephony = True
     print(f"[{variant}] raw rows={len(raw)}; preparing to {stage}", flush=True)
     dataset = pipeline.prepare_dataset_split(raw, cache_dir=str(stage))
     manifest = write_stage_manifest(
@@ -759,6 +782,15 @@ def build_parser() -> argparse.ArgumentParser:
     assemble.add_argument("--phone-stage", default=None)
     assemble.add_argument("--train-dir", default=None)
     assemble.add_argument("--no-clean-up", action="store_true")
+    assemble.add_argument(
+        "--allow-source-fingerprint-mismatch",
+        action="store_true",
+        help=(
+            "Recover existing halves with variant-dependent HF hashes; still "
+            "validate settings, schema, row counts, labels and informal flags. "
+            "Cannot verify identical source audio."
+        ),
+    )
 
     allp = sub.add_parser("all", help="run clean, offload/drop, phone, assemble")
     _common(allp)
@@ -821,6 +853,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             build_fingerprint(ns),
             force=ns.force,
             clean_up=ns.clean_up,
+            allow_source_fingerprint_mismatch=ns.allow_source_fingerprint_mismatch,
         )
         print(f"published {ns.train_dir} rows={meta['total_rows']}")
         _upload_final(ns, Path(ns.train_dir))

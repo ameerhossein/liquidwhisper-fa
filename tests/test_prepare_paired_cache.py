@@ -152,6 +152,73 @@ def test_half_rejects_legacy_manifest_and_changed_preparation_code(tmp_path, mon
         ppc.load_stage_manifest(tmp_path / "clean")
 
 
+@pytest.mark.parametrize("mismatch", [None, "labels", "is_informal"])
+def test_recover_variant_dependent_source_hashes(tmp_path, mismatch):
+    _stage(tmp_path / "clean", [1, 2], source="clean-hash")
+    _stage(tmp_path / "phone", [1, 2], source="phone-hash")
+    if mismatch:
+        phone = ppc.load_stage_dataset(tmp_path / "phone")
+        values = [[1], [3]] if mismatch == "labels" else [False, True]
+        phone = phone.remove_columns(mismatch).add_column(mismatch, values)
+        phone.save_to_disk(str(tmp_path / "replacement"))
+        import shutil
+        shutil.rmtree(tmp_path / "phone")
+        (tmp_path / "replacement").rename(tmp_path / "phone")
+        loaded = Dataset.from_file(str(next((tmp_path / "phone").glob("*.arrow"))))
+        ppc.write_stage_manifest(
+            tmp_path / "phone", loaded, variant="phone", fingerprint={"x": 1},
+            source_fingerprint="phone-hash",
+        )
+    kwargs = dict(allow_source_fingerprint_mismatch=True)
+    if mismatch:
+        with pytest.raises(ValueError, match=mismatch):
+            ppc.assemble_stages(tmp_path / "clean", tmp_path / "phone",
+                                tmp_path / "train", {"x": 1}, **kwargs)
+        assert (tmp_path / "clean" / ppc.MANIFEST).exists()
+        assert (tmp_path / "phone" / ppc.MANIFEST).exists()
+        assert not (tmp_path / "train").exists()
+    else:
+        meta = ppc.assemble_stages(tmp_path / "clean", tmp_path / "phone",
+                                   tmp_path / "train", {"x": 1}, **kwargs)
+        assert meta["total_rows"] == 4
+
+
+def test_half_loads_source_with_identical_pipeline_state(tmp_path, monkeypatch):
+    from datasets.fingerprint import Hasher
+    from src.data import PersianASRDataPipeline
+
+    source_hashes = []
+    preparation_states = []
+
+    class Raw:
+        _fingerprint = "source"
+
+        def __len__(self):
+            return 2
+
+    def load_raw(self, **kwargs):
+        # The informal-data filter captures self through its normalizer closure.
+        source_hashes.append(Hasher.hash(self))
+        return Raw()
+
+    def prepare(self, raw, **kwargs):
+        preparation_states.append((self.telephony_prob, self.strict_telephony))
+        return object()
+
+    monkeypatch.setattr("transformers.WhisperProcessor.from_pretrained", lambda _: None)
+    monkeypatch.setattr("scripts.train_lora._label_format", lambda _: (None, None))
+    monkeypatch.setattr(PersianASRDataPipeline, "load_raw_dataset", load_raw)
+    monkeypatch.setattr(PersianASRDataPipeline, "prepare_dataset_split", prepare)
+    monkeypatch.setattr(ppc, "build_fingerprint", lambda _: {"x": 1})
+    monkeypatch.setattr(ppc, "write_stage_manifest", lambda *a, **kw: {"rows": 2, "shards": []})
+    for variant in ("clean", "phone"):
+        ns = _all_ns(tmp_path)
+        ns.stage = str(tmp_path / variant)
+        ppc.prepare_half(ns, variant)
+    assert source_hashes[0] == source_hashes[1]
+    assert preparation_states == [(0.0, False), (1.0, True)]
+
+
 def test_upload_final_defaults_to_configured_repo(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
