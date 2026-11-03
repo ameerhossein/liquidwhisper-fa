@@ -60,7 +60,8 @@ def test_adapter_publication_preserves_previous_save_on_failure(tmp_path, monkey
 
 
 @pytest.mark.parametrize("save_fails", [False, True])
-def test_training_completes_only_after_adapter_and_processor_are_published(tmp_path, monkeypatch, save_fails):
+@pytest.mark.parametrize("fork", [False, True])
+def test_training_completes_only_after_adapter_and_processor_are_published(tmp_path, monkeypatch, save_fails, fork):
     run = run_state.create_run(tmp_path, config={}, trainer_args={})
     run_dir = tmp_path / run["run_id"]
     run_state.set_status(run_dir, "running")
@@ -72,6 +73,16 @@ def test_training_completes_only_after_adapter_and_processor_are_published(tmp_p
     args.telephony_profiles = ["customer"]
     args.enable_telemetry = args.run_epoch_benchmark = args.run_post_test_eval = False
     args.num_proc = 0
+    if fork:
+        args.init_from_checkpoint = str(tmp_path / "parent" / "checkpoint-9000")
+        source = Path(args.init_from_checkpoint)
+        source.mkdir(parents=True)
+        (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+        (source / "adapter_model.safetensors").write_bytes(b"parent weights")
+        args.epochs = 1
+        args.learning_rate = 1e-5
+        args.lr_scheduler_type = "constant_with_warmup"
+        args.warmup_steps = 0
     model = _Model()
     processor = _Processor()
     save_processor = processor.save_pretrained
@@ -89,13 +100,21 @@ def test_training_completes_only_after_adapter_and_processor_are_published(tmp_p
     class Trainer:
         def __init__(self, **kwargs):
             self.model = kwargs["model"]
+            if fork:
+                assert kwargs["args"].learning_rate == 1e-5
+                assert kwargs["args"].num_train_epochs == 1
+                assert kwargs["args"].lr_scheduler_type == "constant_with_warmup"
 
         def train(self, **kwargs):
-            pass
+            assert kwargs["resume_from_checkpoint"] is None
 
     monkeypatch.setattr(train_lora, "WhisperProcessor", SimpleNamespace(from_pretrained=lambda *a, **k: processor))
     monkeypatch.setattr(train_lora, "WhisperForConditionalGeneration", SimpleNamespace(from_pretrained=lambda *a, **k: model))
     monkeypatch.setattr(train_lora, "get_peft_model", lambda model, config: model)
+    def load_adapter(base, source, *, is_trainable):
+        assert fork and source == args.init_from_checkpoint and is_trainable
+        return base
+    monkeypatch.setattr(train_lora, "PeftModel", SimpleNamespace(from_pretrained=load_adapter))
     monkeypatch.setattr(train_lora, "PersianASRDataPipeline", lambda **kwargs: object())
     monkeypatch.setattr(train_lora, "_label_format", lambda model: (None, None))
     monkeypatch.setattr(train_lora.prep_cache, "load_prep_cache", lambda *a: [object()])

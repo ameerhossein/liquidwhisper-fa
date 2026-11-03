@@ -116,6 +116,86 @@ def _seed_adapter(client, run_id):
     return adapter
 
 
+def _seed_fork_source(client):
+    run = run_state.create_run(client.mod.RUNS_DIR, config={}, trainer_args={})
+    source = _seed_adapter(client, run["run_id"])
+    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+    (source / "adapter_model.safetensors").write_bytes(b"parent weights")
+    return run, source
+
+
+def test_start_weights_only_fork_preserves_parent_and_records_new_settings(client):
+    parent, source = _seed_fork_source(client)
+    parent_dir = source.parent.parent
+    before = {str(p.relative_to(parent_dir)): p.read_bytes()
+              for p in parent_dir.rglob("*") if p.is_file()}
+    response = client.post("/api/train/start", json={
+        "init_from_checkpoint": str(source), "epochs": 1,
+        "learning_rate": 1e-5, "warmup_steps": 50,
+        "lr_scheduler_type": "constant_with_warmup",
+        "hf_run_repo": "me/new-fork",
+    })
+    assert response.status_code == 200, response.text
+    fork = response.json()
+    assert fork["run_id"] != parent["run_id"]
+    assert Path(fork["paths"]["output_dir"]) == client.mod.RUNS_DIR / fork["run_id"] / "output"
+    flags = _flags(client.launched[-1])
+    assert flags["--init_from_checkpoint"] == str(source)
+    assert flags["--learning_rate"] == "1e-05"
+    assert flags["--epochs"] == "1"
+    assert flags["--lr_scheduler_type"] == "constant_with_warmup"
+    assert flags["--hf_run_repo"] == "me/new-fork"
+    assert "--resume_from_checkpoint" not in client.launched[-1]
+    stored = _run_json(client, fork["run_id"])
+    assert stored["trainer_args"]["init_from_checkpoint"] == str(source)
+    assert stored["config"]["lr_scheduler_type"] == "constant_with_warmup"
+    assert before == {str(p.relative_to(parent_dir)): p.read_bytes()
+                      for p in parent_dir.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("extra", [
+    {"resume_from_checkpoint": "last"}, {"fresh_start": True},
+    {"output_dir": "OVERRIDE"}, {"lr_scheduler_type": "invalid"},
+])
+def test_fork_rejects_unsafe_or_conflicting_settings_before_spawn(client, extra):
+    _, source = _seed_fork_source(client)
+    response = client.post("/api/train/start", json={"init_from_checkpoint": str(source), **extra})
+    assert response.status_code == 400
+    assert not client.launched
+
+
+@pytest.mark.parametrize("problem", ["missing", "weights", "config"])
+def test_fork_rejects_invalid_source_before_spawn(client, problem):
+    _, source = _seed_fork_source(client)
+    if problem == "missing":
+        source = source / "missing"
+    elif problem == "weights":
+        (source / "adapter_model.safetensors").unlink()
+    else:
+        (source / "adapter_config.json").write_text("broken")
+    response = client.post("/api/train/start", json={"init_from_checkpoint": str(source)})
+    assert response.status_code == 400
+    assert not client.launched
+
+
+def test_resume_fork_keeps_initializer_and_new_lr(client, monkeypatch):
+    _, source = _seed_fork_source(client)
+    fork = client.post("/api/train/start", json={
+        "init_from_checkpoint": str(source), "epochs": 1, "learning_rate": 1e-5,
+        "lr_scheduler_type": "constant_with_warmup",
+    }).json()
+    client.mod.training_process = None
+    monkeypatch.setattr(client.mod, "_is_process_running", lambda pid=None: False)
+    _write_run(client, fork["run_id"], status="interrupted")
+    response = client.post(f"/api/runs/{fork['run_id']}/resume")
+    assert response.status_code == 200, response.text
+    flags = _flags(client.launched[-1])
+    assert flags["--init_from_checkpoint"] == str(source)
+    assert flags["--learning_rate"] == "1e-05"
+    assert flags["--lr_scheduler_type"] == "constant_with_warmup"
+    assert "--auto_resume" in client.launched[-1]
+
+
 def _write_merge_artifacts(client, run_id, *, weights="model.safetensors"):
     merged = client.mod.RUNS_DIR / run_id / "merged"
     merged.mkdir(parents=True, exist_ok=True)

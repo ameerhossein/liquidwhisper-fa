@@ -80,6 +80,7 @@ from src import paths as _managed_paths
 from src import prep_cache
 from src import run_state
 from src import hf_sync
+from src.training_fork import validate_fork_source
 from src.generation import persian_generation_kwargs
 
 
@@ -207,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_steps", type=int, default=1000, help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=2, help="Max checkpoints to keep")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Explicit checkpoint to resume from: path, or 'last' for latest in output_dir. Overrides --auto_resume.")
+    parser.add_argument("--init_from_checkpoint", type=str, default=None, help="Initialize a separate run from local LoRA weights only; optimizer, scheduler and epoch counter start fresh. Also accepts best_adapter directories.")
     parser.add_argument("--auto_resume", "--auto-resume", action=argparse.BooleanOptionalAction, default=True, help="Automatically resume from latest checkpoint in output_dir (for pod restarts). Use --no-auto_resume for a fresh run.")
     parser.add_argument("--fresh_start", "--fresh-start", action=argparse.BooleanOptionalAction, default=False, help="Start fresh: delete prior checkpoint-*, best_adapter, reports and telemetry history in output_dir/results before training.")
     parser.add_argument("--num_proc", type=int, default=4, help="Number of preprocessing workers")
@@ -296,6 +298,8 @@ def parse_args():
         )
     if bool(getattr(args, "fresh_start", False)) and restore_requested:
         parser.error("--fresh_start cannot be combined with --hf_resume.")
+    if args.init_from_checkpoint and (args.resume_from_checkpoint or restore_requested or args.fresh_start):
+        parser.error("--init_from_checkpoint cannot be combined with --resume_from_checkpoint, --hf_resume or --fresh_start.")
     # load_best_model_at_end needs save_steps to be a multiple of eval_steps; the
     # Trainer only checks this after data prep and model load.
     if args.save_steps % args.eval_steps != 0:
@@ -357,6 +361,7 @@ def _apply_yaml_config(parser: argparse.ArgumentParser, args: argparse.Namespace
         "use_ffmpeg": "telephony_use_ffmpeg", "telephony_use_ffmpeg": "telephony_use_ffmpeg",
         "phone_benchmark": "phone_benchmark", "phone_seed": "phone_seed",
         "resume_from_checkpoint": "resume_from_checkpoint",
+        "init_from_checkpoint": "init_from_checkpoint",
         "auto_resume": "auto_resume", "auto-resume": "auto_resume",
         "fresh_start": "fresh_start", "fresh-start": "fresh_start",
         "results_dir": "results_dir", "results-dir": "results_dir",
@@ -784,6 +789,7 @@ def _cli_run_config(args) -> dict:
         "lr_scheduler_type",
         "save_total_limit",
         "resume_from_checkpoint",
+        "init_from_checkpoint",
         "gradient_checkpointing",
         "fresh_start",
         "auto_resume",
@@ -821,7 +827,7 @@ def _validate_cli_run_dir(run_dir: Path) -> None:
 
 
 def _maybe_create_hf_run_dir(args) -> Optional[Path]:
-    """Create a canonical run directory when HF mirroring is enabled.
+    """Create a canonical run directory for HF mirroring or a weights-only fork.
 
     The remote layout is keyed by run id, so a mirrored run needs a ledger
     directory even when the caller did not pass ``--run_dir``. Allocating the
@@ -829,7 +835,7 @@ def _maybe_create_hf_run_dir(args) -> Optional[Path]:
     run-scoped exactly like an explicit CLI run.
     """
     repo = getattr(args, "hf_run_repo", None) or os.environ.get("ASR_HF_RUN_REPO")
-    if not str(repo or "").strip():
+    if not str(repo or "").strip() and not getattr(args, "init_from_checkpoint", None):
         return None
     if bool(getattr(args, "post_eval_only", False)):
         return None
@@ -837,7 +843,6 @@ def _maybe_create_hf_run_dir(args) -> Optional[Path]:
         return None
     runs_root = Path(_managed_paths.resolve_runs_dir()).expanduser().resolve()
     run_dir = runs_root / run_state.new_run_id()
-    run_dir.mkdir(parents=True, exist_ok=True)
     args.run_dir = str(run_dir)
     return run_dir
 
@@ -1672,6 +1677,14 @@ def main():
             args.output_dir = str(run_dir / "output")
     args.output_dir = _resolve_output_dir(args.output_dir)
     args.results_dir = _resolve_results_dir(getattr(args, "results_dir", None))
+    if getattr(args, "init_from_checkpoint", None):
+        # Check before directory creation, telemetry writes or any fresh-start
+        # cleanup. A resumed fork uses its own adapter, even if the parent is gone.
+        args.init_from_checkpoint = validate_fork_source(
+            args.init_from_checkpoint,
+            [args.output_dir, args.results_dir, run_dir],
+            require_weights=False,
+        )
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -1799,6 +1812,25 @@ def _save_best_adapter(model, processor, output_dir: str) -> Path:
             shutil.rmtree(backup, ignore_errors=True)
 
 
+def _configure_lora_model(model, args, resume_ckpt=None):
+    """Initialize fork weights without importing the parent's Trainer state."""
+    source = getattr(args, "init_from_checkpoint", None)
+    if source:
+        # Load the saved rank, alpha and target modules rather than replacing
+        # the trained adapter with the CLI's default LoRA configuration.
+        adapter = str(resume_ckpt or source)
+        print(f"Loading trainable LoRA adapter from {adapter}...")
+        return PeftModel.from_pretrained(model, adapter, is_trainable=True)
+    print("Injecting LoRA adapters...")
+    return get_peft_model(model, LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"],
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    ))
+
+
 def _run_training_stages(args, run_dir, mirror):
     # Post-eval-only resume: never repeat dataset prep, preflight, or training,
     # and never replay optimizer steps.
@@ -1809,6 +1841,14 @@ def _run_training_stages(args, run_dir, mirror):
         if mirror is not None:
             mirror.enqueue_ledger("post_eval", reports=True)
         return
+
+    if getattr(args, "init_from_checkpoint", None):
+        # HF auto-repair runs before this stage, so a surviving fork ledger
+        # can recover its own checkpoint without requiring the parent on disk.
+        validate_fork_source(
+            args.init_from_checkpoint, [args.output_dir, args.results_dir, run_dir],
+            require_weights=not bool(_resolve_resume_checkpoint(args)),
+        )
 
     stop_signal = os.path.join(args.results_dir, "stop_training.signal")
     if os.path.exists(stop_signal):
@@ -2084,16 +2124,10 @@ def _run_training_stages(args, run_dir, mirror):
     # Disable cache when training with gradient checkpointing
     model.config.use_cache = False
 
-    # 4. Configure LoRA
-    print("Injecting LoRA adapters...")
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj", "k_proj", "out_proj", "fc1", "fc2"],
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-    model = get_peft_model(model, lora_config)
+    # Resolve after HF auto-repair has had a chance to restore this fork's own
+    # checkpoint. Full resume always takes precedence over parent initialization.
+    resume_ckpt = _resolve_resume_checkpoint(args)
+    model = _configure_lora_model(model, args, resume_ckpt)
     model.print_trainable_parameters()
 
     # 5. Data Collator
@@ -2226,7 +2260,6 @@ def _run_training_stages(args, run_dir, mirror):
     # 9. Execute Training (auto-resumable from persistent-volume checkpoints)
     _mark_run_stage(run_dir, "training", "running")
     try:
-        resume_ckpt = _resolve_resume_checkpoint(args)
         if resume_ckpt:
             print(f"\nResuming training from: {resume_ckpt}")
         else:

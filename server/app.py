@@ -38,6 +38,7 @@ except Exception:
 from src import paths as _managed_paths  # noqa: E402
 from src import run_state  # noqa: E402
 from src import hf_sync  # noqa: E402
+from src.training_fork import validate_fork_source  # noqa: E402
 
 
 def _default_results_dir() -> Path:
@@ -2196,6 +2197,7 @@ _TRAINER_VALUE_ARGS = (
     "max_eval_samples",
     "prep_cache_dir",
     "hf_run_repo",
+    "init_from_checkpoint",
 )
 _TRAINER_LIST_ARGS = ("telephony_profiles",)
 _TRAINER_BOOL_ARGS = (
@@ -2384,6 +2386,13 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if fresh_start:
         auto_resume_on = False
 
+    init_source = str(config.get("init_from_checkpoint", "") or "").strip()
+    if init_source and (resume_explicit or fresh_start or domain_mode):
+        raise HTTPException(status_code=400, detail="init_from_checkpoint cannot be combined with resume_from_checkpoint, fresh_start or domain_adaptation.")
+    scheduler = str(config.get("lr_scheduler_type", "cosine")).strip()
+    if scheduler not in ("cosine", "linear", "constant", "constant_with_warmup"):
+        raise HTTPException(status_code=400, detail="lr_scheduler_type must be cosine, linear, constant or constant_with_warmup.")
+
     if domain_mode:
         if not (100 <= replay_samples_i <= 5000):
             raise HTTPException(status_code=400, detail="replay_samples must be 100..5000.")
@@ -2427,6 +2436,8 @@ def _normalize_start_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "dataset_name": dataset_name,
         "fresh_start": fresh_start,
         "resume_explicit": resume_explicit,
+        "init_from_checkpoint": init_source or None,
+        "lr_scheduler_type": scheduler,
         "auto_resume": auto_resume_on,
         "domain_adaptation": domain_mode,
     }
@@ -2630,6 +2641,18 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
     if explicit_output:
         output_dir = _sanitize_output_dir(explicit_output)
 
+    if values["init_from_checkpoint"]:
+        # Forks always get a new run-owned output directory. Reject overrides
+        # before spawning the trainer or touching any original artifacts.
+        if explicit_output:
+            raise HTTPException(status_code=400, detail="Omit output_dir when using init_from_checkpoint; fork outputs are managed per run.")
+        try:
+            values["init_from_checkpoint"] = validate_fork_source(
+                values["init_from_checkpoint"], [output_dir, run_dir]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         smoke_output = _abs_output_path(_smoke_output_dir()).resolve()
     except Exception:
@@ -2657,7 +2680,7 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "grad_accum": values["grad_accum"],
         "learning_rate": values["learning_rate"],
         "warmup_steps": values["warmup_steps"],
-        "lr_scheduler_type": "cosine",
+        "lr_scheduler_type": values["lr_scheduler_type"],
         "eval_steps": values["eval_steps"],
         "save_steps": values["save_steps"],
         "save_total_limit": 2,
@@ -2690,6 +2713,8 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         trainer_args["replay_ratio"] = values.get("replay_ratio", 0.25)
     if values["resume_explicit"]:
         trainer_args["resume_from_checkpoint"] = values["resume_explicit"]
+    if values["init_from_checkpoint"]:
+        trainer_args["init_from_checkpoint"] = values["init_from_checkpoint"]
     run_config = {
         "base_model": values["base_model"] if domain_mode else "BuzzASR/persian",
         "dataset_name": values["dataset_name"],
@@ -2710,6 +2735,8 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "auto_resume": values["auto_resume"],
         "fresh_start": values["fresh_start"],
         "resume_from_checkpoint": values["resume_explicit"] or None,
+        "init_from_checkpoint": values["init_from_checkpoint"],
+        "lr_scheduler_type": values["lr_scheduler_type"],
         "output_dir": output_dir,
         "results_dir": str(run_dir),
     }
@@ -2765,6 +2792,8 @@ def _start_new_run(config: Dict[str, Any]) -> Dict[str, Any]:
         "auto_resume": values["auto_resume"],
         "fresh_start": values["fresh_start"],
         "resume_from_checkpoint": values["resume_explicit"] or None,
+        "init_from_checkpoint": values["init_from_checkpoint"],
+        "lr_scheduler_type": values["lr_scheduler_type"],
     }
     if domain_mode:
         response_config["domain_adaptation"] = True
@@ -2855,6 +2884,8 @@ def _start_resume_run(config: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         "auto_resume": True,
         "fresh_start": False,
         "resume_from_checkpoint": None,
+        "init_from_checkpoint": trainer_args.get("init_from_checkpoint"),
+        "lr_scheduler_type": trainer_args.get("lr_scheduler_type", "cosine"),
     }
     preflight_cache_dir.mkdir(parents=True, exist_ok=True)
     return _spawn_trainer(

@@ -196,6 +196,54 @@ or `hf` CLI) to reclaim storage. Tokens are read from the environment only and
 are never written to run files or logs; `HF_TOKEN` is shared with
 `scripts/upload_to_hf.py`.
 
+To fork a previous run's trained weights with a new learning rate, use
+`init_from_checkpoint` on the **Start** endpoint. It accepts a local LoRA
+`checkpoint-<step>` or `best_adapter` directory containing `adapter_config.json`
+and adapter weights. If the source is only on HF, restore it first with
+`scripts/hf_restore.py --run <old_run_id>` (without resuming it).
+
+```bash
+curl --fail-with-body http://localhost:7860/api/train/start \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "init_from_checkpoint": "/workspace/stt-outputs/results/runs/OLD_RUN_ID/output/checkpoint-STEP",
+    "epochs": 1,
+    "learning_rate": 1e-5,
+    "lr_scheduler_type": "constant_with_warmup",
+    "warmup_steps": 50,
+    "batch_size": 8,
+    "grad_accum": 4,
+    "telephony_mode": "paired",
+    "hf_run_repo": "YOUR_USER/stt-epoch3-experiment"
+  }'
+```
+
+Replace the source path and repo, and match the original run's dataset, batch,
+accumulation and telephony settings. Fork epochs count **additional training**:
+`epochs: 1` means one new epoch, even if the source finished epoch 2. The saved
+adapter's LoRA configuration is preserved. The optimizer, scheduler, best metric
+and step/epoch counters start fresh, using the new LR and warmup. API schedules
+are `cosine` (default), `linear`, `constant`, or `constant_with_warmup`.
+
+The server assigns a new run ID and new output/results directories. Omit
+`output_dir` and `results_dir`; overrides are rejected for forks. The source
+run is read only, and a separate `hf_run_repo` leaves the original repo
+untouched. Reusing the original mirror repo is also supported: uploads go into
+the new `runs/<run_id>/` folder, with `latest.json` pointing at the active run.
+Do not combine initialization with `resume_from_checkpoint` or `fresh_start`.
+After interruption, Resume continues the fork's own checkpoint and schedule;
+it does not restart training from the parent.
+
+The CLI supports the same option and automatically allocates a new run:
+
+```bash
+python scripts/train_lora.py \
+  --init_from_checkpoint /path/to/old/output/checkpoint-STEP \
+  --epochs 1 --learning_rate 1e-5 \
+  --lr_scheduler_type constant_with_warmup --warmup_steps 50 \
+  --hf_run_repo YOUR_USER/stt-epoch3-experiment
+```
+
 ---
 
 ## Why This Architecture?
